@@ -1,0 +1,219 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+
+generator client {
+provider = "prisma-client-js"
+}
+
+datasource db {
+provider = "postgresql"
+url = env("DATABASE_URL")
+}
+
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  DOCTOR
+  USER
+}
+
+enum AppointmentStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+enum SlotType {
+  FREE
+  PAID
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  CANCELLED
+}
+
+enum DoctorSpeciality {
+  DENTIST
+  CARDIOLOGIST
+  NEUROLOGIST
+  ORTHOPEDIC
+  GYNECOLOGIST
+  PEDIATRICIAN
+  DERMATOLOGIST
+  OPHTHALMOLOGIST
+  GENERAL_PHYSICIAN
+  OTHER
+}
+
+enum BookingSection {
+  DENTAL
+  CARDIAC
+  NEUROLOGY
+  ORTHOPEDICS
+  GYNECOLOGY
+  PEDIATRICS
+  DERMATOLOGY
+  OPHTHALMOLOGY
+  GENERAL
+  OTHER
+}
+
+model PaymentGateway {
+  id            String   @id @default(uuid())
+  name          String
+  apiKey        String?
+  secret        String?
+  webhookSecret String?
+  isActive      Boolean  @default(true)
+  clinicId      String
+  createdAt     DateTime @default(now())
+
+  clinic   Clinic    @relation(fields: [clinicId], references: [id])
+  payments Payment[]
+
+  @@unique([clinicId, name])
+  @@map("payment_gateways")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  name      String
+  phone     String?
+  avatar    String?
+  role      Role
+  clinicId  String? // null for SUPER_ADMIN
+  doctorId  String?  @unique // ✅ FIXED: one-to-one
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clinic       Clinic?       @relation("ClinicAdmins", fields: [clinicId], references: [id])
+  doctor       Doctor?       @relation("DoctorUser", fields: [doctorId], references: [id])
+  appointments Appointment[]
+
+  @@map("user")
+}
+
+model Clinic {
+  id            String   @id @default(uuid())
+  slug          String   @unique
+  name          String
+  logo          String?
+  banner        String?
+  address       String
+  city          String
+  pincode       String
+  timings       Json
+  details       String?
+  accountNumber String
+  ifscCode      String
+  bankName      String
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  admins       User[]           @relation("ClinicAdmins")
+  doctors      Doctor[]
+  appointments Appointment[]
+  slots        Slot[]
+  payments     Payment[]
+  gateways     PaymentGateway[]
+
+  @@map("clinics")
+}
+
+model Doctor {
+  id         String           @id @default(uuid())
+  slug       String           @unique
+  name       String
+  avatar     String?
+  speciality DoctorSpeciality
+  phone      String
+  experience Int
+  clinicId   String
+  isActive   Boolean          @default(true)
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  clinic       Clinic        @relation(fields: [clinicId], references: [id])
+  user         User?         @relation("DoctorUser")
+  appointments Appointment[]
+  slots        Slot[]
+  payments     Payment[] // ✅ FIXED: opposite relation
+
+  @@map("doctors")
+}
+
+model Slot {
+  id        String            @id @default(uuid())
+  doctorId  String
+  clinicId  String
+  date      DateTime
+  time      String
+  duration  Int               @default(30)
+  type      SlotType          @default(FREE)
+  price     Decimal           @default(0)
+  status    AppointmentStatus @default(PENDING)
+  createdAt DateTime          @default(now())
+
+  doctor       Doctor        @relation(fields: [doctorId], references: [id])
+  clinic       Clinic        @relation(fields: [clinicId], references: [id])
+  appointments Appointment[] // ✅ One-to-many (multiple appts possible)
+
+  @@unique([doctorId, date, time])
+  @@map("slots")
+}
+
+model Appointment {
+  id           String            @id @default(uuid())
+  slug         String            @unique
+  userId       String
+  doctorId     String
+  clinicId     String
+  slotId       String            @unique // ✅ FIXED: one-to-one
+  section      BookingSection
+  status       AppointmentStatus @default(PENDING)
+  paymentId    String?
+  notes        String?
+  symptoms     String?
+  prescription String?
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id])
+  doctor  Doctor   @relation(fields: [doctorId], references: [id])
+  clinic  Clinic   @relation(fields: [clinicId], references: [id])
+  slot    Slot     @relation(fields: [slotId], references: [id])
+  payment Payment?
+
+  @@map("appointments")
+}
+
+model Payment {
+  id            String        @id @default(uuid())
+  appointmentId String        @unique
+  clinicId      String
+  doctorId      String
+  gatewayId     String
+  amount        Decimal
+  status        PaymentStatus
+  gatewayRefId  String?
+  createdAt     DateTime      @default(now())
+
+  appointment Appointment    @relation(fields: [appointmentId], references: [id])
+  clinic      Clinic         @relation(fields: [clinicId], references: [id])
+  doctor      Doctor         @relation(fields: [doctorId], references: [id])
+  gateway     PaymentGateway @relation(fields: [gatewayId], references: [id])
+
+  @@map("payments")
+}
