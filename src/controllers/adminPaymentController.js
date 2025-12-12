@@ -1,6 +1,8 @@
 import prisma from '../prisma.js';
 
-// GET /api/admin/payments?start=YYYY-MM-DD&end=YYYY-MM-DD&doctorId=...
+// ----------------------------------------------------------------
+// GET /api/admin/payments
+// ----------------------------------------------------------------
 export const getPayments = async (req, res) => {
   try {
     const { clinicId } = req.user;
@@ -10,6 +12,13 @@ export const getPayments = async (req, res) => {
       return res.status(400).json({ error: 'Clinic ID missing in token' });
     }
 
+    // Verify Clinic is Active (Optional but good practice)
+    const clinic = await prisma.clinic.findUnique({
+        where: { id: clinicId },
+        select: { deletedAt: true }
+    });
+    if(!clinic || clinic.deletedAt) return res.status(404).json({error: "Clinic inactive"});
+
     const where = { clinicId };
 
     if (doctorId) where.doctorId = doctorId;
@@ -18,6 +27,9 @@ export const getPayments = async (req, res) => {
     if (start || end) {
       const startDate = start ? new Date(start) : new Date('1970-01-01');
       const endDate = end ? new Date(end) : new Date('2999-12-31');
+      
+      // Ensure end date covers the full day
+      endDate.setHours(23, 59, 59, 999);
 
       where.createdAt = {
         gte: startDate,
@@ -30,10 +42,10 @@ export const getPayments = async (req, res) => {
       orderBy: { createdAt: 'desc' },
       include: {
         doctor: {
-          select: { id: true, name: true, speciality: true }
+          select: { id: true, name: true, speciality: true, deletedAt: true } // Include deletedAt to flag deleted docs
         },
         appointment: {
-          select: { id: true, status: true } // ❌ removed date (not in schema)
+          select: { id: true, status: true, deletedAt: true } 
         }
       }
     });
@@ -45,7 +57,9 @@ export const getPayments = async (req, res) => {
   }
 };
 
-// GET /api/admin/payments/summary?start=YYYY-MM-DD&end=YYYY-MM-DD
+// ----------------------------------------------------------------
+// GET /api/admin/payments/summary
+// ----------------------------------------------------------------
 export const getPaymentsSummary = async (req, res) => {
   try {
     const { clinicId } = req.user;
@@ -55,8 +69,10 @@ export const getPaymentsSummary = async (req, res) => {
       return res.status(400).json({ error: 'Clinic ID missing in token' });
     }
 
+    // Fix Dates
     const startDate = start ? new Date(start) : new Date('1970-01-01');
     const endDate = end ? new Date(end) : new Date('2999-12-31');
+    endDate.setHours(23, 59, 59, 999);
 
     // Total revenue
     const totalAgg = await prisma.payment.aggregate({
@@ -89,17 +105,19 @@ export const getPaymentsSummary = async (req, res) => {
 
     const doctorIds = perDoctor.map(p => p.doctorId);
 
+    // Fetch doctors (including deleted ones, so we know who earned the money)
     const doctors = await prisma.doctor.findMany({
       where: { id: { in: doctorIds } },
-      select: { id: true, name: true, speciality: true }
+      select: { id: true, name: true, speciality: true, deletedAt: true }
     });
 
     const revenuePerDoctor = perDoctor.map(p => {
       const doc = doctors.find(d => d.id === p.doctorId);
       return {
         doctorId: p.doctorId,
-        doctorName: doc?.name || null,
-        speciality: doc?.speciality || null,
+        doctorName: doc ? doc.name : 'Unknown/Deleted',
+        speciality: doc ? doc.speciality : null,
+        isDeleted: !!(doc && doc.deletedAt), // Flag deleted doctors
         amount: p._sum.amount || 0
       };
     });

@@ -1,40 +1,39 @@
-// src/controllers/doctorController.js
-import prisma from '../prisma.js'; // Adjust path if needed
+import prisma from '../prisma.js';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { logAudit } from '../utils/audit.js';
 
+// ----------------------------------------------------------------
 // DOCTOR LOGIN
-
+// ----------------------------------------------------------------
 export const doctorLogin = async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password)
       return res.status(400).json({ error: 'Email and password required' });
 
-    // 1. Find User
+    // 1. Find User (Must NOT be deleted)
     const user = await prisma.user.findUnique({ where: { email } });
 
-    if (!user || user.role !== 'DOCTOR')
+    if (!user || user.role !== 'DOCTOR' || user.deletedAt)
       return res.status(401).json({ error: 'Invalid credentials' });
 
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
-    // 2. Find Associated Doctor Profile
-    // We search for a Doctor where the related 'user' has the ID we just found.
+    // 2. Find Associated Doctor Profile (Must NOT be deleted)
     const doctor = await prisma.doctor.findFirst({
       where: {
-        user: {
-          id: user.id // <--- CORRECT SYNTAX for relation filtering
-        }
+        user: { id: user.id },
+        deletedAt: null 
       }
     });
 
     if (!doctor) {
-      return res.status(400).json({ error: 'No doctor profile linked to this user account.' });
+      return res.status(400).json({ error: 'No active doctor profile linked to this user account.' });
     }
 
-    // 3. Sign Token with valid doctorId
+    // 3. Sign Token
     const token = jwt.sign(
       { 
         userId: user.id, 
@@ -44,6 +43,17 @@ export const doctorLogin = async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
+
+    // ✅ LOG AUDIT
+    await logAudit({
+      userId: user.id,
+      clinicId: doctor.clinicId,
+      action: 'LOGIN',
+      entity: 'Doctor',
+      entityId: doctor.id,
+      details: { email: user.email },
+      req
+    });
 
     return res.json({
       token,
@@ -60,7 +70,10 @@ export const doctorLogin = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
-// GET /api/doctor/profile
+
+// ----------------------------------------------------------------
+// GET DOCTOR PROFILE
+// ----------------------------------------------------------------
 export const getDoctorProfile = async (req, res) => {
   try {
     const { doctorId } = req.user;
@@ -73,8 +86,11 @@ export const getDoctorProfile = async (req, res) => {
       include: { clinic: true }
     });
 
-    if (!doctor)
+    if (!doctor || doctor.deletedAt)
       return res.status(404).json({ error: 'Doctor not found' });
+
+    // Optional: Remove deletedAt from response
+    delete doctor.deletedAt; 
 
     return res.json(doctor);
   } catch (error) {
@@ -83,7 +99,9 @@ export const getDoctorProfile = async (req, res) => {
   }
 };
 
-// GET /api/doctor/slots?date=YYYY-MM-DD
+// ----------------------------------------------------------------
+// GET DOCTOR SLOTS
+// ----------------------------------------------------------------
 export const getDoctorSlots = async (req, res) => {
   try {
     const { doctorId } = req.user;
@@ -92,7 +110,11 @@ export const getDoctorSlots = async (req, res) => {
     if (!doctorId)
       return res.status(400).json({ error: 'Doctor ID missing in token' });
 
-    let where = { doctorId };
+    let where = { 
+        doctorId, 
+        deletedAt: null 
+    };
+    
     if (date) {
       const d = new Date(date);
       const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
@@ -112,7 +134,9 @@ export const getDoctorSlots = async (req, res) => {
   }
 };
 
-// GET /api/doctor/appointments?date=YYYY-MM-DD&status=...
+// ----------------------------------------------------------------
+// GET DOCTOR APPOINTMENTS
+// ----------------------------------------------------------------
 export const getDoctorAppointments = async (req, res) => {
   try {
     const { doctorId } = req.user;
@@ -121,19 +145,13 @@ export const getDoctorAppointments = async (req, res) => {
     if (!doctorId)
       return res.status(400).json({ error: 'Doctor ID missing in token' });
 
-    // Build where clause: filter appointments WHERE slot.doctorId matches
     const where = {
-      slot: {
-        doctorId // filter by slot.doctorId === req.user.doctorId
-      }
+      slot: { doctorId },
+      deletedAt: null
     };
 
-    // Add status filter if provided
-    if (status) {
-      where.status = status;
-    }
+    if (status) where.status = status;
 
-    // Add date filter if provided
     if (date) {
       const d = new Date(date + 'T00:00:00');
       const start = new Date(d);
@@ -156,12 +174,10 @@ export const getDoctorAppointments = async (req, res) => {
       }
     });
 
-    // Format data for frontend (e.g. map user -> patientName)
     const formatted = appointments.map(app => ({
       ...app,
       patientName: app.user?.name || 'Unknown',
       patientPhone: app.user?.phone || '',
-      // Format dates for display
       dateFormatted: app.slot?.date ? new Date(app.slot.date).toLocaleDateString() : 'N/A',
       timeFormatted: app.slot?.time || 'N/A'
     }));
@@ -173,10 +189,12 @@ export const getDoctorAppointments = async (req, res) => {
   }
 };
 
-// PATCH /api/doctor/appointments/:id/status
+// ----------------------------------------------------------------
+// UPDATE APPOINTMENT STATUS
+// ----------------------------------------------------------------
 export const updateDoctorAppointmentStatus = async (req, res) => {
   try {
-    const { doctorId } = req.user;
+    const { doctorId, userId } = req.user;
     const { id } = req.params;
     const { status } = req.body;
 
@@ -187,13 +205,16 @@ export const updateDoctorAppointmentStatus = async (req, res) => {
       return res.status(400).json({ error: 'Invalid status' });
     }
 
-    // Verify appointment belongs to this doctor (via slot.doctorId)
     const appointment = await prisma.appointment.findFirst({
       where: { 
         id,
-        slot: { doctorId }
+        slot: { doctorId },
+        deletedAt: null
       },
-      include: { slot: true }
+      include: { 
+        slot: true, 
+        user: { select: { name: true } }
+      }
     });
 
     if (!appointment)
@@ -202,6 +223,21 @@ export const updateDoctorAppointmentStatus = async (req, res) => {
     const updated = await prisma.appointment.update({
       where: { id },
       data: { status }
+    });
+
+    // ✅ LOG AUDIT
+    await logAudit({
+      userId: userId || req.user.userId,
+      clinicId: appointment.clinicId,
+      action: 'UPDATE_STATUS_DOCTOR',
+      entity: 'Appointment',
+      entityId: id,
+      details: {
+        patientName: appointment.user?.name,
+        previousStatus: appointment.status,
+        newStatus: status
+      },
+      req
     });
 
     return res.json({
@@ -214,11 +250,20 @@ export const updateDoctorAppointmentStatus = async (req, res) => {
   }
 };
 
-// PATCH /api/doctor/profile
+// ----------------------------------------------------------------
+// UPDATE DOCTOR PROFILE
+// ----------------------------------------------------------------
 export const updateDoctorProfile = async (req, res) => {
   try {
     const { userId, doctorId } = req.user; 
     const { phone, password } = req.body;
+
+    const doctor = await prisma.doctor.findUnique({ 
+        where: { id: doctorId },
+        select: { clinicId: true, phone: true, deletedAt: true } 
+    });
+
+    if (!doctor || doctor.deletedAt) return res.status(404).json({ error: "Doctor profile not active." });
 
     const data = {};
     if (phone !== undefined) data.phone = phone;
@@ -246,6 +291,20 @@ export const updateDoctorProfile = async (req, res) => {
       });
     }
 
+    // ✅ LOG AUDIT
+    await logAudit({
+        userId: userId || req.user.userId,
+        clinicId: doctor.clinicId,
+        action: 'UPDATE_DOCTOR_PROFILE',
+        entity: 'Doctor',
+        entityId: doctorId,
+        details: {
+            phoneChanged: phone && phone !== doctor.phone,
+            passwordChanged: !!password
+        },
+        req
+    });
+
     return res.json({ user: updatedUser });
   } catch (error) {
     console.error('Update Doctor Profile Error:', error);
@@ -253,7 +312,9 @@ export const updateDoctorProfile = async (req, res) => {
   }
 };
 
-// GET /api/doctor/appointments/:id (DETAILS)
+// ----------------------------------------------------------------
+// GET APPOINTMENT DETAILS
+// ----------------------------------------------------------------
 export const getAppointmentDetails = async (req, res) => {
   try {
     const { id } = req.params;
@@ -267,12 +328,7 @@ export const getAppointmentDetails = async (req, res) => {
       where: { id },
       include: {
         user: { 
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            phone: true,
-          },
+          select: { id: true, name: true, email: true, phone: true },
         },
         slot: true,
         clinic: true,
@@ -280,16 +336,14 @@ export const getAppointmentDetails = async (req, res) => {
       },
     });
 
-    if (!appointment) {
+    if (!appointment || appointment.deletedAt) {
       return res.status(404).json({ error: 'Appointment not found' });
     }
 
-    // Security check: ensure appointment belongs to doctor
     if (appointment.doctorId && appointment.doctorId !== doctorId) {
        return res.status(403).json({ error: 'Access denied to this appointment' });
     }
 
-    // Format response: map user -> patient, add formatted dates
     const formattedAppointment = {
       ...appointment,
       patient: appointment.user, 
@@ -303,37 +357,38 @@ export const getAppointmentDetails = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
+// ----------------------------------------------------------------
+// GET STATS
+// ----------------------------------------------------------------
 export const getDoctorDashboardStats = async (req, res) => {
   try {
     const { doctorId } = req.user;
 
     if (!doctorId) return res.status(400).json({ error: 'Doctor ID missing' });
 
-    // Get Today's Date Range (00:00 to 23:59)
     const today = new Date();
     const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 1);
 
-    // Get "Upcoming" Date Range (Next 7 days)
     const nextWeek = new Date(today);
     nextWeek.setDate(today.getDate() + 7);
 
-    // Run queries in parallel for speed
     const [todayCount, upcomingCount, completedToday] = await Promise.all([
-      // 1. Total Appointments Today
       prisma.appointment.count({
         where: {
-          doctorId, // Filter by logged-in doctor
+          doctorId, 
+          deletedAt: null,
           slot: {
             date: { gte: startOfDay, lt: endOfDay }
           }
         }
       }),
 
-      // 2. Upcoming Appointments (Next 7 days)
       prisma.appointment.count({
         where: {
           doctorId,
+          deletedAt: null,
           slot: {
             date: { gt: endOfDay, lt: nextWeek }
           },
@@ -341,10 +396,10 @@ export const getDoctorDashboardStats = async (req, res) => {
         }
       }),
 
-      // 3. Completed Today
       prisma.appointment.count({
         where: {
           doctorId,
+          deletedAt: null,
           status: 'COMPLETED',
           slot: {
             date: { gte: startOfDay, lt: endOfDay }
@@ -353,14 +408,44 @@ export const getDoctorDashboardStats = async (req, res) => {
       })
     ]);
 
-    res.json({
-      todayCount,
-      upcomingCount,
-      completedToday
-    });
+    res.json({ todayCount, upcomingCount, completedToday });
 
   } catch (error) {
     console.error('Doctor Dashboard Stats Error:', error);
     res.status(500).json({ error: 'Failed to fetch dashboard stats' });
+  }
+};
+
+// ----------------------------------------------------------------
+// GET REVIEWS
+// ----------------------------------------------------------------
+export const getMyReviews = async (req, res) => {
+  try {
+    const doctorId = req.user.doctorId;
+
+    if (!doctorId) {
+      return res.status(400).json({ error: "Doctor ID not found in session" });
+    }
+
+    const reviews = await prisma.review.findMany({
+      where: { 
+        doctorId,
+        deletedAt: null 
+      },
+      include: {
+        user: { select: { name: true, avatar: true } },
+        appointment: { select: { createdAt: true } }
+      },
+      orderBy: { createdAt: 'desc' }
+    });
+
+    const total = reviews.reduce((sum, r) => sum + r.rating, 0);
+    const average = reviews.length > 0 ? (total / reviews.length).toFixed(1) : 0;
+
+    res.json({ average, total: reviews.length, reviews });
+
+  } catch (error) {
+    console.error("Get Doctor Reviews Error:", error);
+    res.status(500).json({ error: error.message });
   }
 };

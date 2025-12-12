@@ -1,6 +1,7 @@
 import prisma from '../prisma.js';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { logAudit } from '../utils/audit.js'; // Optional: Add audit log
 
 // CLINIC ADMIN LOGIN
 export const adminLogin = async (req, res) => {
@@ -12,11 +13,23 @@ export const adminLogin = async (req, res) => {
     }
 
     const user = await prisma.user.findUnique({
-      where: { email }
+      where: { email },
+      include: { clinic: true } // Check clinic status too
     });
 
+    // 1. Check User Existence & Role
     if (!user || user.role !== 'ADMIN') {
       return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // 2. ✅ Check Soft Delete (User)
+    if (user.deletedAt) {
+      return res.status(403).json({ error: 'Account has been deactivated/deleted.' });
+    }
+
+    // 3. ✅ Check Clinic Status (Is it deleted?)
+    if (user.clinic && user.clinic.deletedAt) {
+      return res.status(403).json({ error: 'Your clinic account is inactive.' });
     }
 
     const validPassword = await bcrypt.compare(password, user.password);
@@ -29,6 +42,18 @@ export const adminLogin = async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
+
+    // Optional: Log Audit
+    try {
+        await logAudit({
+            userId: user.id,
+            clinicId: user.clinicId,
+            action: 'ADMIN_LOGIN',
+            entity: 'User',
+            entityId: user.id,
+            req
+        });
+    } catch(e) { console.error("Audit log failed", e); }
 
     return res.json({
       token,

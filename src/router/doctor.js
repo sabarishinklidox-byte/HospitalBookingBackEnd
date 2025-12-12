@@ -5,8 +5,9 @@ import {
   getDoctorSlots,
   getDoctorAppointments,
   updateDoctorProfile,
-  updateDoctorAppointmentStatus, getAppointmentDetails,getDoctorDashboardStats
+  updateDoctorAppointmentStatus, getAppointmentDetails,getDoctorDashboardStats,getMyReviews
 } from '../controllers/doctorController.js';
+import{updatePrescription} from '../controllers/doctorAppointmentController.js'
 import { authMiddleware, requireDoctor } from '../middleware/auth.js';
 
 const router = Router();
@@ -22,4 +23,7 @@ router.patch('/appointments/:id/status', authMiddleware, requireDoctor, updateDo
 router.patch('/profile', authMiddleware, requireDoctor, updateDoctorProfile); 
 router.get('/appointments/:id', authMiddleware, requireDoctor, getAppointmentDetails)
 router.get('/dashboard-stats', authMiddleware, requireDoctor, getDoctorDashboardStats);
+router.get('/reviews', authMiddleware,requireDoctor, getMyReviews);
+router.patch('/appointments/:id/prescription',authMiddleware,requireDoctor,updatePrescription);
+
 export default router;

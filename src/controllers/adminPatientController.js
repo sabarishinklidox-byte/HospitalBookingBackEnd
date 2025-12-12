@@ -1,6 +1,8 @@
-import prisma from '../prisma.js'; // Adjust path if needed (e.g. '../lib/prisma.js')
+import prisma from '../prisma.js'; 
 
+// ----------------------------------------------------------------
 // GET /api/admin/patients/:userId/history
+// ----------------------------------------------------------------
 export const getPatientHistory = async (req, res) => {
   try {
     const { clinicId } = req.user;
@@ -11,9 +13,17 @@ export const getPatientHistory = async (req, res) => {
       return res.status(400).json({ error: 'Clinic ID missing in token' });
     }
 
-    // 2. Fetch User (Patient) Info
-    // NOTE: Using 'userId' directly as string (UUID). 
-    // If your DB strictly uses Integers, wrap with Number(userId).
+    // 2. Verify Clinic is Active (Optional safety check)
+    const clinicCheck = await prisma.clinic.findUnique({
+      where: { id: clinicId },
+      select: { deletedAt: true }
+    });
+    if (!clinicCheck || clinicCheck.deletedAt) {
+      return res.status(404).json({ error: "Clinic not found or inactive" });
+    }
+
+    // 3. Fetch User (Patient) Info
+    // We allow fetching even if user.deletedAt is set (to see history of deleted users)
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
@@ -21,7 +31,8 @@ export const getPatientHistory = async (req, res) => {
         name: true,
         email: true,
         phone: true,
-        avatar: true // Remove if not in schema
+        avatar: true,
+        deletedAt: true // Include this so frontend knows if patient is inactive
       }
     });
 
@@ -29,24 +40,24 @@ export const getPatientHistory = async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // 3. Fetch Appointments
+    // 4. Fetch Appointments (Active Only)
     const appointments = await prisma.appointment.findMany({
       where: {
-        clinicId: clinicId, // Matching string UUID
-        userId: userId      // Matching string UUID
+        clinicId: clinicId, 
+        userId: userId,
+        deletedAt: null // ✅ Filter out soft-deleted appointments
       },
-      // Safe sorting: tries createdAt if it exists, otherwise you might need to change to 'id'
-      // If this crashes saying "Unknown field createdAt", change to: orderBy: { id: 'desc' }
       orderBy: { createdAt: 'desc' }, 
       include: {
         doctor: {
-          select: { id: true, name: true, speciality: true }
+          // Include deletedAt so we know if the doctor is gone
+          select: { id: true, name: true, speciality: true, deletedAt: true }
         },
         clinic: {
           select: { id: true, name: true }
         },
         slot: true,
-        // payment: true // Uncomment ONLY if 'Payment' model and relation exist
+        payment: true // If you have payments, include them
       }
     });
 

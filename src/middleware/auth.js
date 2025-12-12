@@ -45,3 +45,9 @@ export const requireUser = (req, res, next) => {
   }
   next();
 };
+export const requireAdminOrSuperAdmin = (req, res, next) => {
+  if (!req.user || !['ADMIN', 'SUPER_ADMIN'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Admin or Super Admin only' });
+  }
+  next();
+};

@@ -1,66 +1,83 @@
 import prisma from '../prisma.js';
 import bcrypt from 'bcryptjs';
 import { v4 as uuidv4 } from 'uuid';
+// ✅ Import Logger
+import { logAudit } from '../utils/audit.js'; 
 
-// CREATE doctor with unique slug and linked user credentials
+// ----------------------------------------------------------------
+// CREATE DOCTOR
+// ----------------------------------------------------------------
 export const createDoctor = async (req, res) => {
   try {
-    const { clinicId } = req.user;
+    console.log('CREATE_DOCTOR file:', req.file);
+    console.log('CREATE_DOCTOR body:', req.body);
+
+    const { clinicId, userId } = req.user;
 
     if (!clinicId) {
       return res.status(400).json({ error: 'Clinic ID missing in token' });
     }
 
-    const { name, email, phone, speciality, experience, avatar, password } =
-      req.body;
+    const { name, email, phone, speciality, experience, password } = req.body;
 
     if (!name || !email || !speciality || !experience || !password) {
       return res.status(400).json({
-        error:
-          'name, email, speciality, experience and password are required'
+        error: 'name, email, speciality, experience and password are required',
       });
     }
 
-    // Check if email already exists
+    // avatar from file upload or from body (URL)
+    let avatar = null;
+    if (req.file) {
+      avatar = `/uploads/${req.file.filename}`;
+    } else if (req.body.avatar) {
+      avatar = req.body.avatar;
+    }
+
+    // Check if email already exists...
     const existingUser = await prisma.user.findUnique({ where: { email } });
     if (existingUser) {
+      if (existingUser.deletedAt) {
+        return res
+          .status(400)
+          .json({ error: 'Email belongs to a deleted account.' });
+      }
       return res.status(400).json({ error: 'Email already in use' });
     }
 
-    // Generate base slug
     const baseSlug = name
       .toLowerCase()
       .replace(/[^a-z0-9]/g, '-')
       .replace(/-+/g, '-')
       .replace(/^-|-$/g, '');
 
-    // Check existing slugs starting with baseSlug
     const existingSlugs = await prisma.doctor.findMany({
       where: { slug: { startsWith: baseSlug } },
-      select: { slug: true }
+      select: { slug: true },
     });
 
-    // Make slug unique if needed
     let slug = baseSlug;
     if (existingSlugs.length > 0) {
       slug = `${baseSlug}-${existingSlugs.length + 1}`;
     }
 
-    // Create doctor profile
     const doctor = await prisma.doctor.create({
       data: {
         slug,
         name,
-        avatar: avatar || null,
+        avatar,                 // 👈 now uses value from req.file / body
         speciality,
         phone: phone || '',
         experience: Number(experience),
         clinicId,
-        isActive: true
-      }
+        isActive: true,
+      },
     });
 
-    // Hash password for doctor user login
+    // ...rest of your code (hash password, create user, logAudit, etc.)
+
+
+    // Hash password
     const hashedPassword = await bcrypt.hash(password, 12);
 
     // Create user login linked to doctor
@@ -76,6 +93,21 @@ export const createDoctor = async (req, res) => {
       }
     });
 
+    // ✅ LOG AUDIT
+    await logAudit({
+      userId: userId || req.user.userId,
+      clinicId,
+      action: 'CREATE_DOCTOR',
+      entity: 'Doctor',
+      entityId: doctor.id,
+      details: { 
+        name: doctor.name, 
+        speciality: doctor.speciality,
+        email: user.email
+      },
+      req
+    });
+
     return res.status(201).json({ doctor, user });
   } catch (error) {
     console.error('Create Doctor Error:', error);
@@ -83,15 +115,18 @@ export const createDoctor = async (req, res) => {
   }
 };
 
-// GET doctors of clinic
-// GET doctors of clinic (only active)
-// GET doctors of clinic (all, active + inactive)
+// ----------------------------------------------------------------
+// GET DOCTORS (Active Only)
+// ----------------------------------------------------------------
 export const getDoctors = async (req, res) => {
   try {
     const { clinicId } = req.user;
 
     const doctors = await prisma.doctor.findMany({
-      where: { clinicId },
+      where: { 
+        clinicId,
+        deletedAt: null // ✅ Filter deleted doctors
+      },
       orderBy: { name: 'asc' }
     });
 
@@ -102,18 +137,22 @@ export const getDoctors = async (req, res) => {
   }
 };
 
-
-// UPDATE doctor and linked user info
+// ----------------------------------------------------------------
+// UPDATE DOCTOR
+// ----------------------------------------------------------------
 export const updateDoctor = async (req, res) => {
   try {
-    const { clinicId } = req.user;
+    const { clinicId, userId } = req.user;
     const { id } = req.params;
-    const { name, email, phone, speciality, experience, avatar, password } =
-      req.body;
+    const { name, email, phone, speciality, experience, avatar, password } = req.body;
 
-    // Ensure doctor belongs to this clinic
+    // Ensure doctor belongs to this clinic AND NOT DELETED
     const existingDoctor = await prisma.doctor.findFirst({
-      where: { id, clinicId }
+      where: { 
+        id, 
+        clinicId,
+        deletedAt: null 
+      }
     });
 
     if (!existingDoctor) {
@@ -128,8 +167,7 @@ export const updateDoctor = async (req, res) => {
         avatar: avatar !== undefined ? avatar : existingDoctor.avatar,
         speciality: speciality ?? existingDoctor.speciality,
         phone: phone ?? existingDoctor.phone,
-        experience:
-          experience !== undefined ? Number(experience) : existingDoctor.experience
+        experience: experience !== undefined ? Number(experience) : existingDoctor.experience
       }
     });
 
@@ -152,9 +190,7 @@ export const updateDoctor = async (req, res) => {
     }
     if (password) {
       if (password.length < 6) {
-        return res
-          .status(400)
-          .json({ error: 'Password must be at least 6 characters' });
+        return res.status(400).json({ error: 'Password must be at least 6 characters' });
       }
       userData.password = await bcrypt.hash(password, 12);
     }
@@ -164,6 +200,23 @@ export const updateDoctor = async (req, res) => {
       data: userData
     });
 
+    // ✅ LOG AUDIT
+    const changes = {};
+    if (name !== existingDoctor.name) changes.name = name;
+    if (speciality !== existingDoctor.speciality) changes.speciality = speciality;
+    if (email !== user.email) changes.email = email;
+    if (password) changes.password = "Password Changed";
+
+    await logAudit({
+      userId: userId || req.user.userId,
+      clinicId,
+      action: 'UPDATE_DOCTOR',
+      entity: 'Doctor',
+      entityId: id,
+      details: changes,
+      req
+    });
+
     return res.json({ doctor: doctorUpdated, user: userUpdated });
   } catch (error) {
     console.error('Update Doctor Error:', error);
@@ -171,13 +224,17 @@ export const updateDoctor = async (req, res) => {
   }
 };
 
-// TOGGLE doctor active/inactive
+// ----------------------------------------------------------------
+// TOGGLE DOCTOR ACTIVE
+// ----------------------------------------------------------------
 export const toggleDoctorActive = async (req, res) => {
   try {
-    const { clinicId } = req.user;
+    const { clinicId, userId } = req.user;
     const { id } = req.params;
 
-    const existing = await prisma.doctor.findFirst({ where: { id, clinicId } });
+    const existing = await prisma.doctor.findFirst({ 
+        where: { id, clinicId, deletedAt: null } // ✅ Check deleted
+    });
 
     if (!existing) {
       return res.status(404).json({ error: 'Doctor not found in this clinic' });
@@ -188,9 +245,70 @@ export const toggleDoctorActive = async (req, res) => {
       data: { isActive: !existing.isActive }
     });
 
+    // ✅ LOG AUDIT
+    await logAudit({
+      userId: userId || req.user.userId,
+      clinicId,
+      action: 'TOGGLE_DOCTOR_STATUS',
+      entity: 'Doctor',
+      entityId: id,
+      details: { 
+        name: existing.name,
+        previousStatus: existing.isActive ? 'Active' : 'Inactive',
+        newStatus: updated.isActive ? 'Active' : 'Inactive'
+      },
+      req
+    });
+
     return res.json({ message: 'Doctor status updated', doctor: updated });
   } catch (error) {
     console.error('Toggle Doctor Active Error:', error);
     return res.status(500).json({ error: error.message });
   }
 };
+
+// ----------------------------------------------------------------
+// DELETE DOCTOR (Soft Delete)
+// ----------------------------------------------------------------
+export const deleteDoctor = async (req, res) => {
+    try {
+      const { clinicId, userId } = req.user;
+      const { id } = req.params;
+  
+      const existing = await prisma.doctor.findFirst({ 
+          where: { id, clinicId, deletedAt: null } 
+      });
+  
+      if (!existing) {
+        return res.status(404).json({ error: 'Doctor not found in this clinic' });
+      }
+
+      // 1. Soft Delete Doctor Profile
+      await prisma.doctor.update({
+        where: { id },
+        data: { deletedAt: new Date(), isActive: false }
+      });
+  
+      // 2. Soft Delete User Account (so they can't login)
+      await prisma.user.updateMany({
+        where: { doctorId: id },
+        data: { deletedAt: new Date() }
+      });
+  
+      // ✅ LOG AUDIT
+      await logAudit({
+        userId: userId || req.user.userId,
+        clinicId,
+        action: 'DELETE_DOCTOR',
+        entity: 'Doctor',
+        entityId: id,
+        details: { name: existing.name },
+        req
+      });
+  
+      return res.json({ message: 'Doctor deleted successfully (soft)' });
+    } catch (error) {
+      console.error('Delete Doctor Error:', error);
+      return res.status(500).json({ error: error.message });
+    }
+  };

@@ -1,25 +1,32 @@
 import prisma from '../prisma.js';
+import { logAudit } from '../utils/audit.js';
 
-// CREATE Slot POST /api/admin/slots
+// ----------------------------------------------------------------
+// CREATE SINGLE SLOT
+// ----------------------------------------------------------------
 export const createSlot = async (req, res) => {
   try {
-    const { clinicId } = req.user;
-    if (!clinicId) {
-      return res.status(400).json({ error: 'Clinic ID missing in token' });
-    }
+    const { clinicId, userId } = req.user;
+    if (!clinicId) return res.status(400).json({ error: 'Clinic ID missing in token' });
 
-    const { doctorId, date, time, duration, type, price } = req.body;
+    // ✅ Get paymentMode instead of type
+    const { doctorId, date, time, duration, price, paymentMode } = req.body; 
 
-    if (!doctorId || !date || !time || !duration || !type) {
+    if (!doctorId || !date || !time || !duration) {
       return res.status(400).json({
-        error: 'doctorId, date, time, duration, type are required'
+        error: 'doctorId, date, time, duration are required'
       });
     }
 
-    // ensure doctor belongs to this clinic
+    // Ensure doctor belongs to this clinic AND is not deleted
     const doctor = await prisma.doctor.findFirst({
-      where: { id: doctorId, clinicId }
+      where: { 
+        id: doctorId, 
+        clinicId,
+        deletedAt: null 
+      }
     });
+
     if (!doctor) {
       return res.status(404).json({ error: 'Doctor not found in this clinic' });
     }
@@ -31,9 +38,27 @@ export const createSlot = async (req, res) => {
         date: new Date(date),
         time,
         duration: Number(duration),
-        type,
-        price: type === 'PAID' ? Number(price || 0) : 0
+        // ✅ Handle paymentMode and Price
+        paymentMode: paymentMode || 'ONLINE', // Default if missing
+        price: paymentMode === 'FREE' ? 0 : Number(price || 0),
+        // Deprecated 'type' field handling if still in schema
+        type: paymentMode === 'FREE' ? 'FREE' : 'PAID', 
       }
+    });
+
+    await logAudit({
+      userId: userId || req.user.userId,
+      clinicId,
+      action: 'CREATE_SLOT',
+      entity: 'Slot',
+      entityId: slot.id,
+      details: {
+        doctorName: doctor.name,
+        date: new Date(date).toLocaleDateString(),
+        time,
+        paymentMode // Log this
+      },
+      req
     });
 
     return res.status(201).json(slot);
@@ -43,17 +68,21 @@ export const createSlot = async (req, res) => {
   }
 };
 
-// LIST slots for a doctor
+// ----------------------------------------------------------------
+// LIST SLOTS
+// ----------------------------------------------------------------
 export const getSlots = async (req, res) => {
   try {
     const { clinicId } = req.user;
     const { doctorId, date } = req.query;
 
-    if (!doctorId) {
-      return res.status(400).json({ error: 'doctorId is required' });
-    }
+    if (!doctorId) return res.status(400).json({ error: 'doctorId is required' });
 
-    const where = { clinicId, doctorId };
+    const where = { 
+      clinicId, 
+      doctorId,
+      deletedAt: null
+    };
 
     if (date) {
       const d = new Date(date);
@@ -74,36 +103,48 @@ export const getSlots = async (req, res) => {
   }
 };
 
-// UPDATE Slot
+// ----------------------------------------------------------------
+// UPDATE SLOT
+// ----------------------------------------------------------------
 export const updateSlot = async (req, res) => {
   try {
-    const { clinicId } = req.user;
+    const { clinicId, userId } = req.user;
     const { id } = req.params;
-    const { date, time, duration, type, price } = req.body;
+    // ✅ Get paymentMode
+    const { date, time, duration, price, paymentMode } = req.body;
 
     const existing = await prisma.slot.findFirst({
-      where: { id, clinicId }
+      where: { id, clinicId, deletedAt: null }
     });
 
-    if (!existing) {
-      return res.status(404).json({ error: 'Slot not found in this clinic' });
-    }
+    if (!existing) return res.status(404).json({ error: 'Slot not found' });
 
     const updated = await prisma.slot.update({
       where: { id },
       data: {
         date: date ? new Date(date) : existing.date,
         time: time ?? existing.time,
-        duration:
-          duration !== undefined ? Number(duration) : existing.duration,
-        type: type ?? existing.type,
-        price:
-          type === 'PAID'
-            ? Number(price || existing.price)
-            : type === 'FREE'
-            ? 0
-            : existing.price
+        duration: duration !== undefined ? Number(duration) : existing.duration,
+        paymentMode: paymentMode ?? existing.paymentMode,
+        price: paymentMode === 'FREE' ? 0 : (price !== undefined ? Number(price) : existing.price),
+        // Sync deprecated type field
+        type: (paymentMode === 'FREE' || existing.paymentMode === 'FREE') ? 'FREE' : 'PAID'
       }
+    });
+
+    await logAudit({
+      userId: userId || req.user.userId,
+      clinicId,
+      action: 'UPDATE_SLOT',
+      entity: 'Slot',
+      entityId: id,
+      details: {
+        oldTime: existing.time,
+        newTime: updated.time,
+        oldMode: existing.paymentMode,
+        newMode: updated.paymentMode
+      },
+      req
     });
 
     return res.json(updated);
@@ -113,45 +154,62 @@ export const updateSlot = async (req, res) => {
   }
 };
 
-// DELETE Slot
+// ----------------------------------------------------------------
+// DELETE SLOT
+// ----------------------------------------------------------------
 export const deleteSlot = async (req, res) => {
   try {
-    const { clinicId } = req.user;
+    const { clinicId, userId } = req.user;
     const { id } = req.params;
 
     const existing = await prisma.slot.findFirst({
-      where: { id, clinicId }
+      where: { id, clinicId },
+      include: { doctor: { select: { name: true } } }
     });
 
-    if (!existing) {
-      return res.status(404).json({ error: 'Slot not found in this clinic' });
-    }
+    if (!existing) return res.status(404).json({ error: 'Slot not found' });
 
-    await prisma.slot.delete({
-      where: { id }
+    await prisma.slot.update({
+      where: { id },
+      data: { deletedAt: new Date() }
     });
 
-    return res.json({ message: 'Slot deleted' });
+    await logAudit({
+      userId: userId || req.user.userId,
+      clinicId,
+      action: 'DELETE_SLOT',
+      entity: 'Slot',
+      entityId: id,
+      details: {
+        doctorName: existing.doctor?.name,
+        date: new Date(existing.date).toLocaleDateString(),
+        time: existing.time
+      },
+      req
+    });
+
+    return res.json({ message: 'Slot deleted (soft)' });
   } catch (error) {
     console.error('Delete Slot Error:', error);
     return res.status(500).json({ error: error.message });
   }
 };
 
-
-// POST /api/admin/slots/bulk
-
-
-
+// ----------------------------------------------------------------
+// BULK CREATE
+// ----------------------------------------------------------------
 export const createBulkSlots = async (req, res) => {
   try {
+    const { clinicId, userId } = req.user; 
+    // ✅ Get paymentMode
     const { 
       doctorId,
       startDate,
       endDate,
-      startTime,  // e.g., "09:00"
-      duration,   // e.g., 30
-      days
+      startTime,  
+      duration, 
+      days,
+      paymentMode 
     } = req.body;
 
     if (!doctorId || !startDate || !endDate || !startTime || !duration) {
@@ -160,36 +218,46 @@ export const createBulkSlots = async (req, res) => {
 
     const doctor = await prisma.doctor.findUnique({
       where: { id: doctorId },
-      select: { clinicId: true }
+      select: { clinicId: true, name: true, deletedAt: true }
     });
 
-    if (!doctor) {
+    if (!doctor || doctor.deletedAt) {
       return res.status(404).json({ error: "Doctor not found" });
     }
 
-    const slotsToCreate = [];
-    let currentDate = new Date(startDate);
-    const finalDate = new Date(endDate);
+    const selectedDays = days.map(d => parseInt(d));
 
-    // Loop through dates
+    const slotsToCreate = [];
+    
+    let currentDate = new Date(startDate);
+    currentDate.setHours(12, 0, 0, 0); 
+
+    const finalDate = new Date(endDate);
+    finalDate.setHours(12, 0, 0, 0);
+
+    // ✅ Determine Price Logic
+    // If ONLINE or OFFLINE, price is 500 (or whatever logic you want). If FREE, 0.
+    // Ideally, frontend should send 'price' if it's customizable. 
+    // Here we assume 500 default for paid slots.
+    const slotPrice = paymentMode === 'FREE' ? 0 : 500; 
+
     while (currentDate <= finalDate) {
-      
-      // Check if this day matches selected days (Mon, Tue, etc.)
-      if (days.includes(currentDate.getDay())) {
-        
-        // CREATE ONLY ONE SLOT AT startTime (not a range)
+      const dayIndex = currentDate.getDay(); 
+
+      if (selectedDays.includes(dayIndex)) {
         slotsToCreate.push({
           doctorId: doctorId,
           clinicId: doctor.clinicId,
-          date: new Date(currentDate),
-          time: startTime, // Just this one time
+          date: new Date(currentDate), 
+          time: startTime, 
           duration: parseInt(duration),
-          type: "PAID",
-          price: 500
+          // ✅ Use paymentMode
+          paymentMode: paymentMode || 'ONLINE',
+          price: slotPrice,
+          type: paymentMode === 'FREE' ? 'FREE' : 'PAID' // Deprecated fallback
         });
       }
       
-      // Move to next day
       currentDate.setDate(currentDate.getDate() + 1);
     }
 
@@ -197,7 +265,6 @@ export const createBulkSlots = async (req, res) => {
       return res.status(400).json({ error: "No slots generated." });
     }
 
-    // Save one by one (handles duplicates)
     let successCount = 0;
     let duplicateCount = 0;
 
@@ -212,6 +279,25 @@ export const createBulkSlots = async (req, res) => {
           console.error(`Failed to create slot:`, error.message);
         }
       }
+    }
+
+    if (successCount > 0) {
+      await logAudit({
+        userId: userId || req.user.userId,
+        clinicId,
+        action: 'BULK_CREATE_SLOTS',
+        entity: 'Slot',
+        entityId: 'BULK',
+        details: {
+          doctorName: doctor.name,
+          count: successCount,
+          skipped: duplicateCount,
+          startDate,
+          endDate,
+          paymentMode // Log this
+        },
+        req
+      });
     }
 
     res.json({ 
