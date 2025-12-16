@@ -1,7 +1,20 @@
 import prisma from '../prisma.js';
 import bcrypt from 'bcryptjs';
-// ✅ Import Logger
 import { logAudit } from '../utils/audit.js';
+
+// helper to get current plan for a clinic
+async function getClinicPlan(clinicId) {
+  const clinic = await prisma.clinic.findUnique({
+    where: { id: clinicId },
+    include: {
+      subscription: {
+        include: { plan: true },
+      },
+    },
+  });
+
+  return clinic?.subscription?.plan || null; // Plan has allowOnlinePayments, allowCustomBranding, enableAuditLogs, etc. [web:1186]
+}
 
 // ----------------------------------------------------------------
 // GET /api/admin/profile (admin + clinic info)
@@ -19,12 +32,14 @@ export const getAdminProfile = async (req, res) => {
         phone: true,
         role: true,
         clinicId: true,
-        deletedAt: true
-      }
+        deletedAt: true,
+      },
     });
 
     if (!admin || admin.deletedAt) {
-      return res.status(404).json({ error: 'Admin account not found or inactive.' });
+      return res
+        .status(404)
+        .json({ error: 'Admin account not found or inactive.' });
     }
 
     const clinic = await prisma.clinic.findUnique({
@@ -39,24 +54,27 @@ export const getAdminProfile = async (req, res) => {
         details: true,
         logo: true,
         banner: true,
-        deletedAt: true
-      }
+        deletedAt: true,
+      },
     });
 
     if (!clinic || clinic.deletedAt) {
       return res.status(404).json({ error: 'Clinic not found or inactive.' });
     }
 
-    // Clean up response
+    // get current plan for this clinic
+    const plan = await getClinicPlan(clinicId);
+
     delete admin.deletedAt;
     delete clinic.deletedAt;
 
-    return res.json({ admin, clinic });
+    return res.json({ admin, clinic, plan }); // ✅ send plan
   } catch (error) {
     console.error('Get Admin Profile Error:', error);
     return res.status(500).json({ error: error.message });
   }
 };
+
 
 // ----------------------------------------------------------------
 // PATCH /api/admin/profile
@@ -66,13 +84,12 @@ export const updateAdminProfile = async (req, res) => {
     const { userId, clinicId } = req.user;
     const { name, phone, password } = req.body;
 
-    // 1. Fetch current data (Check deleted)
     const currentAdmin = await prisma.user.findUnique({
-      where: { id: userId }
+      where: { id: userId },
     });
 
     if (!currentAdmin || currentAdmin.deletedAt) {
-        return res.status(404).json({ error: "User not found." });
+      return res.status(404).json({ error: 'User not found.' });
     }
 
     const data = {};
@@ -81,7 +98,9 @@ export const updateAdminProfile = async (req, res) => {
 
     if (password) {
       if (password.length < 6) {
-        return res.status(400).json({ error: 'Password must be at least 6 characters' });
+        return res
+          .status(400)
+          .json({ error: 'Password must be at least 6 characters' });
       }
       const hashed = await bcrypt.hash(password, 12);
       data.password = hashed;
@@ -96,15 +115,14 @@ export const updateAdminProfile = async (req, res) => {
         email: true,
         phone: true,
         role: true,
-        clinicId: true
-      }
+        clinicId: true,
+      },
     });
 
-    // ✅ LOG AUDIT
     const changes = {};
     if (name && name !== currentAdmin.name) changes.name = name;
     if (phone && phone !== currentAdmin.phone) changes.phone = phone;
-    if (password) changes.password = 'Password Changed'; 
+    if (password) changes.password = 'Password Changed';
 
     await logAudit({
       userId,
@@ -113,7 +131,7 @@ export const updateAdminProfile = async (req, res) => {
       entity: 'User',
       entityId: userId,
       details: changes,
-      req
+      req,
     });
 
     return res.json({ admin: updated });
@@ -129,14 +147,23 @@ export const updateAdminProfile = async (req, res) => {
 export const updateClinicSettings = async (req, res) => {
   try {
     const { clinicId, userId } = req.user;
-    const { address, city, pincode, timings, details, logo, banner } = req.body;
+    const {
+      address,
+      city,
+      pincode,
+      timings,
+      details,
+      googlePlaceId,
+      googleMapsUrl,
+      googleReviewsEmbedCode,
+      googleRating,           // ✅ new field from body
+    } = req.body;
 
-    // Check if clinic exists & active
     const existingClinic = await prisma.clinic.findUnique({
-        where: { id: clinicId }
+      where: { id: clinicId },
     });
     if (!existingClinic || existingClinic.deletedAt) {
-        return res.status(404).json({ error: "Clinic not found." });
+      return res.status(404).json({ error: 'Clinic not found.' });
     }
 
     const data = {};
@@ -145,8 +172,35 @@ export const updateClinicSettings = async (req, res) => {
     if (pincode !== undefined) data.pincode = pincode;
     if (timings !== undefined) data.timings = timings;
     if (details !== undefined) data.details = details;
-    if (logo !== undefined) data.logo = logo;
-    if (banner !== undefined) data.banner = banner;
+
+    // ✅ Google config fields
+    if (googlePlaceId !== undefined) data.googlePlaceId = googlePlaceId;
+    if (googleMapsUrl !== undefined) data.googleMapsUrl = googleMapsUrl;
+    if (googleReviewsEmbedCode !== undefined) {
+      data.googleReviewsEmbedCode = googleReviewsEmbedCode;
+    }
+
+    // ✅ numeric rating only (0–5, manual or synced)
+    if (googleRating !== undefined && googleRating !== '') {
+      data.googleRating = Number(googleRating);
+    }
+
+    const logoFile = req.files?.logo?.[0];
+    const bannerFile = req.files?.banner?.[0];
+
+    if (logoFile) {
+      const baseUrl =
+        process.env.APP_BASE_URL ||
+        `http://localhost:${process.env.PORT || 5000}`;
+      data.logo = `${baseUrl}/uploads/${logoFile.filename}`;
+    }
+
+    if (bannerFile) {
+      const baseUrl =
+        process.env.APP_BASE_URL ||
+        `http://localhost:${process.env.PORT || 5000}`;
+      data.banner = `${baseUrl}/uploads/${bannerFile.filename}`;
+    }
 
     const clinic = await prisma.clinic.update({
       where: { id: clinicId },
@@ -160,19 +214,22 @@ export const updateClinicSettings = async (req, res) => {
         timings: true,
         details: true,
         logo: true,
-        banner: true
-      }
+        banner: true,
+        googlePlaceId: true,
+        googleMapsUrl: true,
+        googleReviewsEmbedCode: true,
+        googleRating: true,      // ✅ include in response
+      },
     });
 
-    // ✅ LOG AUDIT
     await logAudit({
       userId: userId || req.user.userId,
       clinicId,
       action: 'UPDATE_CLINIC_SETTINGS',
       entity: 'Clinic',
       entityId: clinicId,
-      details: data, 
-      req
+      details: data,
+      req,
     });
 
     return res.json({ clinic });
@@ -190,9 +247,21 @@ export const updateClinicGateway = async (req, res) => {
     const { clinicId, userId } = req.user;
     const { provider, apiKey, secretKey, isActive } = req.body;
 
-    // Check clinic validity first
-    const clinicCheck = await prisma.clinic.findUnique({ where: { id: clinicId }});
-    if(!clinicCheck || clinicCheck.deletedAt) return res.status(404).json({error: "Clinic not found"});
+    // 1) Check clinic validity
+    const clinicCheck = await prisma.clinic.findUnique({
+      where: { id: clinicId },
+    });
+    if (!clinicCheck || clinicCheck.deletedAt) {
+      return res.status(404).json({ error: 'Clinic not found' });
+    }
+
+    // 2) Gate by plan: only plans with allowOnlinePayments can configure gateways
+    const plan = await getClinicPlan(clinicId);
+    if (!plan || !plan.allowOnlinePayments) {
+      return res.status(403).json({
+        error: 'Online payments are disabled on your current plan.',
+      });
+    }
 
     if (!provider) {
       return res.status(400).json({ error: 'provider is required' });
@@ -200,26 +269,25 @@ export const updateClinicGateway = async (req, res) => {
 
     const gateway = await prisma.paymentGateway.upsert({
       where: {
-        clinicId_provider: {
+        clinicId_name: {
           clinicId,
-          provider
-        }
+          name: provider, // matches your PaymentGateway.name field
+        },
       },
       update: {
         apiKey: apiKey ?? undefined,
-        secretKey: secretKey ?? undefined,
-        isActive: typeof isActive === 'boolean' ? isActive : undefined
+        secret: secretKey ?? undefined,
+        isActive: typeof isActive === 'boolean' ? isActive : undefined,
       },
       create: {
         clinicId,
-        provider,
+        name: provider,
         apiKey: apiKey || '',
-        secretKey: secretKey || '',
-        isActive: isActive ?? true
-      }
+        secret: secretKey || '',
+        isActive: isActive ?? true,
+      },
     });
 
-    // ✅ LOG AUDIT
     await logAudit({
       userId: userId || req.user.userId,
       clinicId,
@@ -230,9 +298,9 @@ export const updateClinicGateway = async (req, res) => {
         provider,
         isActive,
         apiKey: apiKey ? '***UPDATED***' : 'Unchanged',
-        secretKey: secretKey ? '***UPDATED***' : 'Unchanged'
+        secretKey: secretKey ? '***UPDATED***' : 'Unchanged',
       },
-      req
+      req,
     });
 
     return res.json({ gateway });

@@ -19,6 +19,12 @@ import {
   toggleAuditPermission,
   getClinicAdminById,
 } from '../controllers/superAdminController.js';
+import {
+  listPlans,
+  createPlan,
+  updatePlan,
+  deletePlan,
+} from '../controllers/planController.js';
 import { authMiddleware, requireSuperAdmin } from '../middleware/auth.js';
 
 const router = Router();
@@ -78,5 +84,9 @@ router.get(
   requireSuperAdmin,
   getGlobalBookingsStats
 );
+router.get('/plans', authMiddleware, requireSuperAdmin, listPlans);
+router.post('/plans', authMiddleware, requireSuperAdmin, createPlan);
+router.put('/plans/:id', authMiddleware, requireSuperAdmin, updatePlan);
+router.delete('/plans/:id', authMiddleware, requireSuperAdmin, deletePlan);
 
 export default router;

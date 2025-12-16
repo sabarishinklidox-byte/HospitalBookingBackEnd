@@ -62,7 +62,7 @@ export const getAppointments = async (req, res) => {
         user: { select: { name: true, phone: true, email: true } },
         doctor: { select: { name: true, speciality: true } },
         slot: { select: { date: true, time: true } },
-        logs: { orderBy: { createdAt: 'desc' } }, // AppointmentLog[]
+        logs: { orderBy: { createdAt: 'desc' } },
       },
     });
 
@@ -70,6 +70,9 @@ export const getAppointments = async (req, res) => {
       id: app.id,
       status: app.status,
       userId: app.userId,
+
+      // ✅ expose doctorId so front‑end can reschedule
+      doctorId: app.doctorId,
 
       patientName: app.user?.name || 'Unknown',
       patientPhone: app.user?.phone || 'N/A',
@@ -211,6 +214,155 @@ export const updateAppointmentStatus = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+// PATCH /admin/appointments/:id/reschedule
+// body: { newDate, newTime, note, deleteOldSlot?: boolean }
+
+// PATCH /appointments/:id/reschedule
+// body: { newDate, newTime, note, deleteOldSlot?: boolean }
+
+export const rescheduleAppointmentByAdmin = async (req, res) => {
+  try {
+    const { clinicId, userId } = req.user;
+    const { id } = req.params;
+    const { newDate, newTime, note, deleteOldSlot } = req.body;
+
+    if (!newDate || !newTime) {
+      return res
+        .status(400)
+        .json({ error: "New date and time are required." });
+    }
+
+    const appt = await prisma.appointment.findFirst({
+      where: { id, clinicId, deletedAt: null },
+      include: { slot: true, doctor: true, user: true },
+    });
+
+    if (!appt) {
+      return res.status(404).json({ error: "Appointment not found" });
+    }
+
+    const oldSlot = appt.slot;
+    const oldDate = oldSlot.date;
+    const oldTime = oldSlot.time;
+
+    const targetDate = new Date(newDate);
+
+    // 1) find/create new slot
+    let newSlot = await prisma.slot.findFirst({
+      where: {
+        clinicId,
+        doctorId: appt.doctorId,
+        date: targetDate,
+        time: newTime,
+        deletedAt: null,
+      },
+    });
+
+    if (!newSlot) {
+      newSlot = await prisma.slot.create({
+        data: {
+          clinicId,
+          doctorId: appt.doctorId,
+          date: targetDate,
+          time: newTime,
+          duration: oldSlot.duration,
+          type: oldSlot.type,
+          price: oldSlot.price,
+          paymentMode: oldSlot.paymentMode,
+          status: "PENDING",
+        },
+      });
+    } else {
+      const existingAppt = await prisma.appointment.findFirst({
+        where: {
+          slotId: newSlot.id,
+          deletedAt: null,
+          status: { in: ["PENDING", "CONFIRMED"] },
+          id: { not: appt.id },
+        },
+      });
+
+      if (existingAppt) {
+        return res
+          .status(400)
+          .json({ error: "Another appointment already exists in that slot." });
+      }
+    }
+
+    // 2) transaction: move appointment + handle old slot
+    const updated = await prisma.$transaction(async (tx) => {
+      if (deleteOldSlot) {
+        // 🔴 Option 1: soft delete old slot (block it completely)
+        await tx.slot.update({
+          where: { id: oldSlot.id },
+          data: {
+            deletedAt: new Date(),
+          },
+        });
+      } else {
+        // 🟢 Option 2: free old slot for reuse
+        await tx.slot.update({
+          where: { id: oldSlot.id },
+          data: {
+            status: "PENDING",
+          },
+        });
+      }
+
+      const updatedAppt = await tx.appointment.update({
+        where: { id: appt.id },
+        data: {
+          slotId: newSlot.id,
+          status: "CONFIRMED",
+          updatedAt: new Date(),
+        },
+        include: { slot: true, doctor: true, user: true },
+      });
+
+      await tx.appointmentLog.create({
+        data: {
+          appointmentId: appt.id,
+          oldDate,
+          oldTime,
+          newDate: targetDate,
+          newTime,
+          reason: note || "Rescheduled by clinic admin",
+          changedBy: userId,
+        },
+      });
+
+      return updatedAppt;
+    });
+
+    await logAudit({
+      userId,
+      clinicId,
+      action: "RESCHEDULE_APPOINTMENT",
+      entity: "Appointment",
+      entityId: id,
+      details: {
+        previousStatus: appt.status,
+        newStatus: updated.status,
+        oldDate,
+        newDate,
+        oldTime,
+        newTime,
+        deleteOldSlot: !!deleteOldSlot,
+        reason: note || "Rescheduled by clinic admin",
+      },
+      req,
+    });
+
+    return res.json({
+      message: "Appointment rescheduled successfully",
+      appointment: updated,
+    });
+  } catch (error) {
+    console.error("Reschedule Error:", error);
+    return res.status(500).json({ error: "Failed to reschedule appointment" });
+  }
+};
+
 
 // ----------------------------------------------------------------
 // GET SINGLE APPOINTMENT DETAILS

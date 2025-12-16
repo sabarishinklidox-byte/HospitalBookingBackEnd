@@ -2,7 +2,11 @@
 import express from 'express';
 import { adminLogin } from '../controllers/adminAuthController.js';
 import { getAdminDashboard } from '../controllers/adminDashboardController.js';
-import { authMiddleware, requireAdmin, requireAdminOrSuperAdmin } from '../middleware/auth.js';
+import {
+  authMiddleware,
+  requireAdmin,
+  requireAdminOrSuperAdmin,
+} from '../middleware/auth.js';
 
 import {
   createDoctor,
@@ -10,13 +14,17 @@ import {
   updateDoctor,
   toggleDoctorActive,
 } from '../controllers/adminDoctorController.js';
+
 import {
   createSlot,
   getSlots,
   updateSlot,
   deleteSlot,
   createBulkSlots,
+  getDoctorSlotsForReschedule,
+  getDoctorSlotsWindow,
 } from '../controllers/adminSlotController.js';
+
 import {
   getAppointments,
   cancelAppointment,
@@ -24,48 +32,56 @@ import {
   getAppointmentDetails,
   exportAppointmentsExcel,
   exportAppointmentsPdf,
+  rescheduleAppointmentByAdmin,
 } from '../controllers/adminAppointmentController.js';
+
+import { refreshClinicGoogleRating } from '../controllers/clinicController.js';
+
 import {
   getPayments,
   getPaymentsSummary,
 } from '../controllers/adminPaymentController.js';
+
 import { getPatientHistory } from '../controllers/adminPatientController.js';
+
 import {
   getAdminProfile,
   updateAdminProfile,
   updateClinicSettings,
   updateClinicGateway,
 } from '../controllers/adminProfileController.js';
+
 import { getClinicReviews } from '../controllers/adminReviewController.js';
 import { getAuditLogs } from '../controllers/auditController.js';
+
 import {
   getClinicBookingsStats,
   getClinicSlotsUsageStats,
 } from '../controllers/clinicAdminAnalyticsController.js';
 
-// ✅ IMPORT GATEWAY CONTROLLER
-import { 
-  getGatewayConfig, 
-  updateGatewayConfig 
+import { upgradeClinicPlan } from '../controllers/adminSubscriptionController.js';
+
+import {
+  getGatewayConfig,
+  updateGatewayConfig,
 } from '../controllers/adminGatewayController.js';
 
-// ✅ Multer upload middleware
 import { upload } from '../middleware/upload.js';
 
 const router = express.Router();
 
-// Admin Login Route
+// ---------------- Auth ----------------
 router.post('/login', adminLogin);
 
-// Admin dashboard overview
+// ---------------- Dashboard ----------------
 router.get('/dashboard', authMiddleware, requireAdmin, getAdminDashboard);
 
-// Doctors
+// ---------------- Doctors ----------------
 router.post(
   '/doctors',
   authMiddleware,
   requireAdmin,
-  upload.single('avatar'), // 👈 doctor avatar file (optional)
+  upload.single('avatar'),
   createDoctor
 );
 
@@ -75,7 +91,7 @@ router.put(
   '/doctors/:id',
   authMiddleware,
   requireAdmin,
-  upload.single('avatar'), // 👈 allow avatar update
+  upload.single('avatar'),
   updateDoctor
 );
 
@@ -86,27 +102,38 @@ router.patch(
   toggleDoctorActive
 );
 
-// Slots
+// ---------------- Slots ----------------
 router.post('/slots', authMiddleware, requireAdmin, createSlot);
 router.post('/slots/bulk', authMiddleware, requireAdmin, createBulkSlots);
 router.get('/slots', authMiddleware, requireAdmin, getSlots);
 router.put('/slots/:id', authMiddleware, requireAdmin, updateSlot);
 router.delete('/slots/:id', authMiddleware, requireAdmin, deleteSlot);
 
-// Appointments
+// doctor slots window for reschedule UI (Today/Tomorrow/next days)
+router.get(
+  '/doctors/:doctorId/slots',
+  authMiddleware,
+  requireAdmin,
+  getDoctorSlotsWindow   // or getDoctorSlotsForReschedule if you prefer that logic
+);
+
+// ---------------- Appointments ----------------
 router.get('/appointments', authMiddleware, requireAdmin, getAppointments);
+
 router.patch(
   '/appointments/:id/cancel',
   authMiddleware,
   requireAdmin,
   cancelAppointment
 );
+
 router.patch(
   '/appointments/:id/status',
   authMiddleware,
   requireAdmin,
   updateAppointmentStatus
 );
+
 router.get(
   '/appointments/:id',
   authMiddleware,
@@ -114,8 +141,17 @@ router.get(
   getAppointmentDetails
 );
 
-// Payments (Transaction History)
+// ✅ Reschedule (no extra /admin segment)
+router.patch(
+  '/appointments/:id/reschedule',
+  authMiddleware,
+  requireAdmin,
+  rescheduleAppointmentByAdmin
+);
+
+// ---------------- Payments ----------------
 router.get('/payments', authMiddleware, requireAdmin, getPayments);
+
 router.get(
   '/payments/summary',
   authMiddleware,
@@ -123,7 +159,7 @@ router.get(
   getPaymentsSummary
 );
 
-// Patients
+// ---------------- Patients ----------------
 router.get(
   '/patients/:userId/history',
   authMiddleware,
@@ -131,30 +167,51 @@ router.get(
   getPatientHistory
 );
 
-// Profile & Settings
+// ---------------- Profile & Settings ----------------
 router.get('/profile', authMiddleware, requireAdmin, getAdminProfile);
 router.patch('/profile', authMiddleware, requireAdmin, updateAdminProfile);
-router.patch('/clinic', authMiddleware, requireAdmin, updateClinicSettings);
-// Note: 'updateClinicGateway' (singular) might be deprecated if it was for the old method. 
-// We are using the new routes below for Stripe specifically.
 
-// ✅ NEW PAYMENT GATEWAY CONFIG ROUTES
+router.patch(
+  '/clinic',
+  authMiddleware,
+  requireAdmin,
+  upload.fields([
+    { name: 'logo', maxCount: 1 },
+    { name: 'banner', maxCount: 1 },
+  ]),
+  updateClinicSettings
+);
+
+router.patch(
+  '/clinic/gateway',
+  authMiddleware,
+  requireAdmin,
+  updateClinicGateway
+);
+
+// Stripe gateway config
 router.get('/gateway/stripe', authMiddleware, requireAdmin, getGatewayConfig);
 router.post('/gateway/stripe', authMiddleware, requireAdmin, updateGatewayConfig);
 
-// Reviews
+// ---------------- Reviews ----------------
 router.get('/reviews', authMiddleware, requireAdmin, getClinicReviews);
 
-// Audit logs
-router.get('/audit-logs', authMiddleware, requireAdminOrSuperAdmin, getAuditLogs);
+// ---------------- Audit logs ----------------
+router.get(
+  '/audit-logs',
+  authMiddleware,
+  requireAdminOrSuperAdmin,
+  getAuditLogs
+);
 
-// Analytics
+// ---------------- Analytics ----------------
 router.get(
   '/analytics/bookings',
   authMiddleware,
   requireAdmin,
   getClinicBookingsStats
 );
+
 router.get(
   '/analytics/slots-usage',
   authMiddleware,
@@ -162,7 +219,7 @@ router.get(
   getClinicSlotsUsageStats
 );
 
-// Appointments export
+// ---------------- Exports ----------------
 router.get(
   '/appointments/export/excel',
   authMiddleware,
@@ -175,6 +232,21 @@ router.get(
   authMiddleware,
   requireAdmin,
   exportAppointmentsPdf
+);
+
+// ---------------- Subscription & misc ----------------
+router.post(
+  '/subscription/upgrade',
+  authMiddleware,
+  requireAdmin,
+  upgradeClinicPlan
+);
+
+router.post(
+  '/clinic/google-rating/refresh',
+  authMiddleware,
+  requireAdmin,
+  refreshClinicGoogleRating
 );
 
 export default router;

@@ -6,6 +6,24 @@ import { logAudit } from '../utils/audit.js';
 
 // ----------------------------------------------------------------
 // CREATE DOCTOR
+// src/controllers/doctorController.js
+
+
+// helper to get plan
+async function getClinicPlan(clinicId) {
+  const clinic = await prisma.clinic.findUnique({
+    where: { id: clinicId },
+    include: {
+      subscription: {
+        include: { plan: true },
+      },
+    },
+  });
+  return clinic?.subscription?.plan || null; // Plan has maxDoctors etc. [web:1186]
+}
+
+// ----------------------------------------------------------------
+// CREATE DOCTOR
 // ----------------------------------------------------------------
 export const createDoctor = async (req, res) => {
   try {
@@ -18,6 +36,24 @@ export const createDoctor = async (req, res) => {
       return res.status(400).json({ error: 'Clinic ID missing in token' });
     }
 
+    // ✅ Enforce plan doctor limit
+    const plan = await getClinicPlan(clinicId);
+    if (!plan) {
+      return res
+        .status(400)
+        .json({ error: 'No active subscription plan for this clinic.' });
+    }
+
+    const doctorCount = await prisma.doctor.count({
+      where: { clinicId, deletedAt: null },
+    });
+
+    if (doctorCount >= plan.maxDoctors) {
+      return res.status(403).json({
+        error: `Doctor limit reached for your current plan (max ${plan.maxDoctors}).`,
+      });
+    }
+
     const { name, email, phone, speciality, experience, password } = req.body;
 
     if (!name || !email || !speciality || !experience || !password) {
@@ -26,7 +62,6 @@ export const createDoctor = async (req, res) => {
       });
     }
 
-    // avatar from file upload or from body (URL)
     let avatar = null;
     if (req.file) {
       avatar = `/uploads/${req.file.filename}`;
@@ -34,7 +69,6 @@ export const createDoctor = async (req, res) => {
       avatar = req.body.avatar;
     }
 
-    // Check if email already exists...
     const existingUser = await prisma.user.findUnique({ where: { email } });
     if (existingUser) {
       if (existingUser.deletedAt) {
@@ -65,7 +99,7 @@ export const createDoctor = async (req, res) => {
       data: {
         slug,
         name,
-        avatar,                 // 👈 now uses value from req.file / body
+        avatar,
         speciality,
         phone: phone || '',
         experience: Number(experience),
@@ -74,13 +108,8 @@ export const createDoctor = async (req, res) => {
       },
     });
 
-    // ...rest of your code (hash password, create user, logAudit, etc.)
-
-
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 12);
 
-    // Create user login linked to doctor
     const user = await prisma.user.create({
       data: {
         id: uuidv4(),
@@ -89,23 +118,22 @@ export const createDoctor = async (req, res) => {
         name,
         phone: phone || '',
         role: 'DOCTOR',
-        doctorId: doctor.id
-      }
+        doctorId: doctor.id,
+      },
     });
 
-    // ✅ LOG AUDIT
     await logAudit({
       userId: userId || req.user.userId,
       clinicId,
       action: 'CREATE_DOCTOR',
       entity: 'Doctor',
       entityId: doctor.id,
-      details: { 
-        name: doctor.name, 
+      details: {
+        name: doctor.name,
         speciality: doctor.speciality,
-        email: user.email
+        email: user.email,
       },
-      req
+      req,
     });
 
     return res.status(201).json({ doctor, user });
@@ -114,6 +142,7 @@ export const createDoctor = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
 
 // ----------------------------------------------------------------
 // GET DOCTORS (Active Only)

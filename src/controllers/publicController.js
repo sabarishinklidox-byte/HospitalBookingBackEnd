@@ -1,5 +1,6 @@
 import prisma from '../prisma.js';
 
+
 // ----------------------------------------------------------------
 // GET /api/public/clinics
 // ----------------------------------------------------------------
@@ -20,6 +21,12 @@ export const getClinics = async (req, res) => {
         details: true,
         logo: true,
         banner: true,
+        // ✅ Google reviews fields
+        googlePlaceId: true,
+        googleMapsUrl: true,
+        googleReviewsEmbedCode: true,
+        googleRating: true,          // <‑‑ add this
+        googleTotalReviews: true,    // <‑‑ optional
       },
       orderBy: { name: 'asc' },
     });
@@ -30,6 +37,8 @@ export const getClinics = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
+
 
 // ----------------------------------------------------------------
 // GET /api/public/clinics/:clinicId/doctors
@@ -58,7 +67,7 @@ export const getDoctorsByClinic = async (req, res) => {
         speciality: true,
         phone: true,
         experience: true,
-        avatar: true,          // 👈 add this
+        avatar: true,
         reviews: {
           where: { deletedAt: null },
           select: { rating: true },
@@ -86,6 +95,7 @@ export const getDoctorsByClinic = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
 
 // ----------------------------------------------------------------
 // GET /api/public/doctors/:doctorId/slots
@@ -147,6 +157,7 @@ export const getSlotsByDoctor = async (req, res) => {
   }
 };
 
+
 // ----------------------------------------------------------------
 // GET /api/public/doctors/:id
 // ----------------------------------------------------------------
@@ -191,6 +202,7 @@ export const getDoctorById = async (req, res) => {
   }
 };
 
+
 // ----------------------------------------------------------------
 // GET /api/public/clinics/:id (increments linkClicks)
 // ----------------------------------------------------------------
@@ -198,7 +210,6 @@ export const getPublicClinicById = async (req, res) => {
   const { id } = req.params;
 
   try {
-    // 1) Find clinic that is public
     const clinic = await prisma.clinic.findFirst({
       where: { id, deletedAt: null, isActive: true },
       select: {
@@ -210,6 +221,12 @@ export const getPublicClinicById = async (req, res) => {
         logo: true,
         banner: true,
         linkClicks: true,
+        // ✅ Google reviews fields
+        googlePlaceId: true,
+        googleMapsUrl: true,
+        googleReviewsEmbedCode: true,
+        googleRating: true,          // <‑‑ add this
+        googleTotalReviews: true,    // <‑‑ optional
       },
     });
 
@@ -217,7 +234,6 @@ export const getPublicClinicById = async (req, res) => {
       return res.status(404).json({ error: 'Clinic not found' });
     }
 
-    // 2) Increment counter (best-effort)
     await prisma.clinic
       .update({
         where: { id },

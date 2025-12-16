@@ -1,4 +1,3 @@
-// This is your Prisma schema file
 generator client {
   provider = "prisma-client-js"
 }
@@ -31,7 +30,6 @@ enum SlotType {
   PAID
 }
 
-// ✅ THIS WAS MISSING - ADDED HERE
 enum SlotPaymentMode {
   ONLINE
   OFFLINE
@@ -44,6 +42,13 @@ enum PaymentStatus {
   FAILED
   REFUNDED
   CANCELLED
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+  TRIAL
 }
 
 enum DoctorSpeciality {
@@ -72,84 +77,153 @@ enum BookingSection {
   OTHER
 }
 
-// --- MODELS ---
+// --- SAAS SUBSCRIPTION MODELS (NEW) ---
+
+model Plan {
+  id                  String   @id @default(uuid())
+  name                String
+  slug                String   @unique
+  priceMonthly        Decimal
+  currency            String   @default("INR")
+
+  // Feature Limits
+  maxDoctors          Int      @default(1)
+  maxBookingsPerMonth Int      @default(100)
+  allowOnlinePayments Boolean  @default(false)
+  allowCustomBranding Boolean  @default(false)
+
+  // Feature flags
+  enableReviews       Boolean  @default(true)   // ✅ doctor reviews feature
+  enableBulkSlots     Boolean  @default(true)   // ✅ bulk slot creation
+  enableExports       Boolean  @default(true)   // ✅ export PDF/Excel
+  enableAuditLogs     Boolean  @default(true)
+  enableGoogleReviews Boolean  @default(false)  // ✅ Google ratings on public pages
+
+  isActive            Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  deletedAt           DateTime?
+
+  subscriptions       Subscription[]
+
+  @@map("plans")
+}
+
+
+model Subscription {
+  id                   String             @id @default(uuid())
+  clinicId             String             @unique // One active sub per clinic
+  planId               String
+  status               SubscriptionStatus @default(ACTIVE)
+
+  startDate            DateTime           @default(now())
+  endDate              DateTime?          // Null means auto-renewing or lifetime
+  nextBillingDate      DateTime?
+
+  // External Payment Gateway IDs (for recurring billing)
+  gatewaySubscriptionId String?          // e.g. sub_12345 (Stripe)
+  gatewayCustomerId      String?         // e.g. cus_12345
+
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+  deletedAt            DateTime?         // Soft Delete
+
+  clinic               Clinic            @relation(fields: [clinicId], references: [id])
+  plan                 Plan              @relation(fields: [planId], references: [id])
+
+  @@map("subscriptions")
+}
+
+// --- EXISTING CORE MODELS ---
 
 model PaymentGateway {
-  id            String    @id @default(uuid())
+  id            String   @id @default(uuid())
   name          String
   apiKey        String?
   secret        String?
   webhookSecret String?
-  isActive      Boolean   @default(true)
+  isActive      Boolean  @default(true)
   clinicId      String
-  createdAt     DateTime  @default(now())
-  deletedAt     DateTime? // ✅ Soft Delete
+  createdAt     DateTime @default(now())
+  deletedAt     DateTime? // Soft Delete
 
-  clinic   Clinic    @relation(fields: [clinicId], references: [id])
-  payments Payment[]
+  clinic        Clinic   @relation(fields: [clinicId], references: [id])
+  payments      Payment[]
 
   @@unique([clinicId, name])
   @@map("payment_gateways")
 }
 
 model User {
-  id        String    @id @default(uuid())
-  email     String    @unique
-  password  String
-  name      String
-  phone     String?
-  avatar    String?
-  role      Role
-  clinicId  String?
-  doctorId  String?   @unique
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  deletedAt DateTime? // ✅ Soft Delete
+  id         String    @id @default(uuid())
+  email      String    @unique
+  password   String
+  name       String
+  phone      String?
+  avatar     String?
+  role       Role
+  clinicId   String?
+  doctorId   String?   @unique
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime? // Soft Delete
 
-  clinic       Clinic?       @relation("ClinicAdmins", fields: [clinicId], references: [id])
-  doctor       Doctor?       @relation("DoctorUser", fields: [doctorId], references: [id])
+  clinic      Clinic?      @relation("ClinicAdmins", fields: [clinicId], references: [id])
+  doctor      Doctor?      @relation("DoctorUser", fields: [doctorId], references: [id])
   appointments Appointment[]
-  
-  reviews       Review[]
-  auditLogs     AuditLog[] 
+
+  reviews      Review[]
+  auditLogs    AuditLog[]
 
   @@map("user")
 }
-
 model Clinic {
-  id             String   @id @default(uuid())
-  slug           String   @unique
-  name           String
-  logo           String?
-  banner         String?
-  address        String
-  city           String
-  pincode        String
-  timings        Json
-  details        String?
-  accountNumber  String
-  ifscCode       String
-  bankName       String
-  
-  // Fields for Super Admin Control
+  id            String   @id @default(uuid())
+  slug          String   @unique
+  name          String
+  logo          String?
+  banner        String?
+  address       String
+  city          String
+  pincode       String
+  timings       Json
+  details       String?
+  accountNumber String
+  ifscCode      String
+  bankName      String
+
+  // Super admin control
   isActive       Boolean  @default(true)
   allowAuditView Boolean  @default(false)
 
+  // Google integration
+  googlePlaceId         String?
+  googleMapsUrl         String?
+  googleReviewsEmbedCode String?
+  googleRating          Decimal?
+  googleTotalReviews    Int?
+  googleReviewsCache    Json?
+  lastGoogleSync        DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-  deletedAt DateTime? // ✅ Soft Delete
+  deletedAt DateTime?
 
-  admins       User[]           @relation("ClinicAdmins")
+  admins       User[]        @relation("ClinicAdmins")
   doctors      Doctor[]
   appointments Appointment[]
   slots        Slot[]
   payments     Payment[]
   gateways     PaymentGateway[]
   auditLogs    AuditLog[]
-  linkClicks   Int     @default(0)
+  linkClicks   Int           @default(0)
+
+  subscription Subscription?
 
   @@map("clinics")
 }
+
+
 
 model Doctor {
   id         String           @id @default(uuid())
@@ -163,7 +237,7 @@ model Doctor {
   isActive   Boolean          @default(true)
   createdAt  DateTime         @default(now())
   updatedAt  DateTime         @updatedAt
-  deletedAt  DateTime?        // ✅ Soft Delete
+  deletedAt  DateTime?        // Soft Delete
 
   clinic       Clinic       @relation(fields: [clinicId], references: [id])
   user         User?        @relation("DoctorUser")
@@ -186,9 +260,8 @@ model Slot {
   price       Decimal           @default(0)
   status      AppointmentStatus @default(PENDING)
   createdAt   DateTime          @default(now())
-  deletedAt   DateTime?         // ✅ Soft Delete
-  
-  // ✅ NOW LINKED TO THE ENUM DEFINED ABOVE
+  deletedAt   DateTime?         // Soft Delete
+
   paymentMode SlotPaymentMode   @default(ONLINE)
 
   doctor       Doctor       @relation(fields: [doctorId], references: [id])
@@ -200,48 +273,48 @@ model Slot {
 }
 
 model Appointment {
-  id           String            @id @default(uuid())
-  slug         String            @unique
-  userId       String
-  doctorId     String
-  clinicId     String
-  slotId       String            @unique
-  section      BookingSection
-  status       AppointmentStatus @default(PENDING)
-  paymentId    String?
-  notes        String?
-  symptoms     String?
+  id          String            @id @default(uuid())
+  slug        String            @unique
+  userId      String
+  doctorId    String
+  clinicId    String
+  slotId      String            @unique
+  section     BookingSection
+  status      AppointmentStatus @default(PENDING)
+  paymentId   String?
+  notes       String?
+  symptoms    String?
   prescription String?
-  createdAt    DateTime          @default(now())
-  updatedAt    DateTime          @updatedAt
-  deletedAt    DateTime?         // ✅ Soft Delete
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  deletedAt   DateTime?         // Soft Delete
 
-  user    User   @relation(fields: [userId], references: [id])
-  doctor  Doctor @relation(fields: [doctorId], references: [id])
-  clinic  Clinic @relation(fields: [clinicId], references: [id])
-  slot    Slot   @relation(fields: [slotId], references: [id])
+  user    User    @relation(fields: [userId], references: [id])
+  doctor  Doctor  @relation(fields: [doctorId], references: [id])
+  clinic  Clinic  @relation(fields: [clinicId], references: [id])
+  slot    Slot    @relation(fields: [slotId], references: [id])
   payment Payment?
 
-  logs    AppointmentLog[]
-  review  Review?
+  logs   AppointmentLog[]
+  review Review?
 
   @@map("appointments")
 }
 
 model Payment {
-  id           String        @id @default(uuid())
-  appointmentId String       @unique
+  id           String       @id @default(uuid())
+  appointmentId String      @unique
   clinicId     String
   doctorId     String
   gatewayId    String
   amount       Decimal
   status       PaymentStatus
   gatewayRefId String?
-  createdAt    DateTime      @default(now())
+  createdAt    DateTime     @default(now())
 
-  appointment Appointment    @relation(fields: [appointmentId], references: [id])
-  clinic      Clinic         @relation(fields: [clinicId], references: [id])
-  doctor      Doctor         @relation(fields: [doctorId], references: [id])
+  appointment Appointment   @relation(fields: [appointmentId], references: [id])
+  clinic      Clinic        @relation(fields: [clinicId], references: [id])
+  doctor      Doctor        @relation(fields: [doctorId], references: [id])
   gateway     PaymentGateway @relation(fields: [gatewayId], references: [id])
 
   @@map("payments")
@@ -250,34 +323,34 @@ model Payment {
 // --- HISTORY & LOGS ---
 
 model AppointmentLog {
-  id            String   @id @default(uuid())
+  id           String   @id @default(uuid())
   appointmentId String
-  oldDate       DateTime
-  oldTime       String
-  newDate       DateTime
-  newTime       String
-  reason        String?
-  changedBy     String
-  createdAt     DateTime @default(now())
+  oldDate      DateTime
+  oldTime      String
+  newDate      DateTime
+  newTime      String
+  reason       String?
+  changedBy    String
+  createdAt    DateTime @default(now())
 
-  appointment   Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  appointment  Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
 
   @@map("appointment_logs")
 }
 
 model Review {
-  id            String   @id @default(uuid())
-  appointmentId String   @unique
-  doctorId      String
-  userId        String
-  rating        Int
-  comment       String?
-  createdAt     DateTime @default(now())
-  deletedAt     DateTime? // ✅ Soft Delete
+  id           String   @id @default(uuid())
+  appointmentId String  @unique
+  doctorId     String
+  userId       String
+  rating       Int
+  comment      String?
+  createdAt    DateTime @default(now())
+  deletedAt    DateTime? // Soft Delete
 
-  appointment   Appointment @relation(fields: [appointmentId], references: [id])
-  doctor        Doctor      @relation(fields: [doctorId], references: [id])
-  user          User        @relation(fields: [userId], references: [id])
+  appointment  Appointment @relation(fields: [appointmentId], references: [id])
+  doctor       Doctor      @relation(fields: [doctorId], references: [id])
+  user         User        @relation(fields: [userId], references: [id])
 
   @@map("reviews")
 }
@@ -285,7 +358,7 @@ model Review {
 model AuditLog {
   id        String   @id @default(uuid())
   userId    String
-  clinicId  String?  
+  clinicId  String?
   action    String
   entity    String
   entityId  String?
@@ -293,8 +366,8 @@ model AuditLog {
   ipAddress String?
   createdAt DateTime @default(now())
 
-  user      User     @relation(fields: [userId], references: [id])
-  clinic    Clinic?  @relation(fields: [clinicId], references: [id]) 
+  user      User    @relation(fields: [userId], references: [id])
+  clinic    Clinic? @relation(fields: [clinicId], references: [id])
 
   @@map("audit_logs")
 }

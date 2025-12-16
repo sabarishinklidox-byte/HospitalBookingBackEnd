@@ -4,6 +4,21 @@ import Stripe from 'stripe';
 import crypto from 'crypto';
 
 // ----------------------------------------------------------------
+// Helper: load plan for a clinic
+// ----------------------------------------------------------------
+async function getClinicPlan(clinicId) {
+  const clinic = await prisma.clinic.findUnique({
+    where: { id: clinicId },
+    include: {
+      subscription: {
+        include: { plan: true },
+      },
+    },
+  });
+  return clinic?.subscription?.plan || null; // Plan has allowOnlinePayments etc. [web:1186]
+}
+
+// ----------------------------------------------------------------
 // HELPER: Get Gateway Instance
 // ----------------------------------------------------------------
 const getPaymentInstance = async (clinicId, provider = 'RAZORPAY') => {
@@ -11,7 +26,7 @@ const getPaymentInstance = async (clinicId, provider = 'RAZORPAY') => {
     where: {
       clinicId,
       isActive: true,
-      provider: provider, // 'RAZORPAY' or 'STRIPE'
+      provider, // 'RAZORPAY' or 'STRIPE'
     },
   });
 
@@ -47,7 +62,6 @@ export const createBooking = async (req, res) => {
   try {
     const { slotId, userId, paymentMethod, provider } = req.body;
     // paymentMethod: 'ONLINE' | 'OFFLINE'
-    // provider: 'RAZORPAY' | 'STRIPE' (Optional, defaults to RAZORPAY if ONLINE)
 
     // 1. Fetch Slot
     const slot = await prisma.slot.findUnique({
@@ -56,13 +70,36 @@ export const createBooking = async (req, res) => {
     });
 
     if (!slot) return res.status(404).json({ error: 'Slot not found' });
-    if (slot.isBooked) return res.status(400).json({ error: 'Slot already booked' });
+    if (slot.isBooked)
+      return res.status(400).json({ error: 'Slot already booked' });
+
+    // 2. Plan gating for online payments
+    const plan = await getClinicPlan(slot.clinicId);
+    if (!plan) {
+      return res
+        .status(400)
+        .json({ error: 'No active subscription plan for this clinic.' });
+    }
+
+    // If clinic plan does not allow online payments, block ONLINE flow entirely
+    if (
+      paymentMethod === 'ONLINE' ||
+      slot.paymentMode === 'ONLINE' ||
+      slot.paymentMode === 'OFFLINE'
+    ) {
+      if (!plan.allowOnlinePayments) {
+        return res.status(403).json({
+          error:
+            'Online payments are disabled on your current plan. Please upgrade or use OFFLINE/FREE slots.',
+        });
+      }
+    }
 
     // ---------------------------------------------------------
-    // ✅ 2. ENFORCE ADMIN RULES
+    // 3. Admin rules by slot.paymentMode
     // ---------------------------------------------------------
 
-    // A. If Slot is FREE
+    // A. FREE slot
     if (slot.paymentMode === 'FREE') {
       const appointment = await prisma.appointment.create({
         data: {
@@ -80,21 +117,29 @@ export const createBooking = async (req, res) => {
         where: { id: slotId },
         data: { isBooked: true },
       });
-      return res.json({ success: true, message: 'Free booking confirmed!' });
+      return res.json({
+        success: true,
+        message: 'Free booking confirmed!',
+        appointmentId: appointment.id,
+      });
     }
 
-    // B. If Slot is ONLINE ONLY but user wants OFFLINE
+    // B. Slot requires ONLINE but user chose OFFLINE
     if (slot.paymentMode === 'ONLINE' && paymentMethod === 'OFFLINE') {
-      return res.status(400).json({ error: 'This slot requires Online Payment.' });
+      return res
+        .status(400)
+        .json({ error: 'This slot requires Online Payment.' });
     }
 
-    // C. If Slot is OFFLINE ONLY but user wants ONLINE
+    // C. Slot requires OFFLINE but user chose ONLINE
     if (slot.paymentMode === 'OFFLINE' && paymentMethod === 'ONLINE') {
-      return res.status(400).json({ error: 'This slot requires Payment at Clinic.' });
+      return res
+        .status(400)
+        .json({ error: 'This slot requires Payment at Clinic.' });
     }
 
     // ---------------------------------------------------------
-    // 3. HANDLE ONLINE PAYMENT SETUP
+    // 4. HANDLE ONLINE PAYMENT SETUP
     // ---------------------------------------------------------
     let orderData = {};
     let gatewayId = null;
@@ -106,7 +151,7 @@ export const createBooking = async (req, res) => {
 
       if (gateway.provider === 'RAZORPAY') {
         const options = {
-          amount: Math.round(Number(slot.price) * 100), // paisa
+          amount: Math.round(Number(slot.price) * 100),
           currency: 'INR',
           receipt: `rcpt_${slotId}_${Date.now()}`,
         };
@@ -148,7 +193,7 @@ export const createBooking = async (req, res) => {
     }
 
     // ---------------------------------------------------------
-    // 4. CREATE APPOINTMENT RECORD
+    // 5. CREATE APPOINTMENT RECORD
     // ---------------------------------------------------------
     const appointment = await prisma.appointment.create({
       data: {
@@ -156,7 +201,8 @@ export const createBooking = async (req, res) => {
         slotId,
         clinicId: slot.clinicId,
         doctorId: slot.doctorId,
-        status: paymentMethod === 'OFFLINE' ? 'CONFIRMED' : 'PENDING_PAYMENT',
+        status:
+          paymentMethod === 'OFFLINE' ? 'CONFIRMED' : 'PENDING_PAYMENT',
         paymentStatus: 'PENDING',
         paymentMethod,
         amount: slot.price,
@@ -164,7 +210,7 @@ export const createBooking = async (req, res) => {
     });
 
     // ---------------------------------------------------------
-    // 5. FINALIZE OFFLINE BOOKING
+    // 6. FINALIZE OFFLINE BOOKING
     // ---------------------------------------------------------
     if (paymentMethod === 'OFFLINE') {
       await prisma.slot.update({
@@ -180,7 +226,7 @@ export const createBooking = async (req, res) => {
     }
 
     // ---------------------------------------------------------
-    // 6. FINALIZE ONLINE RESPONSE
+    // 7. FINALIZE ONLINE RESPONSE
     // ---------------------------------------------------------
     if (orderData.provider === 'STRIPE' && orderData.url) {
       orderData.url = orderData.url.replace('TEMP_ID', appointment.id);
@@ -190,6 +236,7 @@ export const createBooking = async (req, res) => {
       success: true,
       isOnline: true,
       appointmentId: appointment.id,
+      gatewayId,
       ...orderData,
     });
   } catch (error) {
@@ -214,16 +261,30 @@ export const verifyPayment = async (req, res) => {
       where: { id: appointmentId },
     });
 
-    if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
+    if (!appointment)
+      return res.status(404).json({ error: 'Appointment not found' });
 
-    // Fetch gateway credentials again to verify signature
+    // Plan gating: ensure clinic still allowed online payments
+    const plan = await getClinicPlan(appointment.clinicId);
+    if (!plan || !plan.allowOnlinePayments) {
+      return res.status(403).json({
+        error: 'Online payments are disabled on this clinic plan.',
+      });
+    }
+
     const gateway = await prisma.paymentGateway.findFirst({
-      where: { clinicId: appointment.clinicId, provider: 'RAZORPAY', isActive: true },
+      where: {
+        clinicId: appointment.clinicId,
+        provider: 'RAZORPAY',
+        isActive: true,
+      },
     });
 
-    if (!gateway) return res.status(400).json({ error: 'Payment configuration missing' });
+    if (!gateway)
+      return res
+        .status(400)
+        .json({ error: 'Payment configuration missing' });
 
-    // Verify Signature
     const body = razorpay_order_id + '|' + razorpay_payment_id;
     const expectedSignature = crypto
       .createHmac('sha256', gateway.secretKey)
@@ -231,7 +292,6 @@ export const verifyPayment = async (req, res) => {
       .digest('hex');
 
     if (expectedSignature === razorpay_signature) {
-      // 1. Update Appointment
       await prisma.appointment.update({
         where: { id: appointmentId },
         data: {
@@ -241,13 +301,11 @@ export const verifyPayment = async (req, res) => {
         },
       });
 
-      // 2. Lock Slot
       await prisma.slot.update({
         where: { id: appointment.slotId },
         data: { isBooked: true },
       });
 
-      // 3. Create Payment Record
       await prisma.payment.create({
         data: {
           appointmentId: appointment.id,
@@ -260,7 +318,10 @@ export const verifyPayment = async (req, res) => {
         },
       });
 
-      return res.json({ success: true, message: 'Payment verified & Booking Confirmed' });
+      return res.json({
+        success: true,
+        message: 'Payment verified & Booking Confirmed',
+      });
     } else {
       return res.status(400).json({ success: false, error: 'Invalid signature' });
     }
@@ -283,13 +344,20 @@ export const verifyStripePayment = async (req, res) => {
     if (!appointment)
       return res.status(404).json({ error: 'Appointment not found' });
 
+    // Plan gating: ensure clinic still allowed online payments
+    const plan = await getClinicPlan(appointment.clinicId);
+    if (!plan || !plan.allowOnlinePayments) {
+      return res.status(403).json({
+        error: 'Online payments are disabled on this clinic plan.',
+      });
+    }
+
     const gateway = await getPaymentInstance(appointment.clinicId, 'STRIPE');
     const session = await gateway.instance.checkout.sessions.retrieve(
-      session_id
+      session_id,
     );
 
     if (session.payment_status === 'paid') {
-      // Success
       await prisma.appointment.update({
         where: { id: appointmentId },
         data: {
@@ -318,7 +386,7 @@ export const verifyStripePayment = async (req, res) => {
       return res.status(400).json({ error: 'Payment not completed' });
     }
   } catch (e) {
-    console.error(e);
+    console.error('Stripe Verification Error:', e);
     return res.status(500).json({ error: 'Verification failed' });
   }
 };

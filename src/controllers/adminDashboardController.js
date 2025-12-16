@@ -8,16 +8,27 @@ export const getAdminDashboard = async (req, res) => {
       return res.status(400).json({ error: 'Clinic ID missing in token' });
     }
 
-    // 1. Clinic details
-    const clinic = await prisma.clinic.findUnique({
+    // 1. Clinic + plan
+    const clinicWithSub = await prisma.clinic.findUnique({
       where: { id: clinicId },
-      select: { id: true, name: true, city: true, deletedAt: true },
+      include: {
+        subscription: {
+          include: { plan: true }, // Plan has maxDoctors, allowOnlinePayments, enableAuditLogs, etc. [web:1186]
+        },
+      },
     });
 
-    if (!clinic || clinic.deletedAt) {
+    if (!clinicWithSub || clinicWithSub.deletedAt) {
       return res.status(404).json({ error: 'Clinic not found' });
     }
-    delete clinic.deletedAt;
+
+    const clinic = {
+      id: clinicWithSub.id,
+      name: clinicWithSub.name,
+      city: clinicWithSub.city,
+    };
+
+    const plan = clinicWithSub.subscription?.plan || null;
 
     // 2. Date ranges
     const todayStart = new Date();
@@ -85,7 +96,7 @@ export const getAdminDashboard = async (req, res) => {
     });
     const todayRevenue = todayPaidAppointments.reduce(
       (sum, app) => sum + (Number(app.slot.price) || 0),
-      0
+      0,
     );
 
     // 7. Yesterday's Revenue
@@ -102,7 +113,7 @@ export const getAdminDashboard = async (req, res) => {
     });
     const yesterdayRevenue = yesterdayPaidAppointments.reduce(
       (sum, app) => sum + (Number(app.slot.price) || 0),
-      0
+      0,
     );
 
     // 8. Total Lifetime Revenue
@@ -116,7 +127,7 @@ export const getAdminDashboard = async (req, res) => {
     });
     const totalRevenue = allPaidAppointments.reduce(
       (sum, app) => sum + (Number(app.slot.price) || 0),
-      0
+      0,
     );
 
     // 9. Upcoming Appointments
@@ -131,9 +142,10 @@ export const getAdminDashboard = async (req, res) => {
       },
     });
 
-    // 10. Response
+    // 10. Response with plan
     return res.json({
       clinic,
+      plan, // <- expose plan so frontend can enable/disable dashboard widgets
       todayAppointments,
       yesterdayAppointments,
       upcomingAppointments,

@@ -1,34 +1,67 @@
 import prisma from '../prisma.js';
 import { logAudit } from '../utils/audit.js';
 
+// helper to get current plan for a clinic
+async function getClinicPlan(clinicId) {
+  const clinic = await prisma.clinic.findUnique({
+    where: { id: clinicId },
+    include: {
+      subscription: {
+        include: { plan: true },
+      },
+    },
+  });
+  return clinic?.subscription?.plan || null; // Plan has allowOnlinePayments, enableAuditLogs, etc.
+}
+
 // ----------------------------------------------------------------
 // CREATE SINGLE SLOT
 // ----------------------------------------------------------------
 export const createSlot = async (req, res) => {
   try {
     const { clinicId, userId } = req.user;
-    if (!clinicId) return res.status(400).json({ error: 'Clinic ID missing in token' });
+    if (!clinicId) {
+      return res.status(400).json({ error: 'Clinic ID missing in token' });
+    }
 
-    // ✅ Get paymentMode instead of type
-    const { doctorId, date, time, duration, price, paymentMode } = req.body; 
+    const { doctorId, date, time, duration, price, paymentMode } = req.body;
 
     if (!doctorId || !date || !time || !duration) {
       return res.status(400).json({
-        error: 'doctorId, date, time, duration are required'
+        error: 'doctorId, date, time, duration are required',
       });
     }
 
-    // Ensure doctor belongs to this clinic AND is not deleted
+    const plan = await getClinicPlan(clinicId);
+    if (!plan) {
+      return res
+        .status(400)
+        .json({ error: 'No active subscription plan for this clinic.' });
+    }
+
+    const mode = paymentMode || 'ONLINE';
+    const isPaidMode = mode === 'ONLINE' || mode === 'OFFLINE';
+
+    // gate paid/online modes
+    if (isPaidMode && !plan.allowOnlinePayments) {
+      return res.status(403).json({
+        error:
+          'Paid/online slots are disabled on your current plan. Use FREE mode instead.',
+      });
+    }
+
     const doctor = await prisma.doctor.findFirst({
-      where: { 
-        id: doctorId, 
+      where: {
+        id: doctorId,
         clinicId,
-        deletedAt: null 
-      }
+        deletedAt: null,
+      },
     });
 
     if (!doctor) {
-      return res.status(404).json({ error: 'Doctor not found in this clinic' });
+      return res
+        .status(404)
+        .json({ error: 'Doctor not found in this clinic' });
     }
 
     const slot = await prisma.slot.create({
@@ -38,12 +71,10 @@ export const createSlot = async (req, res) => {
         date: new Date(date),
         time,
         duration: Number(duration),
-        // ✅ Handle paymentMode and Price
-        paymentMode: paymentMode || 'ONLINE', // Default if missing
-        price: paymentMode === 'FREE' ? 0 : Number(price || 0),
-        // Deprecated 'type' field handling if still in schema
-        type: paymentMode === 'FREE' ? 'FREE' : 'PAID', 
-      }
+        paymentMode: mode,
+        price: mode === 'FREE' ? 0 : Number(price || 0),
+        type: mode === 'FREE' ? 'FREE' : 'PAID',
+      },
     });
 
     await logAudit({
@@ -56,9 +87,9 @@ export const createSlot = async (req, res) => {
         doctorName: doctor.name,
         date: new Date(date).toLocaleDateString(),
         time,
-        paymentMode // Log this
+        paymentMode: mode,
       },
-      req
+      req,
     });
 
     return res.status(201).json(slot);
@@ -76,24 +107,30 @@ export const getSlots = async (req, res) => {
     const { clinicId } = req.user;
     const { doctorId, date } = req.query;
 
-    if (!doctorId) return res.status(400).json({ error: 'doctorId is required' });
+    if (!doctorId) {
+      return res.status(400).json({ error: 'doctorId is required' });
+    }
 
-    const where = { 
-      clinicId, 
+    const where = {
+      clinicId,
       doctorId,
-      deletedAt: null
+      deletedAt: null,
     };
 
     if (date) {
       const d = new Date(date);
       const startOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-      const endOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+      const endOfDay = new Date(
+        d.getFullYear(),
+        d.getMonth(),
+        d.getDate() + 1
+      );
       where.date = { gte: startOfDay, lt: endOfDay };
     }
 
     const slots = await prisma.slot.findMany({
       where,
-      orderBy: [{ date: 'asc' }, { time: 'asc' }]
+      orderBy: [{ date: 'asc' }, { time: 'asc' }],
     });
 
     return res.json(slots);
@@ -110,26 +147,49 @@ export const updateSlot = async (req, res) => {
   try {
     const { clinicId, userId } = req.user;
     const { id } = req.params;
-    // ✅ Get paymentMode
     const { date, time, duration, price, paymentMode } = req.body;
 
     const existing = await prisma.slot.findFirst({
-      where: { id, clinicId, deletedAt: null }
+      where: { id, clinicId, deletedAt: null },
     });
 
-    if (!existing) return res.status(404).json({ error: 'Slot not found' });
+    if (!existing) {
+      return res.status(404).json({ error: 'Slot not found' });
+    }
+
+    const plan = await getClinicPlan(clinicId);
+    if (!plan) {
+      return res
+        .status(400)
+        .json({ error: 'No active subscription plan for this clinic.' });
+    }
+
+    const nextMode = paymentMode ?? existing.paymentMode;
+    const isPaidMode = nextMode === 'ONLINE' || nextMode === 'OFFLINE';
+
+    if (isPaidMode && !plan.allowOnlinePayments) {
+      return res.status(403).json({
+        error:
+          'Paid/online slots are disabled on your current plan. Use FREE mode instead.',
+      });
+    }
 
     const updated = await prisma.slot.update({
       where: { id },
       data: {
         date: date ? new Date(date) : existing.date,
         time: time ?? existing.time,
-        duration: duration !== undefined ? Number(duration) : existing.duration,
-        paymentMode: paymentMode ?? existing.paymentMode,
-        price: paymentMode === 'FREE' ? 0 : (price !== undefined ? Number(price) : existing.price),
-        // Sync deprecated type field
-        type: (paymentMode === 'FREE' || existing.paymentMode === 'FREE') ? 'FREE' : 'PAID'
-      }
+        duration:
+          duration !== undefined ? Number(duration) : existing.duration,
+        paymentMode: nextMode,
+        price:
+          nextMode === 'FREE'
+            ? 0
+            : price !== undefined
+            ? Number(price)
+            : existing.price,
+        type: nextMode === 'FREE' ? 'FREE' : 'PAID',
+      },
     });
 
     await logAudit({
@@ -142,9 +202,9 @@ export const updateSlot = async (req, res) => {
         oldTime: existing.time,
         newTime: updated.time,
         oldMode: existing.paymentMode,
-        newMode: updated.paymentMode
+        newMode: updated.paymentMode,
       },
-      req
+      req,
     });
 
     return res.json(updated);
@@ -164,14 +224,16 @@ export const deleteSlot = async (req, res) => {
 
     const existing = await prisma.slot.findFirst({
       where: { id, clinicId },
-      include: { doctor: { select: { name: true } } }
+      include: { doctor: { select: { name: true } } },
     });
 
-    if (!existing) return res.status(404).json({ error: 'Slot not found' });
+    if (!existing) {
+      return res.status(404).json({ error: 'Slot not found' });
+    }
 
     await prisma.slot.update({
       where: { id },
-      data: { deletedAt: new Date() }
+      data: { deletedAt: new Date() },
     });
 
     await logAudit({
@@ -183,9 +245,9 @@ export const deleteSlot = async (req, res) => {
       details: {
         doctorName: existing.doctor?.name,
         date: new Date(existing.date).toLocaleDateString(),
-        time: existing.time
+        time: existing.time,
       },
-      req
+      req,
     });
 
     return res.json({ message: 'Slot deleted (soft)' });
@@ -196,73 +258,92 @@ export const deleteSlot = async (req, res) => {
 };
 
 // ----------------------------------------------------------------
-// BULK CREATE
+// BULK CREATE (gated by enableAuditLogs)
 // ----------------------------------------------------------------
 export const createBulkSlots = async (req, res) => {
   try {
-    const { clinicId, userId } = req.user; 
-    // ✅ Get paymentMode
-    const { 
+    const { clinicId, userId } = req.user;
+    const {
       doctorId,
       startDate,
       endDate,
-      startTime,  
-      duration, 
+      startTime,
+      duration,
       days,
-      paymentMode 
+      paymentMode,
     } = req.body;
 
     if (!doctorId || !startDate || !endDate || !startTime || !duration) {
-      return res.status(400).json({ error: "Missing required fields" });
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const plan = await getClinicPlan(clinicId);
+    if (!plan) {
+      return res
+        .status(400)
+        .json({ error: 'No active subscription plan for this clinic.' });
+    }
+
+    // ✅ gate bulk slots on enableAuditLogs (advanced tools)
+    if (!plan.enableAuditLogs) {
+      return res.status(403).json({
+        error:
+          'Bulk slot creation is not available on your current plan. Please upgrade to enable this feature.',
+      });
+    }
+
+    const mode = paymentMode || 'ONLINE';
+    const isPaidMode = mode === 'ONLINE' || mode === 'OFFLINE';
+
+    if (isPaidMode && !plan.allowOnlinePayments) {
+      return res.status(403).json({
+        error:
+          'Paid/online slots are disabled on your current plan. Use FREE mode instead.',
+      });
     }
 
     const doctor = await prisma.doctor.findUnique({
       where: { id: doctorId },
-      select: { clinicId: true, name: true, deletedAt: true }
+      select: { clinicId: true, name: true, deletedAt: true },
     });
 
     if (!doctor || doctor.deletedAt) {
-      return res.status(404).json({ error: "Doctor not found" });
+      return res.status(404).json({ error: 'Doctor not found' });
     }
 
-    const selectedDays = days.map(d => parseInt(d));
+    const selectedDays = days.map((d) => parseInt(d, 10));
 
     const slotsToCreate = [];
-    
+
     let currentDate = new Date(startDate);
-    currentDate.setHours(12, 0, 0, 0); 
+    currentDate.setHours(12, 0, 0, 0);
 
     const finalDate = new Date(endDate);
     finalDate.setHours(12, 0, 0, 0);
 
-    // ✅ Determine Price Logic
-    // If ONLINE or OFFLINE, price is 500 (or whatever logic you want). If FREE, 0.
-    // Ideally, frontend should send 'price' if it's customizable. 
-    // Here we assume 500 default for paid slots.
-    const slotPrice = paymentMode === 'FREE' ? 0 : 500; 
+    const slotPrice = mode === 'FREE' ? 0 : 500;
 
     while (currentDate <= finalDate) {
-      const dayIndex = currentDate.getDay(); 
+      const dayIndex = currentDate.getDay();
 
       if (selectedDays.includes(dayIndex)) {
         slotsToCreate.push({
-          doctorId: doctorId,
+          doctorId,
           clinicId: doctor.clinicId,
-          date: new Date(currentDate), 
-          time: startTime, 
-          duration: parseInt(duration),
-          // ✅ Use paymentMode
-          paymentMode: paymentMode || 'ONLINE',
+          date: new Date(currentDate),
+          time: startTime,
+          duration: parseInt(duration, 10),
+          paymentMode: mode,
           price: slotPrice,
-          type: paymentMode === 'FREE' ? 'FREE' : 'PAID' // Deprecated fallback
+          type: mode === 'FREE' ? 'FREE' : 'PAID',
         });
       }
-      
+
       currentDate.setDate(currentDate.getDate() + 1);
     }
 
     if (slotsToCreate.length === 0) {
-      return res.status(400).json({ error: "No slots generated." });
+      return res.status(400).json({ error: 'No slots generated.' });
     }
 
     let successCount = 0;
@@ -276,7 +357,7 @@ export const createBulkSlots = async (req, res) => {
         if (error.code === 'P2002') {
           duplicateCount++;
         } else {
-          console.error(`Failed to create slot:`, error.message);
+          console.error('Failed to create slot:', error.message);
         }
       }
     }
@@ -294,19 +375,212 @@ export const createBulkSlots = async (req, res) => {
           skipped: duplicateCount,
           startDate,
           endDate,
-          paymentMode // Log this
+          paymentMode: mode,
         },
-        req
+        req,
       });
     }
 
-    res.json({ 
-      message: `Created: ${successCount}, Skipped: ${duplicateCount}`, 
-      count: successCount 
+    return res.json({
+      message: `Created: ${successCount}, Skipped: ${duplicateCount}`,
+      count: successCount,
+    });
+  } catch (error) {
+    console.error('Bulk Create Error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+};
+// controllers/slotController.js
+// controllers/slotController.js
+export const getDoctorSlotsForReschedule = async (req, res) => {
+  try {
+    const { clinicId } = req.user;
+    const { doctorId } = req.params;
+    const { from, days = 7 } = req.query;
+
+    if (!doctorId) {
+      return res.status(400).json({ error: "doctorId is required" });
+    }
+
+    const startDate = from ? new Date(from) : new Date();
+    const endDate = new Date(startDate);
+    endDate.setDate(endDate.getDate() + Number(days));
+
+    const slots = await prisma.slot.findMany({
+      where: {
+        clinicId,
+        doctorId,
+        date: { gte: startDate, lt: endDate },
+        deletedAt: null,
+      },
+      orderBy: [{ date: "asc" }, { time: "asc" }],
     });
 
-  } catch (error) {
-    console.error("Bulk Create Error:", error);
-    res.status(500).json({ error: error.message });
+    const appts = await prisma.appointment.findMany({
+      where: {
+        clinicId,
+        doctorId,
+        deletedAt: null,
+        status: { in: ["PENDING", "CONFIRMED"] },
+        slotId: { not: null },
+      },
+      include: { slot: true },
+    });
+
+    const takenSlotIds = new Set(appts.map((a) => a.slotId));
+
+    const byDate = {};
+    for (const s of slots) {
+      if (takenSlotIds.has(s.id)) continue;
+
+      const key = s.date.toISOString().slice(0, 10);
+      if (!byDate[key]) {
+        byDate[key] = { date: key, label: key, slots: [] };
+      }
+
+      const [h] = s.time.split(":").map(Number);
+      let period = "Morning";
+      if (h >= 12 && h < 17) period = "Afternoon";
+      if (h >= 17) period = "Evening";
+
+      byDate[key].slots.push({
+        timeLabel: s.time,
+        startTime: s.time,
+        endTime: s.time,  // you can compute HH:mm + duration if needed
+        period,
+      });
+    }
+
+    return res.json(Object.values(byDate));
+  } catch (err) {
+    console.error("getDoctorSlotsForReschedule error", err);
+    return res.status(500).json({ error: "Failed to load slots" });
+  }
+};
+
+export const getDoctorSlotsWindow = async (req, res) => {
+  try {
+    const { clinicId } = req.user; // or from req.query if needed
+    const { doctorId } = req.params;
+    const { from, days = 7 } = req.query;
+
+    if (!clinicId) {
+      return res.status(400).json({ error: 'Clinic ID missing from request' });
+    }
+    if (!doctorId) {
+      return res.status(400).json({ error: 'Doctor ID is required' });
+    }
+
+    const baseDateStr = from || new Date().toISOString().slice(0, 10);
+    const fromDate = new Date(baseDateStr);
+    const daysNum = parseInt(days, 10) || 7;
+
+    const toDate = new Date(fromDate);
+    toDate.setDate(toDate.getDate() + daysNum - 1);
+
+    const slots = await prisma.slot.findMany({
+      where: {
+        clinicId,
+        doctorId,
+        deletedAt: null,
+        date: { gte: fromDate, lte: toDate },
+        // adjust if you use a different status for available slots
+        status: 'PENDING',
+      },
+      orderBy: [{ date: 'asc' }, { time: 'asc' }],
+    });
+
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const tomorrowDate = new Date();
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tomorrowStr = tomorrowDate.toISOString().slice(0, 10);
+
+    const byDate = {};
+
+    for (const s of slots) {
+      const d = s.date.toISOString().slice(0, 10); // "2025-12-17"
+
+      if (!byDate[d]) {
+        let label;
+        if (d === todayStr) label = 'Today';
+        else if (d === tomorrowStr) label = 'Tomorrow';
+        else {
+          label = s.date.toLocaleDateString('en-GB', {
+            weekday: 'short',
+            day: '2-digit',
+            month: 'short',
+          }); // e.g. "Wed, 17 Dec"
+        }
+
+        byDate[d] = {
+          date: d,
+          label,
+          slots: [],
+        };
+      }
+
+      // derive Morning / Afternoon / Evening from hour
+      // assuming s.time is "HH:MM"
+      const [hh] = s.time.split(':');
+      const hour = parseInt(hh, 10);
+      const period =
+        hour < 12 ? 'Morning' : hour < 17 ? 'Afternoon' : 'Evening';
+
+      // create a user‑friendly label like "09:30 AM"
+      const [hStr, mStr] = s.time.split(':');
+      let hour12 = ((hour + 11) % 12) + 1;
+      const ampm = hour < 12 ? 'AM' : 'PM';
+      const timeLabel = `${String(hour12).padStart(2, '0')}:${mStr} ${ampm}`;
+
+      // if you store endTime, use it; else compute from duration minutes
+      let endTime = s.endTime;
+      if (!endTime && s.duration) {
+        const start = new Date(`2000-01-01T${s.time}:00`);
+        start.setMinutes(start.getMinutes() + s.duration);
+        const eh = String(start.getHours()).padStart(2, '0');
+        const em = String(start.getMinutes()).padStart(2, '0');
+        endTime = `${eh}:${em}`;
+      }
+
+      byDate[d].slots.push({
+        period,
+        timeLabel,          // "09:30 AM"
+        startTime: s.time,  // "09:30"
+        endTime,            // "09:45"
+      });
+    }
+
+    // ensure days without slots still appear (optional)
+    const daysArray = [];
+    for (let i = 0; i < daysNum; i++) {
+      const d = new Date(fromDate);
+      d.setDate(d.getDate() + i);
+      const dateStr = d.toISOString().slice(0, 10);
+
+      if (byDate[dateStr]) {
+        daysArray.push(byDate[dateStr]);
+      } else {
+        let label;
+        if (dateStr === todayStr) label = 'Today';
+        else if (dateStr === tomorrowStr) label = 'Tomorrow';
+        else {
+          label = d.toLocaleDateString('en-GB', {
+            weekday: 'short',
+            day: '2-digit',
+            month: 'short',
+          });
+        }
+        daysArray.push({
+          date: dateStr,
+          label,
+          slots: [],
+        });
+      }
+    }
+
+    return res.json(daysArray);
+  } catch (err) {
+    console.error('getDoctorSlotsWindow error', err);
+    return res.status(500).json({ error: 'Failed to load slots' });
   }
 };
