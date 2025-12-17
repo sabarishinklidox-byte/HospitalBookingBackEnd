@@ -8,7 +8,7 @@ const toSlug = (str) =>
   str
     .toLowerCase()
     .trim()
-    .replace(/[^a-z0-9]/g, '-')   // non-alnum → dash [web:1186]
+    .replace(/[^a-z0-9]/g, '-')   // non-alnum → dash
     .replace(/-+/g, '-')          // collapse ---
     .replace(/^-|-$/g, '');       // trim
 
@@ -56,7 +56,9 @@ export const registerOrganization = async (req, res) => {
       where: { id: planId, isActive: true, deletedAt: null },
     });
     if (!plan) {
-      return res.status(400).json({ error: 'Selected plan is not available' });
+      return res
+        .status(400)
+        .json({ error: 'Selected plan is not available' });
     }
 
     // 2) Ensure email not already used
@@ -109,13 +111,21 @@ export const registerOrganization = async (req, res) => {
         },
       });
 
-      // Create subscription
+      // Create subscription with snapshot of plan terms
       const subscription = await tx.subscription.create({
         data: {
           clinicId: clinic.id,
           planId: plan.id,
           status: 'ACTIVE',
           startDate: new Date(),
+
+          // snapshot fields – make sure these exist on Subscription model
+          priceAtPurchase: plan.priceMonthly,
+          maxDoctors: plan.maxDoctors,
+          maxBookingsPerPeriod: plan.maxBookingsPerMonth,
+          durationDays: plan.durationDays,
+          isTrial: plan.isTrial,
+          trialDays: plan.trialDays,
         },
       });
 

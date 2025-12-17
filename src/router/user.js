@@ -38,6 +38,12 @@ router.get('/doctors/:doctorId/reviews', getDoctorReviews);
 router.post('/book-appointment', authMiddleware, requireUser, createBooking);
 router.post('/verify-payment', authMiddleware, requireUser, verifyPayment); // Razorpay
 router.post('/verify-stripe-payment', authMiddleware, requireUser, verifyStripePayment);
+router.post(
+  '/appointments/:id/cancel',
+  authMiddleware,
+  requireUser,
+  cancelUserAppointment
+);
 
 // ✅ VERIFICATION ROUTES
 

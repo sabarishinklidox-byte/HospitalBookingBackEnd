@@ -1,4 +1,5 @@
 import prisma from '../prisma.js';
+import { logAudit } from '../utils/audit.js';
 
 const logPlanAudit = async (userId, action, planId, details = null) => {
   try {
@@ -49,9 +50,28 @@ export const createPlan = async (req, res) => {
       allowOnlinePayments,
       allowCustomBranding,
       enableAuditLogs = true,
-      enableGoogleReviews = false,   // ✅ new flag from body
+      enableGoogleReviews = false,
       isActive = true,
+
+      // NEW
+      isTrial = false,
+      durationDays,          // e.g. 15
+      trialDays,             // optional separate trial
     } = req.body;
+
+    // Basic validation example
+    if (!name || !slug || priceMonthly == null) {
+      return res.status(400).json({ error: 'name, slug, priceMonthly are required' });
+    }
+
+    if (durationDays != null && durationDays <= 0) {
+      return res.status(400).json({ error: 'durationDays must be > 0' });
+    }
+
+    if (isTrial && !durationDays) {
+      // you can enforce that trial plans must have a duration
+      return res.status(400).json({ error: 'Trial plans must have durationDays' });
+    }
 
     const plan = await prisma.plan.create({
       data: {
@@ -64,8 +84,12 @@ export const createPlan = async (req, res) => {
         allowOnlinePayments,
         allowCustomBranding,
         enableAuditLogs,
-        enableGoogleReviews,        // ✅ persist flag
+        enableGoogleReviews,
         isActive,
+
+        isTrial,
+        durationDays: durationDays ?? null,
+        trialDays: trialDays ?? null,
       },
     });
 
@@ -81,12 +105,12 @@ export const createPlan = async (req, res) => {
 };
 
 
+
 // PUT /api/super-admin/plans/:id
 export const updatePlan = async (req, res) => {
   try {
     const userId = req.user.id;
     const { id } = req.params;
-    const data = req.body; // can include enableGoogleReviews
 
     const existing = await prisma.plan.findFirst({
       where: { id, deletedAt: null },
@@ -95,17 +119,88 @@ export const updatePlan = async (req, res) => {
       return res.status(404).json({ error: 'Plan not found' });
     }
 
+    // Count active subscriptions for this plan
+    const activeSubCount = await prisma.subscription.count({
+      where: { planId: id, status: 'ACTIVE' },
+    });
+
+    const {
+      // allowed always
+      name,
+      allowOnlinePayments,
+      allowCustomBranding,
+      enableBulkSlots,
+      enableExports,
+      enableAuditLogs,
+      enableGoogleReviews,
+      isActive,
+
+      // dangerous if there are active subs
+      priceMonthly,
+      maxDoctors,
+      maxBookingsPerMonth,
+      durationDays,
+      isTrial,
+      trialDays,
+
+      ...rest
+    } = req.body;
+
+    const data = {
+      ...rest,
+      name: name ?? existing.name,
+      allowOnlinePayments:
+        allowOnlinePayments ?? existing.allowOnlinePayments,
+      allowCustomBranding:
+        allowCustomBranding ?? existing.allowCustomBranding,
+      enableBulkSlots: enableBulkSlots ?? existing.enableBulkSlots,
+      enableExports: enableExports ?? existing.enableExports,
+      enableAuditLogs: enableAuditLogs ?? existing.enableAuditLogs,
+      enableGoogleReviews:
+        enableGoogleReviews ?? existing.enableGoogleReviews,
+      isActive:
+        typeof isActive === 'boolean' ? isActive : existing.isActive,
+    };
+
+    if (activeSubCount === 0) {
+      if (priceMonthly != null) data.priceMonthly = priceMonthly;
+      if (maxDoctors != null) data.maxDoctors = maxDoctors;
+      if (maxBookingsPerMonth != null)
+        data.maxBookingsPerMonth = maxBookingsPerMonth;
+      if (durationDays !== undefined) data.durationDays = durationDays;
+      if (isTrial !== undefined) data.isTrial = isTrial;
+      if (trialDays !== undefined) data.trialDays = trialDays;
+    } else {
+      if (
+        priceMonthly != null ||
+        maxDoctors != null ||
+        maxBookingsPerMonth != null ||
+        durationDays !== undefined ||
+        isTrial !== undefined ||
+        trialDays !== undefined
+      ) {
+        return res.status(400).json({
+          error:
+            'Cannot change price, limits or duration while plan has active subscriptions. Create a new plan instead.',
+        });
+      }
+    }
+
     const updated = await prisma.plan.update({
       where: { id },
       data,
     });
 
-    if (updated.enableAuditLogs) {
-      await logPlanAudit(userId, 'PLAN_UPDATED', id, {
-        before: existing,
-        after: updated,
-      });
-    }
+    // Audit as generic log
+    await logAudit({
+      userId,
+      clinicId: null,
+      action: 'PLAN_UPDATED',
+      entity: 'Plan',
+      entityId: id,
+      details: { before: existing, after: updated },
+      req,
+    });
 
     return res.json(updated);
   } catch (err) {
@@ -115,6 +210,7 @@ export const updatePlan = async (req, res) => {
 };
 
 
+// DELETE (soft) /api/super-admin/plans/:id
 // DELETE (soft) /api/super-admin/plans/:id
 export const deletePlan = async (req, res) => {
   try {
@@ -128,14 +224,31 @@ export const deletePlan = async (req, res) => {
       return res.status(404).json({ error: 'Plan not found' });
     }
 
-    const updated = await prisma.plan.update({
+    const activeSubCount = await prisma.subscription.count({
+      where: { planId: id, status: 'ACTIVE' },
+    });
+
+    if (activeSubCount > 0) {
+      return res.status(400).json({
+        error:
+          'Cannot delete a plan that has active subscriptions. Deactivate it instead.',
+      });
+    }
+
+    await prisma.plan.update({
       where: { id },
       data: { deletedAt: new Date(), isActive: false },
     });
 
-    if (existing.enableAuditLogs) {
-      await logPlanAudit(userId, 'PLAN_DELETED', id, { before: existing });
-    }
+    await logAudit({
+      userId,
+      clinicId: null,
+      action: 'PLAN_DELETED',
+      entity: 'Plan',
+      entityId: id,
+      details: { before: existing },
+      req,
+    });
 
     return res.json({ message: 'Plan deleted (soft)' });
   } catch (err) {

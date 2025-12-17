@@ -1,7 +1,32 @@
-import prisma from '../prisma.js';
-import { logAudit } from '../utils/audit.js';
-import ExcelJS from 'exceljs';
-import PDFDocument from 'pdfkit';
+
+
+// ----------------------------------------------------------------
+// GET APPOINTMENTS (List)
+// ----------------------------------------------------------------
+
+
+// ----------------------------------------------------------------
+// UPDATE STATUS (Admin quick actions)
+// ----------------------------------------------------------------
+
+
+// ----------------------------------------------------------------
+// RESCHEDULE APPOINTMENT BY ADMIN
+// ----------------------------------------------------------------
+
+
+// ----------------------------------------------------------------
+// GET SINGLE APPOINTMENT DETAILS
+// ----------------------------------------------------------------
+
+
+// ----------------------------------------------------------------
+// GET APPOINTMENTS (List)
+// ----------------------------------------------------------------
+import prisma from "../prisma.js";
+import { logAudit } from "../utils/audit.js";
+import ExcelJS from "exceljs";
+import PDFDocument from "pdfkit";
 
 // ----------------------------------------------------------------
 // GET APPOINTMENTS (List)
@@ -10,7 +35,7 @@ export const getAppointments = async (req, res) => {
   try {
     const { clinicId } = req.user;
     if (!clinicId) {
-      return res.status(400).json({ error: 'Clinic ID missing from request' });
+      return res.status(400).json({ error: "Clinic ID missing from request" });
     }
 
     const {
@@ -24,8 +49,8 @@ export const getAppointments = async (req, res) => {
       limit = 10,
     } = req.query;
 
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
+    const pageNum = parseInt(page, 10);
+    const limitNum = parseInt(limit, 10);
     const skip = (pageNum - 1) * limitNum;
 
     const where = { clinicId, deletedAt: null };
@@ -45,63 +70,103 @@ export const getAppointments = async (req, res) => {
     if (patient) {
       where.user = {
         OR: [
-          { name: { contains: patient, mode: 'insensitive' } },
+          { name: { contains: patient, mode: "insensitive" } },
           { phone: { contains: patient } },
         ],
       };
     }
 
-    const totalAppointments = await prisma.appointment.count({ where });
+    const [totalAppointments, appointments] = await prisma.$transaction([
+      prisma.appointment.count({ where }),
+      prisma.appointment.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip,
+        take: limitNum,
+        include: {
+          user: { select: { name: true, phone: true, email: true } },
+          doctor: { select: { name: true, speciality: true } },
+          slot: {
+            select: {
+              date: true,
+              time: true,
+              paymentMode: true,
+              type: true,
+              price: true,
+            },
+          },
+          logs: { orderBy: { createdAt: "desc" } },
+        },
+      }),
+    ]);
 
-    const appointments = await prisma.appointment.findMany({
-      where,
-      orderBy: { createdAt: 'desc' },
-      skip,
-      take: limitNum,
-      include: {
-        user: { select: { name: true, phone: true, email: true } },
-        doctor: { select: { name: true, speciality: true } },
-        slot: { select: { date: true, time: true } },
-        logs: { orderBy: { createdAt: 'desc' } },
-      },
-    });
+    const appointmentIds = appointments.map((a) => a.id);
+
+    // ✅ unread notifications for these appointments (CANCELLATION + RESCHEDULE)
+    const unreadNotifs = appointmentIds.length
+      ? await prisma.notification.findMany({
+          where: {
+            clinicId,
+            type: { in: ["CANCELLATION", "RESCHEDULE"] },
+            readAt: null,
+            entityId: { in: appointmentIds },
+          },
+          select: { entityId: true, type: true },
+        })
+      : [];
+
+    const unreadCancellationSet = new Set(
+      unreadNotifs
+        .filter((n) => n.type === "CANCELLATION")
+        .map((n) => n.entityId)
+    );
+
+    const unreadRescheduleSet = new Set(
+      unreadNotifs.filter((n) => n.type === "RESCHEDULE").map((n) => n.entityId)
+    );
 
     const formatted = appointments.map((app) => ({
       id: app.id,
       status: app.status,
       userId: app.userId,
-
-      // ✅ expose doctorId so front‑end can reschedule
       doctorId: app.doctorId,
 
-      patientName: app.user?.name || 'Unknown',
-      patientPhone: app.user?.phone || 'N/A',
-      patientEmail: app.user?.email || '',
+      patientName: app.user?.name || "Unknown",
+      patientPhone: app.user?.phone || "N/A",
+      patientEmail: app.user?.email || "",
 
-      doctorName: app.doctor?.name || 'Unknown',
-      doctorSpecialization: app.doctor?.speciality || '',
+      doctorName: app.doctor?.name || "Unknown",
+      doctorSpecialization: app.doctor?.speciality || "",
 
       date: app.slot?.date,
       time: app.slot?.time,
       dateFormatted: app.slot?.date
         ? new Date(app.slot.date).toLocaleDateString()
-        : 'N/A',
-      timeFormatted: app.slot?.time || 'N/A',
+        : "N/A",
+      timeFormatted: app.slot?.time || "N/A",
 
-      history: app.logs.map((log) => ({
+      paymentMode: app.slot?.paymentMode || null,
+      slotType: app.slot?.type || null,
+      price: app.slot?.price ?? null,
+
+      // ✅ per-appointment unread flags for UI
+      hasUnreadCancellation: unreadCancellationSet.has(app.id),
+      hasUnreadReschedule: unreadRescheduleSet.has(app.id),
+
+      history: (app.logs || []).map((log) => ({
         id: log.id,
-        action: 'RESCHEDULE_APPOINTMENT',
+        action: "RESCHEDULE_APPOINTMENT",
         changedBy: log.changedBy,
         timestamp: new Date(log.createdAt).toLocaleString(),
-        oldDate: new Date(log.oldDate).toLocaleDateString(),
-        newDate: new Date(log.newDate).toLocaleDateString(),
-        oldTime: log.oldTime,
-        newTime: log.newTime,
-        reason: log.reason,
+        oldDate: log.oldDate ? new Date(log.oldDate).toLocaleDateString() : null,
+        newDate: log.newDate ? new Date(log.newDate).toLocaleDateString() : null,
+        oldTime: log.oldTime || null,
+        newTime: log.newTime || null,
+        reason: log.reason || null,
       })),
     }));
 
-    res.json({
+    return res.json({
       data: formatted,
       pagination: {
         total: totalAppointments,
@@ -111,96 +176,72 @@ export const getAppointments = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('Get Appointments Error:', error);
-    res.status(500).json({ error: error.message });
-  }
-};
-// ----------------------------------------------------------------
-// CANCEL APPOINTMENT
-// ----------------------------------------------------------------
-export const cancelAppointment = async (req, res) => {
-  try {
-    const { clinicId, userId } = req.user;
-    const { id } = req.params;
-
-    const existing = await prisma.appointment.findFirst({
-      where: {
-        id,
-        clinicId,
-        deletedAt: null,
-      },
-    });
-
-    if (!existing) {
-      return res.status(404).json({ error: 'Appointment not found' });
-    }
-
-    const updated = await prisma.appointment.update({
-      where: { id },
-      data: { status: 'CANCELLED' },
-    });
-
-    await logAudit({
-      userId: userId || req.user.userId,
-      clinicId,
-      action: 'CANCEL_APPOINTMENT',
-      entity: 'Appointment',
-      entityId: id,
-      details: {
-        previousStatus: existing.status,
-        newStatus: 'CANCELLED',
-        reason: 'Admin requested cancellation',
-      },
-      req,
-    });
-
-    return res.json({
-      message: 'Appointment cancelled successfully',
-      appointment: updated,
-    });
-  } catch (error) {
-    console.error('Cancel Error:', error);
+    console.error("Get Appointments Error:", error);
     return res.status(500).json({ error: error.message });
   }
 };
 
 // ----------------------------------------------------------------
-// UPDATE STATUS
+// UPDATE STATUS (Admin quick actions)
 // ----------------------------------------------------------------
 export const updateAppointmentStatus = async (req, res) => {
   try {
     const { clinicId, userId } = req.user;
     const { id } = req.params;
-    const { status, reason } = req.body;   // ← reason from admin
+    const { status, reason } = req.body;
 
-    const validStatuses = ['CONFIRMED', 'COMPLETED', 'NO_SHOW', 'CANCELLED'];
+    const validStatuses = ["CONFIRMED", "COMPLETED", "NO_SHOW", "CANCELLED"];
     if (!validStatuses.includes(status)) {
-      return res.status(400).json({ error: 'Invalid status value' });
+      return res.status(400).json({ error: "Invalid status value" });
     }
 
     const existing = await prisma.appointment.findFirst({
       where: { id, clinicId, deletedAt: null },
+      include: { slot: true, user: true },
     });
     if (!existing) {
-      return res.status(404).json({ error: 'Appointment not found' });
+      return res.status(404).json({ error: "Appointment not found" });
     }
 
-    const updated = await prisma.appointment.update({
-      where: { id },
-      data: { status },
+    const data = { status };
+    if (status === "CANCELLED") {
+      data.cancelReason = reason || "Cancelled by clinic";
+      // if you have cancelledBy in schema:
+      // data.cancelledBy = "ADMIN";
+    }
+
+    const updated = await prisma.$transaction(async (tx) => {
+      const appt = await tx.appointment.update({
+        where: { id },
+        data,
+      });
+
+      if (status === "CANCELLED") {
+        // ✅ admin action => create as READ (no blinking)
+        await tx.notification.create({
+          data: {
+            clinicId,
+            type: "CANCELLATION",
+            entityId: id,
+            message: `Cancelled by admin — ${reason || "Cancelled by clinic"}`,
+            readAt: new Date(),
+          },
+        });
+      }
+
+      return appt;
     });
 
     await logAudit({
       userId: userId || req.user.userId,
       clinicId,
-      action: 'UPDATE_STATUS',
-      entity: 'Appointment',
+      action: "UPDATE_STATUS",
+      entity: "Appointment",
       entityId: id,
       details: {
         previousStatus: existing.status,
         newStatus: status,
-        // this is what getUserAppointments reads as cancelReason
-        reason: status === 'CANCELLED' ? (reason || 'Cancelled by clinic') : null,
+        reason: status === "CANCELLED" ? (reason || "Cancelled by clinic") : null,
       },
       req,
     });
@@ -210,16 +251,14 @@ export const updateAppointmentStatus = async (req, res) => {
       appointment: updated,
     });
   } catch (error) {
-    console.error('Update Status Error:', error);
+    console.error("Update Status Error:", error);
     return res.status(500).json({ error: error.message });
   }
 };
-// PATCH /admin/appointments/:id/reschedule
-// body: { newDate, newTime, note, deleteOldSlot?: boolean }
 
-// PATCH /appointments/:id/reschedule
-// body: { newDate, newTime, note, deleteOldSlot?: boolean }
-
+// ----------------------------------------------------------------
+// RESCHEDULE APPOINTMENT BY ADMIN
+// ----------------------------------------------------------------
 export const rescheduleAppointmentByAdmin = async (req, res) => {
   try {
     const { clinicId, userId } = req.user;
@@ -227,9 +266,7 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
     const { newDate, newTime, note, deleteOldSlot } = req.body;
 
     if (!newDate || !newTime) {
-      return res
-        .status(400)
-        .json({ error: "New date and time are required." });
+      return res.status(400).json({ error: "New date and time are required." });
     }
 
     const appt = await prisma.appointment.findFirst({
@@ -289,23 +326,17 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
       }
     }
 
-    // 2) transaction: move appointment + handle old slot
+    // 2) transaction: move appointment + handle old slot + create notification
     const updated = await prisma.$transaction(async (tx) => {
       if (deleteOldSlot) {
-        // 🔴 Option 1: soft delete old slot (block it completely)
         await tx.slot.update({
           where: { id: oldSlot.id },
-          data: {
-            deletedAt: new Date(),
-          },
+          data: { deletedAt: new Date() },
         });
       } else {
-        // 🟢 Option 2: free old slot for reuse
         await tx.slot.update({
           where: { id: oldSlot.id },
-          data: {
-            status: "PENDING",
-          },
+          data: { status: "PENDING" },
         });
       }
 
@@ -331,6 +362,17 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
         },
       });
 
+      // ✅ admin action => create as READ (no blinking)
+      await tx.notification.create({
+        data: {
+          clinicId,
+          type: "RESCHEDULE",
+          entityId: appt.id,
+          message: `Rescheduled — ${new Date(oldDate).toLocaleDateString()} ${oldTime} → ${targetDate.toLocaleDateString()} ${newTime}`,
+          readAt: new Date(),
+        },
+      });
+
       return updatedAppt;
     });
 
@@ -344,7 +386,7 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
         previousStatus: appt.status,
         newStatus: updated.status,
         oldDate,
-        newDate,
+        newDate: targetDate,
         oldTime,
         newTime,
         deleteOldSlot: !!deleteOldSlot,
@@ -363,37 +405,138 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
   }
 };
 
+// ----------------------------------------------------------------
+// CANCEL APPOINTMENT (Admin) – direct admin cancel OR approve pending request
+// ----------------------------------------------------------------
+export const cancelAppointment = async (req, res) => {
+  try {
+    const { clinicId, userId } = req.user;
+    const { id } = req.params;
+    const { reason } = req.body || {};
+
+    const existing = await prisma.appointment.findFirst({
+      where: { id, clinicId, deletedAt: null },
+      include: { cancellationRequest: true, slot: true },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ error: "Appointment not found" });
+    }
+
+    if (["COMPLETED", "NO_SHOW"].includes(existing.status)) {
+      return res
+        .status(400)
+        .json({ error: "Cannot cancel completed/no-show appointment" });
+    }
+
+    const finalReason = reason || existing.cancelReason || "Cancelled by clinic";
+
+    const hasPendingRequest =
+      !!existing.cancellationRequest &&
+      existing.cancellationRequest.status === "PENDING";
+
+    // ✅ patient requested cancel => unread
+    // ✅ admin cancelled directly => read (no blink)
+    const readAtForNotification = hasPendingRequest ? null : new Date();
+
+    const [updatedAppt, updatedReq] = await prisma.$transaction([
+      prisma.appointment.update({
+        where: { id },
+        data: {
+          status: "CANCELLED",
+          cancelReason: finalReason,
+          // if you have cancelledBy in schema:
+          // cancelledBy: hasPendingRequest ? "USER" : "ADMIN",
+        },
+      }),
+
+      hasPendingRequest
+        ? prisma.cancellationRequest.update({
+            where: { appointmentId: existing.id },
+            data: {
+              status: "APPROVED",
+              processedAt: new Date(),
+              processedById: userId || req.user.userId,
+              reason: finalReason,
+            },
+          })
+        : Promise.resolve(null),
+
+      prisma.notification.create({
+        data: {
+          clinicId,
+          type: "CANCELLATION",
+          entityId: id,
+          message: hasPendingRequest
+            ? `Cancelled by patient — ${finalReason}`
+            : `Cancelled by admin — ${finalReason}`,
+          readAt: readAtForNotification,
+        },
+      }),
+    ]);
+
+    await logAudit({
+      userId: userId || req.user.userId,
+      clinicId,
+      action: "CANCEL_APPOINTMENT",
+      entity: "Appointment",
+      entityId: id,
+      details: {
+        previousStatus: existing.status,
+        newStatus: "CANCELLED",
+        reason: finalReason,
+        paymentMode: existing.slot?.paymentMode || null,
+        hadCancellationRequest: hasPendingRequest,
+      },
+      req,
+    });
+
+    return res.json({
+      message: "Appointment cancelled successfully",
+      appointment: updatedAppt,
+      cancellationRequest: updatedReq,
+    });
+  } catch (error) {
+    console.error("Cancel Error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+};
+
+
+
+
 
 // ----------------------------------------------------------------
-// GET SINGLE APPOINTMENT DETAILS
+// UPDATE STATUS (Admin quick actions: CONFIRMED / COMPLETED / NO_SHOW / CANCELLED)
 // ----------------------------------------------------------------
+
+
+// ----------------------------------------------------------------
+// RESCHEDULE APPOINTMENT BY ADMIN
+// ----------------------------------------------------------------
+
+
+// ----------------------------------------------------------------
+// CANCEL APPOINTMENT (Admin) – direct admin cancel OR approve pending request
+
+
 export const getAppointmentDetails = async (req, res) => {
   try {
     const { id } = req.params;
     const { clinicId } = req.user;
 
     const appointment = await prisma.appointment.findFirst({
-      where: {
-        id,
-        clinicId,
-        deletedAt: null,
-      },
+      where: { id, clinicId, deletedAt: null },
       include: {
-        user: {
-          select: { id: true, name: true, email: true, phone: true },
-        },
-        doctor: {
-          select: { id: true, name: true, speciality: true },
-        },
+        user: { select: { id: true, name: true, email: true, phone: true } },
+        doctor: { select: { id: true, name: true, speciality: true } },
         slot: true,
         clinic: true,
-        logs: { orderBy: { createdAt: 'desc' } }, // 🔴 include audit logs
+        logs: { orderBy: { createdAt: 'desc' } },
       },
     });
 
-    if (!appointment) {
-      return res.status(404).json({ error: 'Appointment not found' });
-    }
+    if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
 
     const history = appointment.logs.map((log) => {
       const details = log.details || {};
@@ -404,27 +547,21 @@ export const getAppointmentDetails = async (req, res) => {
         timestamp: new Date(log.createdAt).toLocaleString(),
         oldStatus: details.previousStatus || null,
         newStatus: details.newStatus || null,
-        oldDate: details.oldDate
-          ? new Date(details.oldDate).toLocaleDateString()
-          : null,
-        newDate: details.newDate
-          ? new Date(details.newDate).toLocaleDateString()
-          : null,
+        oldDate: details.oldDate ? new Date(details.oldDate).toLocaleDateString() : null,
+        newDate: details.newDate ? new Date(details.newDate).toLocaleDateString() : null,
         oldTime: details.oldTime || null,
         newTime: details.newTime || null,
         reason: details.reason || null,
       };
     });
 
-    const formattedAppointment = {
+    res.json({
       ...appointment,
       patient: appointment.user,
       dateFormatted: new Date(appointment.slot.date).toLocaleDateString(),
       timeFormatted: appointment.slot.time,
-      history, // 🔴 now details popup/modal also sees reschedule history
-    };
-
-    res.json(formattedAppointment);
+      history,
+    });
   } catch (error) {
     console.error('Get Details Error:', error);
     res.status(500).json({ error: error.message });
@@ -443,13 +580,16 @@ export const deleteAppointment = async (req, res) => {
       where: { id, clinicId, deletedAt: null },
     });
 
-    if (!existing) {
-      return res.status(404).json({ error: 'Appointment not found' });
-    }
+    if (!existing) return res.status(404).json({ error: 'Appointment not found' });
 
     await prisma.appointment.update({
       where: { id },
-      data: { deletedAt: new Date(), status: 'CANCELLED' },
+      data: {
+        deletedAt: new Date(),
+        status: 'CANCELLED',
+        cancelReason: 'Admin soft deleted appointment',
+        cancelledBy: 'ADMIN',
+      },
     });
 
     await logAudit({
@@ -458,7 +598,7 @@ export const deleteAppointment = async (req, res) => {
       action: 'DELETE_APPOINTMENT',
       entity: 'Appointment',
       entityId: id,
-      details: { reason: 'Admin soft deleted appointment' },
+      details: { reason: 'Admin soft deleted appointment', cancelledBy: 'ADMIN' },
       req,
     });
 
@@ -475,12 +615,9 @@ export const deleteAppointment = async (req, res) => {
 export const exportAppointmentsPdf = async (req, res) => {
   try {
     const { clinicId } = req.user;
-    if (!clinicId) {
-      return res.status(400).json({ error: "Clinic ID missing from request" });
-    }
+    if (!clinicId) return res.status(400).json({ error: 'Clinic ID missing from request' });
 
     const { status, doctor, patient, dateFrom, dateTo } = req.query;
-
     const where = { clinicId, deletedAt: null };
 
     if (status) where.status = status;
@@ -517,43 +654,29 @@ export const exportAppointmentsPdf = async (req, res) => {
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="bookings_${new Date()
-        .toISOString()
-        .slice(0, 10)}.pdf"`
+      `attachment; filename="bookings_${new Date().toISOString().slice(0, 10)}.pdf"`
     );
 
     doc.pipe(res);
 
     doc.fontSize(18).text('Bookings Report', { align: 'center' });
-    doc
-      .fontSize(10)
-      .text(`Clinic: ${clinicId}`, { align: 'center' })
-      .moveDown(0.3);
-    doc
-      .fontSize(9)
-      .text(`Generated: ${new Date().toLocaleString()}`, { align: 'center' });
+    doc.fontSize(10).text(`Clinic: ${clinicId}`, { align: 'center' }).moveDown(0.3);
+    doc.fontSize(9).text(`Generated: ${new Date().toLocaleString()}`, { align: 'center' });
     doc.moveDown(1);
 
     appointments.forEach((app, idx) => {
-      const dateStr = app.slot?.date
-        ? new Date(app.slot.date).toLocaleDateString()
-        : 'N/A';
+      const dateStr = app.slot?.date ? new Date(app.slot.date).toLocaleDateString() : 'N/A';
       const timeStr = app.slot?.time || 'N/A';
 
       doc
         .fontSize(11)
-        .text(
-          `${idx + 1}. ${app.user?.name || 'Unknown'}  (${app.user?.phone || 'N/A'})`
-        );
+        .text(`${idx + 1}. ${app.user?.name || 'Unknown'} (${app.user?.phone || 'N/A'})`);
       doc
         .fontSize(9)
         .fillColor('#555555')
-        .text(
-          `Doctor: ${app.doctor?.name || 'Unknown'} (${app.doctor?.speciality || ''})`
-        );
-      doc
-        .text(`Schedule: ${dateStr} ${timeStr}  |  Status: ${app.status}`)
-        .moveDown(0.6);
+        .text(`Doctor: ${app.doctor?.name || 'Unknown'} (${app.doctor?.speciality || ''})`);
+
+      doc.text(`Schedule: ${dateStr} ${timeStr} | Status: ${app.status}`).moveDown(0.6);
       doc.fillColor('black');
 
       if (doc.y > 750) doc.addPage();
@@ -572,12 +695,9 @@ export const exportAppointmentsPdf = async (req, res) => {
 export const exportAppointmentsExcel = async (req, res) => {
   try {
     const { clinicId } = req.user;
-    if (!clinicId) {
-      return res.status(400).json({ error: "Clinic ID missing from request" });
-    }
+    if (!clinicId) return res.status(400).json({ error: 'Clinic ID missing from request' });
 
     const { status, doctor, patient, dateFrom, dateTo } = req.query;
-
     const where = { clinicId, deletedAt: null };
 
     if (status) where.status = status;
@@ -630,9 +750,7 @@ export const exportAppointmentsExcel = async (req, res) => {
         patientEmail: app.user?.email || '',
         doctorName: app.doctor?.name || 'Unknown',
         doctorSpecialization: app.doctor?.speciality || '',
-        dateFormatted: app.slot?.date
-          ? new Date(app.slot.date).toLocaleDateString()
-          : 'N/A',
+        dateFormatted: app.slot?.date ? new Date(app.slot.date).toLocaleDateString() : 'N/A',
         timeFormatted: app.slot?.time || 'N/A',
         status: app.status,
       });
@@ -651,9 +769,7 @@ export const exportAppointmentsExcel = async (req, res) => {
     );
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="bookings_${new Date()
-        .toISOString()
-        .slice(0, 10)}.xlsx"`
+      `attachment; filename="bookings_${new Date().toISOString().slice(0, 10)}.xlsx"`
     );
 
     await workbook.xlsx.write(res);
@@ -663,3 +779,8 @@ export const exportAppointmentsExcel = async (req, res) => {
     res.status(500).json({ error: 'Failed to export Excel' });
   }
 };
+
+// ----------------------------------------------------------------
+// CANCEL APPOINTMENT (Admin)  – direct admin cancel OR approve pending request
+// ----------------------------------------------------------------
+

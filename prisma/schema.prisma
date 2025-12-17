@@ -8,7 +8,10 @@ datasource db {
 }
 
 // --- ENUMS ---
-
+enum NotificationType {
+  CANCELLATION
+  RESCHEDULE
+}
 enum Role {
   SUPER_ADMIN
   ADMIN
@@ -28,6 +31,10 @@ enum AppointmentStatus {
 enum SlotType {
   FREE
   PAID
+}
+enum CancellationActor {
+  USER
+  ADMIN
 }
 
 enum SlotPaymentMode {
@@ -80,59 +87,73 @@ enum BookingSection {
 // --- SAAS SUBSCRIPTION MODELS (NEW) ---
 
 model Plan {
-  id                  String   @id @default(uuid())
-  name                String
-  slug                String   @unique
-  priceMonthly        Decimal
-  currency            String   @default("INR")
+  id                   String   @id @default(uuid())
+  name                 String
+  slug                 String   @unique
+  priceMonthly         Decimal
+  currency             String   @default("INR")
 
   // Feature Limits
-  maxDoctors          Int      @default(1)
-  maxBookingsPerMonth Int      @default(100)
-  allowOnlinePayments Boolean  @default(false)
-  allowCustomBranding Boolean  @default(false)
+  maxDoctors           Int      @default(1)
+  maxBookingsPerMonth  Int      @default(100)
+  allowOnlinePayments  Boolean  @default(false)
+  allowCustomBranding  Boolean  @default(false)
 
   // Feature flags
-  enableReviews       Boolean  @default(true)   // ✅ doctor reviews feature
-  enableBulkSlots     Boolean  @default(true)   // ✅ bulk slot creation
-  enableExports       Boolean  @default(true)   // ✅ export PDF/Excel
-  enableAuditLogs     Boolean  @default(true)
-  enableGoogleReviews Boolean  @default(false)  // ✅ Google ratings on public pages
+  enableReviews        Boolean  @default(true)
+  enableBulkSlots      Boolean  @default(true)
+  enableExports        Boolean  @default(true)
+  enableAuditLogs      Boolean  @default(true)
+  enableGoogleReviews  Boolean  @default(false)
 
-  isActive            Boolean  @default(true)
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
-  deletedAt           DateTime?
+  // NEW: duration / trial
+  isTrial              Boolean  @default(false)
+  durationDays         Int?     // null = recurring plan, value = fixed-length plan (e.g. 15)
+  trialDays            Int?     // optional extra free trial days
 
-  subscriptions       Subscription[]
+  isActive             Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  deletedAt            DateTime?
+
+  subscriptions        Subscription[]
 
   @@map("plans")
 }
 
 
 model Subscription {
-  id                   String             @id @default(uuid())
-  clinicId             String             @unique // One active sub per clinic
-  planId               String
-  status               SubscriptionStatus @default(ACTIVE)
+  id                    String             @id @default(uuid())
+  clinicId              String             @unique
+  planId                String
+  status                SubscriptionStatus @default(ACTIVE)
 
-  startDate            DateTime           @default(now())
-  endDate              DateTime?          // Null means auto-renewing or lifetime
-  nextBillingDate      DateTime?
+  startDate             DateTime           @default(now())
+  endDate               DateTime?
+  nextBillingDate       DateTime?
 
-  // External Payment Gateway IDs (for recurring billing)
-  gatewaySubscriptionId String?          // e.g. sub_12345 (Stripe)
-  gatewayCustomerId      String?         // e.g. cus_12345
+  // Snapshot from plan at time of subscription/upgrade
+  priceAtPurchase       Decimal?          // <-- made optional
+  maxDoctors            Int?              // <-- made optional
+  maxBookingsPerPeriod  Int?              // <-- made optional
+  durationDays          Int?
+  isTrial               Boolean           @default(false)
+  trialDays             Int?
 
-  createdAt            DateTime          @default(now())
-  updatedAt            DateTime          @updatedAt
-  deletedAt            DateTime?         // Soft Delete
+  // External Payment Gateway IDs
+  gatewaySubscriptionId String?
+  gatewayCustomerId     String?
 
-  clinic               Clinic            @relation(fields: [clinicId], references: [id])
-  plan                 Plan              @relation(fields: [planId], references: [id])
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  deletedAt             DateTime?
+
+  clinic                Clinic            @relation(fields: [clinicId], references: [id])
+  plan                  Plan              @relation(fields: [planId], references: [id])
 
   @@map("subscriptions")
 }
+
 
 // --- EXISTING CORE MODELS ---
 
@@ -260,45 +281,66 @@ model Slot {
   price       Decimal           @default(0)
   status      AppointmentStatus @default(PENDING)
   createdAt   DateTime          @default(now())
-  deletedAt   DateTime?         // Soft Delete
+  deletedAt   DateTime?
 
   paymentMode SlotPaymentMode   @default(ONLINE)
+  kind        String            @default("APPOINTMENT") // NEW
 
-  doctor       Doctor       @relation(fields: [doctorId], references: [id])
-  clinic       Clinic       @relation(fields: [clinicId], references: [id])
+  doctor      Doctor            @relation(fields: [doctorId], references: [id])
+  clinic      Clinic            @relation(fields: [clinicId], references: [id])
   appointments Appointment[]
 
   @@unique([doctorId, date, time])
   @@map("slots")
 }
 
+
+
 model Appointment {
-  id          String            @id @default(uuid())
-  slug        String            @unique
-  userId      String
-  doctorId    String
-  clinicId    String
-  slotId      String            @unique
-  section     BookingSection
-  status      AppointmentStatus @default(PENDING)
-  paymentId   String?
-  notes       String?
-  symptoms    String?
+  id           String             @id @default(uuid())
+  slug         String             @unique
+  userId       String
+  doctorId     String
+  clinicId     String
+  slotId       String             @unique
+  section      BookingSection
+  status       AppointmentStatus  @default(PENDING)
+  paymentId    String?
+  notes        String?
+  symptoms     String?
   prescription String?
-  createdAt   DateTime          @default(now())
-  updatedAt   DateTime          @updatedAt
-  deletedAt   DateTime?         // Soft Delete
+  cancelReason String?
+  cancelledBy  CancellationActor?  // ✅ add this
 
-  user    User    @relation(fields: [userId], references: [id])
-  doctor  Doctor  @relation(fields: [doctorId], references: [id])
-  clinic  Clinic  @relation(fields: [clinicId], references: [id])
-  slot    Slot    @relation(fields: [slotId], references: [id])
-  payment Payment?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+  deletedAt    DateTime?
 
-  logs   AppointmentLog[]
-  review Review?
+  user         User               @relation(fields: [userId], references: [id])
+  doctor       Doctor             @relation(fields: [doctorId], references: [id])
+  clinic       Clinic             @relation(fields: [clinicId], references: [id])
+  slot         Slot               @relation(fields: [slotId], references: [id])
+  payment      Payment?
+
+  logs         AppointmentLog[]
+  review       Review?
+  cancellationRequest CancellationRequest?
 
   @@map("appointments")
+}
+
+
+model CancellationRequest {
+  id            String       @id @default(uuid())
+  appointmentId String       @unique
+  appointment   Appointment  @relation(fields: [appointmentId], references: [id])
+  status        String       // PENDING, APPROVED, REJECTED
+  reason        String?
+  createdAt     DateTime     @default(now())
+  processedAt   DateTime?
+  processedById String?
+
+  @@map("cancellation_requests")
 }
 
 model Payment {
@@ -370,4 +412,19 @@ model AuditLog {
   clinic    Clinic? @relation(fields: [clinicId], references: [id])
 
   @@map("audit_logs")
+}
+
+
+
+model Notification {
+  id        String           @id @default(uuid())
+  clinicId  String
+  type      NotificationType
+  entityId  String           // appointmentId
+  message   String
+  createdAt DateTime         @default(now())
+  readAt    DateTime?
+
+  @@index([clinicId, type, readAt])
+  @@index([clinicId, readAt])
 }

@@ -7,6 +7,12 @@ import {
   requireAdmin,
   requireAdminOrSuperAdmin,
 } from '../middleware/auth.js';
+import {
+  getNotifications,
+  getUnreadCount,
+  markAllRead,
+  markReadByIds,markReadByEntity
+} from '../controllers/adminNotificationController.js';
 
 import {
   createDoctor,
@@ -248,5 +254,37 @@ router.post(
   requireAdmin,
   refreshClinicGoogleRating
 );
+// ---------------- Notifications ----------------
+router.get(
+  '/notifications',
+  authMiddleware,
+  requireAdmin,
+  getNotifications
+);
+
+router.get(
+  '/notifications/unread-count',
+  authMiddleware,
+  requireAdmin,
+  getUnreadCount
+);
+
+router.patch(
+  '/notifications/mark-all-read',
+  authMiddleware,
+  requireAdmin,
+  markAllRead
+);
+
+router.patch(
+  '/notifications/mark-read',
+  authMiddleware,
+  requireAdmin,
+  markReadByIds
+);
+router.patch('/notifications/mark-read-by-entity',  authMiddleware,
+  requireAdmin, markReadByEntity);
+
+
 
 export default router;

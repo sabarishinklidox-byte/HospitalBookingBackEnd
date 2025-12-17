@@ -6,10 +6,25 @@ import prisma from '../prisma.js';
 // ----------------------------------------------------------------
 export const getClinics = async (req, res) => {
   try {
+    const { q, city } = req.query; // q = search text
+
     const clinics = await prisma.clinic.findMany({
       where: {
         isActive: true,
         deletedAt: null,
+        ...(city
+          ? { city: { equals: city, mode: 'insensitive' } }
+          : {}),
+        ...(q
+          ? {
+              OR: [
+                { name: { contains: q, mode: 'insensitive' } },
+                { address: { contains: q, mode: 'insensitive' } },
+                { city: { contains: q, mode: 'insensitive' } },
+                { pincode: { contains: q, mode: 'insensitive' } },
+              ],
+            }
+          : {}),
       },
       select: {
         id: true,
@@ -21,12 +36,11 @@ export const getClinics = async (req, res) => {
         details: true,
         logo: true,
         banner: true,
-        // ✅ Google reviews fields
         googlePlaceId: true,
         googleMapsUrl: true,
         googleReviewsEmbedCode: true,
-        googleRating: true,          // <‑‑ add this
-        googleTotalReviews: true,    // <‑‑ optional
+        googleRating: true,
+        googleTotalReviews: true,
       },
       orderBy: { name: 'asc' },
     });
@@ -37,6 +51,7 @@ export const getClinics = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
 
 
 
@@ -100,62 +115,63 @@ export const getDoctorsByClinic = async (req, res) => {
 // ----------------------------------------------------------------
 // GET /api/public/doctors/:doctorId/slots
 // ----------------------------------------------------------------
-export const getSlotsByDoctor = async (req, res) => {
-  try {
-    const { doctorId } = req.params;
-    const { date } = req.query;
+      export const getSlotsByDoctor = async (req, res) => {
+        try {
+          const { doctorId } = req.params;
+          const { date } = req.query;
 
-    const doctor = await prisma.doctor.findUnique({
-      where: { id: doctorId },
-      include: { clinic: true },
-    });
+          const doctor = await prisma.doctor.findUnique({
+            where: { id: doctorId },
+            include: { clinic: true },
+          });
 
-    if (
-      !doctor ||
-      !doctor.isActive ||
-      doctor.deletedAt ||
-      doctor.clinic.deletedAt
-    ) {
-      return res.status(404).json({ error: 'Doctor unavailable.' });
-    }
+          if (
+            !doctor ||
+            !doctor.isActive ||
+            doctor.deletedAt ||
+            doctor.clinic.deletedAt
+          ) {
+            return res.status(404).json({ error: 'Doctor unavailable.' });
+          }
 
-    const where = {
-      doctorId,
-      deletedAt: null,
-    };
+          const where = {
+            doctorId,
+            deletedAt: null,
+            kind: 'APPOINTMENT',          // ✅ hide BREAK / lunch slots
+          };
 
-    if (date) {
-      const d = new Date(date);
-      const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-      const end = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+          if (date) {
+            const d = new Date(date);
+            const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+            const end = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+            where.date = { gte: start, lt: end };
+          }
 
-      where.date = { gte: start, lt: end };
-    }
+          const slots = await prisma.slot.findMany({
+            where,
+            orderBy: [{ date: 'asc' }, { time: 'asc' }],
+            include: {
+              appointments: {
+                where: { deletedAt: null },
+              },
+            },
+          });
 
-    const slots = await prisma.slot.findMany({
-      where,
-      orderBy: [{ date: 'asc' }, { time: 'asc' }],
-      include: {
-        appointments: {
-          where: { deletedAt: null },
-        },
-      },
-    });
+          const data = slots.map((slot) => {
+            const isBooked = slot.appointments.some((a) =>
+              ['PENDING', 'CONFIRMED', 'COMPLETED'].includes(a.status)
+            );
+            const { appointments, ...rest } = slot;
+            return { ...rest, isBooked };
+          });
 
-    const data = slots.map((slot) => {
-      const isBooked = slot.appointments.some((a) =>
-        ['PENDING', 'CONFIRMED', 'COMPLETED'].includes(a.status)
-      );
-      const { appointments, ...rest } = slot;
-      return { ...rest, isBooked };
-    });
+          res.json(data);
+        } catch (error) {
+          console.error('Slot Fetch Error:', error);
+          res.status(500).json({ error: 'Failed to load slots.' });
+        }
+      };
 
-    res.json(data);
-  } catch (error) {
-    console.error('Slot Fetch Error:', error);
-    res.status(500).json({ error: 'Failed to load slots.' });
-  }
-};
 
 
 // ----------------------------------------------------------------

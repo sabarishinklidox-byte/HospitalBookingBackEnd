@@ -13,7 +13,7 @@ export const getAdminDashboard = async (req, res) => {
       where: { id: clinicId },
       include: {
         subscription: {
-          include: { plan: true }, // Plan has maxDoctors, allowOnlinePayments, enableAuditLogs, etc. [web:1186]
+          include: { plan: true },
         },
       },
     });
@@ -52,7 +52,7 @@ export const getAdminDashboard = async (req, res) => {
       },
     });
 
-    // 4. Today's Appointments
+    // 4. Today's Appointments (non-cancelled)
     const todayAppointments = await prisma.appointment.count({
       where: {
         clinicId,
@@ -67,7 +67,7 @@ export const getAdminDashboard = async (req, res) => {
       },
     });
 
-    // 5. Yesterday's Appointments
+    // 5. Yesterday's Appointments (non-cancelled)
     const yesterdayAppointments = await prisma.appointment.count({
       where: {
         clinicId,
@@ -96,7 +96,7 @@ export const getAdminDashboard = async (req, res) => {
     });
     const todayRevenue = todayPaidAppointments.reduce(
       (sum, app) => sum + (Number(app.slot.price) || 0),
-      0,
+      0
     );
 
     // 7. Yesterday's Revenue
@@ -113,7 +113,7 @@ export const getAdminDashboard = async (req, res) => {
     });
     const yesterdayRevenue = yesterdayPaidAppointments.reduce(
       (sum, app) => sum + (Number(app.slot.price) || 0),
-      0,
+      0
     );
 
     // 8. Total Lifetime Revenue
@@ -127,7 +127,7 @@ export const getAdminDashboard = async (req, res) => {
     });
     const totalRevenue = allPaidAppointments.reduce(
       (sum, app) => sum + (Number(app.slot.price) || 0),
-      0,
+      0
     );
 
     // 9. Upcoming Appointments
@@ -142,10 +142,39 @@ export const getAdminDashboard = async (req, res) => {
       },
     });
 
-    // 10. Response with plan
+    // 9.1 Status-wise totals
+    const [
+      totalBookings,
+      totalPending,
+      totalConfirmed,
+      totalCompleted,
+      totalNoShow,
+      totalCancelled,
+    ] = await Promise.all([
+      prisma.appointment.count({
+        where: { clinicId, deletedAt: null },
+      }),
+      prisma.appointment.count({
+        where: { clinicId, deletedAt: null, status: 'PENDING' },
+      }),
+      prisma.appointment.count({
+        where: { clinicId, deletedAt: null, status: 'CONFIRMED' },
+      }),
+      prisma.appointment.count({
+        where: { clinicId, deletedAt: null, status: 'COMPLETED' },
+      }),
+      prisma.appointment.count({
+        where: { clinicId, deletedAt: null, status: 'NO_SHOW' },
+      }),
+      prisma.appointment.count({
+        where: { clinicId, deletedAt: null, status: 'CANCELLED' },
+      }),
+    ]);
+
+    // 10. Response with plan and totals
     return res.json({
       clinic,
-      plan, // <- expose plan so frontend can enable/disable dashboard widgets
+      plan,
       todayAppointments,
       yesterdayAppointments,
       upcomingAppointments,
@@ -153,6 +182,14 @@ export const getAdminDashboard = async (req, res) => {
       todayRevenue,
       yesterdayRevenue,
       totalRevenue,
+
+      // new aggregates
+      totalBookings,
+      totalPending,
+      totalConfirmed,
+      totalCompleted,
+      totalNoShow,
+      totalCancelled,
     });
   } catch (error) {
     console.error('Dashboard Error:', error);

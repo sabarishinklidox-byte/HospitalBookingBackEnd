@@ -4,27 +4,40 @@ import { logAudit } from '../utils/audit.js';
 
 export const upgradeClinicPlan = async (req, res) => {
   try {
-    const { clinicId, userId } = req.user;
+    // Ensure you are actually storing id on req.user in your auth middleware
+    const { clinicId, id: userId } = req.user;
     const { planId } = req.body;
 
     if (!planId) {
       return res.status(400).json({ error: 'planId is required' });
     }
 
-    const targetPlan = await prisma.plan.findUnique({
-      where: { id: planId, deletedAt: null },
+    // Only active, non-deleted plans can be chosen
+    const targetPlan = await prisma.plan.findFirst({
+      where: { id: planId, isActive: true, deletedAt: null },
     });
-    if (!targetPlan || !targetPlan.isActive) {
+    if (!targetPlan) {
       return res.status(400).json({ error: 'Invalid or inactive plan' });
     }
 
-    // assuming Clinic has subscription with planId, adjust to your schema
+    // Update the clinic's subscription to point to new plan
+    // and snapshot its current limits/pricing
     const subscription = await prisma.subscription.update({
       where: { clinicId },
-      data: { planId },
+      data: {
+        // Use relation, not scalar planId
+        plan: { connect: { id: planId } },
+        priceAtPurchase: targetPlan.priceMonthly,
+        maxDoctors: targetPlan.maxDoctors,
+        maxBookingsPerPeriod: targetPlan.maxBookingsPerMonth,
+        durationDays: targetPlan.durationDays,
+        isTrial: targetPlan.isTrial,
+        trialDays: targetPlan.trialDays,
+      },
       include: { plan: true },
     });
 
+    // Audit log (uses AuditLog { userId, clinicId, ... } model)
     await logAudit({
       userId,
       clinicId,
