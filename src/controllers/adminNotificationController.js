@@ -1,17 +1,30 @@
 import prisma from "../prisma.js";
 
+const ALLOWED_TYPES = new Set(["CANCELLATION", "RESCHEDULE", "CANCEL_REQUEST"]);
+
+const parseType = (raw) => {
+  if (!raw) return null;
+  const t = String(raw).trim().toUpperCase();
+  return ALLOWED_TYPES.has(t) ? t : null;
+};
+
 // GET /admin/notifications?type=CANCELLATION&page=1&limit=10&unreadOnly=true
 export const getNotifications = async (req, res) => {
   try {
     const { clinicId } = req.user;
-    const { type, page = "1", limit = "10", unreadOnly } = req.query;
+    const { page = "1", limit = "10", unreadOnly } = req.query;
+    const type = parseType(req.query.type);
+
+    if (req.query.type && !type) {
+      return res.status(400).json({ error: "Invalid notification type" });
+    }
 
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limitNum = Math.max(1, parseInt(limit, 10) || 10);
     const skip = (pageNum - 1) * limitNum;
 
     const where = { clinicId };
-    if (type) where.type = type; // "CANCELLATION" | "RESCHEDULE"
+    if (type) where.type = type;
     if (unreadOnly === "true") where.readAt = null;
 
     const [total, data] = await prisma.$transaction([
@@ -43,7 +56,11 @@ export const getNotifications = async (req, res) => {
 export const getUnreadCount = async (req, res) => {
   try {
     const { clinicId } = req.user;
-    const { type } = req.query;
+    const type = parseType(req.query.type);
+
+    if (req.query.type && !type) {
+      return res.status(400).json({ error: "Invalid notification type" });
+    }
 
     const where = { clinicId, readAt: null };
     if (type) where.type = type;
@@ -57,11 +74,15 @@ export const getUnreadCount = async (req, res) => {
 };
 
 // PATCH /admin/notifications/mark-all-read
-// body: { type?: "CANCELLATION" | "RESCHEDULE" }
+// body: { type?: "CANCELLATION" | "RESCHEDULE" | "CANCEL_REQUEST" }
 export const markAllRead = async (req, res) => {
   try {
     const { clinicId } = req.user;
-    const { type } = req.body || {};
+    const type = parseType(req.body?.type);
+
+    if (req.body?.type && !type) {
+      return res.status(400).json({ error: "Invalid notification type" });
+    }
 
     const where = { clinicId, readAt: null };
     if (type) where.type = type;
@@ -106,14 +127,17 @@ export const markReadByIds = async (req, res) => {
 };
 
 // PATCH /admin/notifications/mark-read-by-entity
-// body: { entityId: string, type?: "CANCELLATION" | "RESCHEDULE" }
-// NOTE: If type is not sent, it marks ALL types for that entity as read.
+// body: { entityId: string, type?: "CANCELLATION" | "RESCHEDULE" | "CANCEL_REQUEST" }
 export const markReadByEntity = async (req, res) => {
   try {
     const { clinicId } = req.user;
-    const { entityId, type } = req.body || {};
+    const { entityId } = req.body || {};
+    const type = parseType(req.body?.type);
 
     if (!entityId) return res.status(400).json({ error: "entityId is required" });
+    if (req.body?.type && !type) {
+      return res.status(400).json({ error: "Invalid notification type" });
+    }
 
     const where = { clinicId, entityId, readAt: null };
     if (type) where.type = type;

@@ -477,71 +477,77 @@ export const deleteSlot = async (req, res) => {
   };
   // controllers/slotController.js
   // controllers/slotController.js
-  export const getDoctorSlotsForReschedule = async (req, res) => {
-    try {
-      const { clinicId } = req.user;
-      const { doctorId } = req.params;
-      const { from, days = 7 } = req.query;
+  // controllers/slotController.js
+// controllers/slotController.js
+export const getDoctorSlotsForReschedule = async (req, res) => {
+  try {
+    const { clinicId } = req.user;
+    const { doctorId } = req.params;
+    const { from, days = 7, excludeAppointmentId } = req.query;
 
-      if (!doctorId) {
-        return res.status(400).json({ error: "doctorId is required" });
-      }
+    if (!clinicId) return res.status(400).json({ error: "Clinic ID missing from request" });
+    if (!doctorId) return res.status(400).json({ error: "doctorId is required" });
 
-      const startDate = from ? new Date(from) : new Date();
-      const endDate = new Date(startDate);
-      endDate.setDate(endDate.getDate() + Number(days));
+    const startDate = from ? new Date(from) : new Date();
+    startDate.setHours(0, 0, 0, 0);
 
-      const slots = await prisma.slot.findMany({
-        where: {
-          clinicId,
-          doctorId,
-          date: { gte: startDate, lt: endDate },
-          deletedAt: null,
-        },
-        orderBy: [{ date: "asc" }, { time: "asc" }],
+    const endDate = new Date(startDate);
+    endDate.setDate(endDate.getDate() + Number(days));
+    endDate.setHours(0, 0, 0, 0);
+
+    // 1) all slots
+    const slots = await prisma.slot.findMany({
+      where: {
+        clinicId,
+        doctorId,
+        deletedAt: null,
+        date: { gte: startDate, lt: endDate },
+      },
+      orderBy: [{ date: "asc" }, { time: "asc" }],
+      select: { id: true, date: true, time: true, duration: true, endTime: true },
+    });
+
+    // 2) all appointments occupying slots (because slotId is UNIQUE)
+    const appts = await prisma.appointment.findMany({
+      where: {
+        clinicId,
+        doctorId,
+        deletedAt: null,
+        slotId: { not: null },
+        ...(excludeAppointmentId ? { id: { not: excludeAppointmentId } } : {}),
+      },
+      select: { slotId: true },
+    });
+
+    const takenSlotIds = new Set(appts.map((a) => a.slotId));
+
+    // 3) group by date and add isBooked
+    const byDate = {};
+    for (const s of slots) {
+      const dateKey = s.date.toISOString().slice(0, 10);
+      if (!byDate[dateKey]) byDate[dateKey] = { date: dateKey, label: dateKey, slots: [] };
+
+      const hour = parseInt(s.time.split(":")[0], 10);
+      const period = hour < 12 ? "Morning" : hour < 17 ? "Afternoon" : "Evening";
+
+      byDate[dateKey].slots.push({
+        slotId: s.id,
+        timeLabel: s.time,
+        startTime: s.time,
+        endTime: s.endTime || null,
+        period,
+        isBooked: takenSlotIds.has(s.id),
       });
-
-      const appts = await prisma.appointment.findMany({
-        where: {
-          clinicId,
-          doctorId,
-          deletedAt: null,
-          status: { in: ["PENDING", "CONFIRMED"] },
-          slotId: { not: null },
-        },
-        include: { slot: true },
-      });
-
-      const takenSlotIds = new Set(appts.map((a) => a.slotId));
-
-      const byDate = {};
-      for (const s of slots) {
-        if (takenSlotIds.has(s.id)) continue;
-
-        const key = s.date.toISOString().slice(0, 10);
-        if (!byDate[key]) {
-          byDate[key] = { date: key, label: key, slots: [] };
-        }
-
-        const [h] = s.time.split(":").map(Number);
-        let period = "Morning";
-        if (h >= 12 && h < 17) period = "Afternoon";
-        if (h >= 17) period = "Evening";
-
-        byDate[key].slots.push({
-          timeLabel: s.time,
-          startTime: s.time,
-          endTime: s.time,  // you can compute HH:mm + duration if needed
-          period,
-        });
-      }
-
-      return res.json(Object.values(byDate));
-    } catch (err) {
-      console.error("getDoctorSlotsForReschedule error", err);
-      return res.status(500).json({ error: "Failed to load slots" });
     }
-  };
+
+    return res.json(Object.values(byDate));
+  } catch (err) {
+    console.error("getDoctorSlotsForReschedule error", err);
+    return res.status(500).json({ error: "Failed to load slots" });
+  }
+};
+
+
 
   export const getDoctorSlotsWindow = async (req, res) => {
     try {

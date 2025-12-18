@@ -11,6 +11,7 @@ datasource db {
 enum NotificationType {
   CANCELLATION
   RESCHEDULE
+  CANCEL_REQUEST
 }
 enum Role {
   SUPER_ADMIN

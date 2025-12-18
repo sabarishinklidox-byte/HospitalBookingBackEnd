@@ -274,17 +274,14 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
       include: { slot: true, doctor: true, user: true },
     });
 
-    if (!appt) {
-      return res.status(404).json({ error: "Appointment not found" });
-    }
+    if (!appt) return res.status(404).json({ error: "Appointment not found" });
 
     const oldSlot = appt.slot;
     const oldDate = oldSlot.date;
     const oldTime = oldSlot.time;
-
     const targetDate = new Date(newDate);
 
-    // 1) find/create new slot
+    // 1) find/create target slot
     let newSlot = await prisma.slot.findFirst({
       where: {
         clinicId,
@@ -309,24 +306,24 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
           status: "PENDING",
         },
       });
-    } else {
-      const existingAppt = await prisma.appointment.findFirst({
-        where: {
-          slotId: newSlot.id,
-          deletedAt: null,
-          status: { in: ["PENDING", "CONFIRMED"] },
-          id: { not: appt.id },
-        },
-      });
-
-      if (existingAppt) {
-        return res
-          .status(400)
-          .json({ error: "Another appointment already exists in that slot." });
-      }
     }
 
-    // 2) transaction: move appointment + handle old slot + create notification
+    // ✅ IMPORTANT: because slotId is @unique, block if ANY other appt uses it
+    const anyApptOnSlot = await prisma.appointment.findFirst({
+      where: {
+        slotId: newSlot.id,
+        deletedAt: null,
+        id: { not: appt.id },
+      },
+      select: { id: true, status: true },
+    });
+
+    if (anyApptOnSlot) {
+      return res.status(409).json({
+        error: `Slot already booked (existing appointment status: ${anyApptOnSlot.status}).`,
+      });
+    }
+
     const updated = await prisma.$transaction(async (tx) => {
       if (deleteOldSlot) {
         await tx.slot.update({
@@ -362,7 +359,6 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
         },
       });
 
-      // ✅ admin action => create as READ (no blinking)
       await tx.notification.create({
         data: {
           clinicId,
@@ -395,11 +391,13 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
       req,
     });
 
-    return res.json({
-      message: "Appointment rescheduled successfully",
-      appointment: updated,
-    });
+    return res.json({ message: "Appointment rescheduled successfully", appointment: updated });
   } catch (error) {
+    // ✅ Friendly P2002 (race condition safe)
+    if (error?.code === "P2002" && error?.meta?.target?.includes("slotId")) {
+      return res.status(409).json({ error: "Slot already booked. Please choose another slot." });
+    }
+
     console.error("Reschedule Error:", error);
     return res.status(500).json({ error: "Failed to reschedule appointment" });
   }
