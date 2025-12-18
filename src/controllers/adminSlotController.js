@@ -345,189 +345,223 @@ export const deleteSlot = async (req, res) => {
   // ----------------------------------------------------------------
   // BULK CREATE (gated by enableAuditLogs)
   // ----------------------------------------------------------------
-  export const createBulkSlots = async (req, res) => {
-    try {
-      const { clinicId, userId } = req.user;
-      const {
-        doctorId,
-        startDate,
-        endDate,
-        startTime,
-        duration,
-        days,
-        paymentMode,
-      } = req.body;
+export const createBulkSlots = async (req, res) => {
+  try {
+    const { clinicId, userId } = req.user;
 
-      if (!doctorId || !startDate || !endDate || !startTime || !duration) {
-        return res.status(400).json({ error: 'Missing required fields' });
-      }
+    const {
+      doctorId,
+      startDate,
+      endDate,
+      startTime,
+      duration,
+      days,
+      paymentMode,
+      kind, // ✅ added for BREAK/LUNCH
+    } = req.body;
 
-      const plan = await getClinicPlan(clinicId);
-      if (!plan) {
-        return res
-          .status(400)
-          .json({ error: 'No active subscription plan for this clinic.' });
-      }
-
-      // ✅ gate bulk slots on enableAuditLogs (advanced tools)
-      if (!plan.enableAuditLogs) {
-        return res.status(403).json({
-          error:
-            'Bulk slot creation is not available on your current plan. Please upgrade to enable this feature.',
-        });
-      }
-
-      const mode = paymentMode || 'ONLINE';
-      const isPaidMode = mode === 'ONLINE' || mode === 'OFFLINE';
-
-      if (isPaidMode && !plan.allowOnlinePayments) {
-        return res.status(403).json({
-          error:
-            'Paid/online slots are disabled on your current plan. Use FREE mode instead.',
-        });
-      }
-
-      const doctor = await prisma.doctor.findUnique({
-        where: { id: doctorId },
-        select: { clinicId: true, name: true, deletedAt: true },
-      });
-
-      if (!doctor || doctor.deletedAt) {
-        return res.status(404).json({ error: 'Doctor not found' });
-      }
-
-      const selectedDays = days.map((d) => parseInt(d, 10));
-
-      const slotsToCreate = [];
-
-      let currentDate = new Date(startDate);
-      currentDate.setHours(12, 0, 0, 0);
-
-      const finalDate = new Date(endDate);
-      finalDate.setHours(12, 0, 0, 0);
-
-      const slotPrice = mode === 'FREE' ? 0 : 500;
-
-      while (currentDate <= finalDate) {
-        const dayIndex = currentDate.getDay();
-
-        if (selectedDays.includes(dayIndex)) {
-          slotsToCreate.push({
-            doctorId,
-            clinicId: doctor.clinicId,
-            date: new Date(currentDate),
-            time: startTime,
-            duration: parseInt(duration, 10),
-            paymentMode: mode,
-            price: slotPrice,
-            type: mode === 'FREE' ? 'FREE' : 'PAID',
-          });
-        }
-
-        currentDate.setDate(currentDate.getDate() + 1);
-      }
-
-      if (slotsToCreate.length === 0) {
-        return res.status(400).json({ error: 'No slots generated.' });
-      }
-
-      let successCount = 0;
-      let duplicateCount = 0;
-
-      for (const slot of slotsToCreate) {
-        try {
-          await prisma.slot.create({ data: slot });
-          successCount++;
-        } catch (error) {
-          if (error.code === 'P2002') {
-            duplicateCount++;
-          } else {
-            console.error('Failed to create slot:', error.message);
-          }
-        }
-      }
-
-      if (successCount > 0) {
-        await logAudit({
-          userId: userId || req.user.userId,
-          clinicId,
-          action: 'BULK_CREATE_SLOTS',
-          entity: 'Slot',
-          entityId: 'BULK',
-          details: {
-            doctorName: doctor.name,
-            count: successCount,
-            skipped: duplicateCount,
-            startDate,
-            endDate,
-            paymentMode: mode,
-          },
-          req,
-        });
-      }
-
-      return res.json({
-        message: `Created: ${successCount}, Skipped: ${duplicateCount}`,
-        count: successCount,
-      });
-    } catch (error) {
-      console.error('Bulk Create Error:', error);
-      return res.status(500).json({ error: error.message });
+    if (!doctorId || !startDate || !endDate || !startTime || !duration) {
+      return res.status(400).json({ error: "Missing required fields" });
     }
-  };
+
+    if (!Array.isArray(days) || days.length === 0) {
+      return res.status(400).json({ error: "Days must be a non-empty array" });
+    }
+
+    const plan = await getClinicPlan(clinicId);
+    if (!plan) {
+      return res
+        .status(400)
+        .json({ error: "No active subscription plan for this clinic." });
+    }
+
+    // ✅ gate bulk slots on enableAuditLogs (advanced tools)
+    if (!plan.enableAuditLogs) {
+      return res.status(403).json({
+        error:
+          "Bulk slot creation is not available on your current plan. Please upgrade to enable this feature.",
+      });
+    }
+
+    const slotKind = kind || "APPOINTMENT";
+
+    // ✅ BREAK/LUNCH rule: always FREE
+    const mode = slotKind === "BREAK" ? "FREE" : paymentMode || "ONLINE";
+    const isPaidMode = mode === "ONLINE" || mode === "OFFLINE";
+
+    if (isPaidMode && !plan.allowOnlinePayments) {
+      return res.status(403).json({
+        error:
+          "Paid/online slots are disabled on your current plan. Use FREE mode instead.",
+      });
+    }
+
+    const doctor = await prisma.doctor.findUnique({
+      where: { id: doctorId },
+      select: { clinicId: true, name: true, deletedAt: true },
+    });
+
+    if (!doctor || doctor.deletedAt) {
+      return res.status(404).json({ error: "Doctor not found" });
+    }
+
+    // ✅ IMPORTANT security check
+    if (doctor.clinicId !== clinicId) {
+      return res
+        .status(403)
+        .json({ error: "Doctor does not belong to this clinic" });
+    }
+
+    const selectedDays = days.map((d) => parseInt(d, 10)).filter(Number.isFinite);
+
+    const slotsToCreate = [];
+
+    let currentDate = new Date(startDate);
+    currentDate.setHours(12, 0, 0, 0);
+
+    const finalDate = new Date(endDate);
+    finalDate.setHours(12, 0, 0, 0);
+
+    const slotPrice = mode === "FREE" ? 0 : 500;
+
+    while (currentDate <= finalDate) {
+      const dayIndex = currentDate.getDay();
+
+      if (selectedDays.includes(dayIndex)) {
+        slotsToCreate.push({
+          doctorId,
+          clinicId: doctor.clinicId,
+          date: new Date(currentDate),
+          time: startTime,
+          duration: parseInt(duration, 10),
+          paymentMode: mode,
+          price: slotPrice,
+          // Keep your existing `type` field behavior, but include BREAK:
+          type: slotKind === "BREAK" ? "BREAK" : mode === "FREE" ? "FREE" : "PAID",
+          // If your Slot model has `kind`, store it too:
+          // kind: slotKind,
+        });
+      }
+
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
+
+    if (slotsToCreate.length === 0) {
+      return res.status(400).json({ error: "No slots generated." });
+    }
+
+    let successCount = 0;
+    let duplicateCount = 0;
+
+    for (const slot of slotsToCreate) {
+      try {
+        await prisma.slot.create({ data: slot });
+        successCount++;
+      } catch (error) {
+        // Prisma P2002 means unique constraint failed (duplicate). [web:2269]
+        if (error.code === "P2002") {
+          duplicateCount++;
+        } else {
+          console.error("Failed to create slot:", error.message);
+        }
+      }
+    }
+
+    if (successCount > 0) {
+      await logAudit({
+        userId: userId || req.user.userId,
+        clinicId,
+        action: "BULK_CREATE_SLOTS",
+        entity: "Slot",
+        entityId: "BULK",
+        details: {
+          doctorName: doctor.name,
+          count: successCount,
+          skipped: duplicateCount,
+          startDate,
+          endDate,
+          paymentMode: mode,
+          kind: slotKind,
+        },
+        req,
+      });
+    }
+
+    return res.json({
+      message: `Created: ${successCount}, Skipped: ${duplicateCount}`,
+      count: successCount,
+    });
+  } catch (error) {
+    console.error("Bulk Create Error:", error);
+    return res.status(500).json({ error: error.message });
+  }
+};
+
   // controllers/slotController.js
   // controllers/slotController.js
   // controllers/slotController.js
 // controllers/slotController.js
-export const getDoctorSlotsForReschedule = async (req, res) => {
+export const getDoctorSlotsForReschedule = async (req, res, next) => {
   try {
-    const { clinicId } = req.user;
+    const clinicId = req.user?.clinicId;
     const { doctorId } = req.params;
     const { from, days = 7, excludeAppointmentId } = req.query;
 
-    if (!clinicId) return res.status(400).json({ error: "Clinic ID missing from request" });
-    if (!doctorId) return res.status(400).json({ error: "doctorId is required" });
+    if (!clinicId) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    if (!doctorId) {
+      return res.status(400).json({ error: "doctorId is required" });
+    }
+
+    const daysNum = Number(days);
+    if (!Number.isFinite(daysNum) || daysNum <= 0 || daysNum > 60) {
+      return res.status(400).json({ error: "days must be a valid number (1-60)" });
+    }
 
     const startDate = from ? new Date(from) : new Date();
+    if (Number.isNaN(startDate.getTime())) {
+      return res.status(400).json({ error: "Invalid from date" });
+    }
     startDate.setHours(0, 0, 0, 0);
 
     const endDate = new Date(startDate);
-    endDate.setDate(endDate.getDate() + Number(days));
+    endDate.setDate(endDate.getDate() + daysNum);
     endDate.setHours(0, 0, 0, 0);
 
-    // 1) all slots
     const slots = await prisma.slot.findMany({
       where: {
         clinicId,
         doctorId,
         deletedAt: null,
+        kind: "APPOINTMENT",              // ✅ hide lunch/break
+        status: "PENDING",                // ✅ only available slots (keep if you use it)
         date: { gte: startDate, lt: endDate },
       },
       orderBy: [{ date: "asc" }, { time: "asc" }],
-      select: { id: true, date: true, time: true, duration: true, endTime: true },
-    });
-
-    // 2) all appointments occupying slots (because slotId is UNIQUE)
-    const appts = await prisma.appointment.findMany({
-      where: {
-        clinicId,
-        doctorId,
-        deletedAt: null,
-        slotId: { not: null },
-        ...(excludeAppointmentId ? { id: { not: excludeAppointmentId } } : {}),
+      include: {
+        appointments: {
+          where: {
+            deletedAt: null,
+            status: { in: ["PENDING", "CONFIRMED", "COMPLETED"] },
+            ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {}),
+          },
+          select: { id: true },
+          take: 1,
+        },
       },
-      select: { slotId: true },
     });
 
-    const takenSlotIds = new Set(appts.map((a) => a.slotId));
-
-    // 3) group by date and add isBooked
+    // Group response to match RescheduleAppointmentModal expectations
     const byDate = {};
     for (const s of slots) {
       const dateKey = s.date.toISOString().slice(0, 10);
-      if (!byDate[dateKey]) byDate[dateKey] = { date: dateKey, label: dateKey, slots: [] };
 
-      const hour = parseInt(s.time.split(":")[0], 10);
+      if (!byDate[dateKey]) {
+        byDate[dateKey] = { date: dateKey, label: dateKey, slots: [] };
+      }
+
+      const hour = parseInt(String(s.time).split(":")[0], 10);
       const period = hour < 12 ? "Morning" : hour < 17 ? "Afternoon" : "Evening";
 
       byDate[dateKey].slots.push({
@@ -536,142 +570,153 @@ export const getDoctorSlotsForReschedule = async (req, res) => {
         startTime: s.time,
         endTime: s.endTime || null,
         period,
-        isBooked: takenSlotIds.has(s.id),
+        isBooked: (s.appointments?.length || 0) > 0,
       });
     }
 
     return res.json(Object.values(byDate));
-  } catch (err) {
-    console.error("getDoctorSlotsForReschedule error", err);
-    return res.status(500).json({ error: "Failed to load slots" });
+  } catch (error) {
+    console.error("getDoctorSlotsForReschedule error:", error);
+    // keep your pattern
+    return next ? next(error) : res.status(500).json({ error: "Failed to load slots" });
   }
 };
 
 
 
-  export const getDoctorSlotsWindow = async (req, res) => {
-    try {
-      const { clinicId } = req.user; // or from req.query if needed
-      const { doctorId } = req.params;
-      const { from, days = 7 } = req.query;
+// GET /api/admin/doctors/:doctorId/slots?from=YYYY-MM-DD&days=7&excludeAppointmentId=...
+export const getDoctorSlotsWindow = async (req, res) => {
+  try {
+    const clinicId = req.user?.clinicId;
+    const { doctorId } = req.params;
+    const { from, days = 7, excludeAppointmentId } = req.query;
 
-      if (!clinicId) {
-        return res.status(400).json({ error: 'Clinic ID missing from request' });
-      }
-      if (!doctorId) {
-        return res.status(400).json({ error: 'Doctor ID is required' });
-      }
+    if (!clinicId) return res.status(401).json({ error: "Unauthorized" });
+    if (!doctorId) return res.status(400).json({ error: "Doctor ID is required" });
 
-      const baseDateStr = from || new Date().toISOString().slice(0, 10);
-      const fromDate = new Date(baseDateStr);
-      const daysNum = parseInt(days, 10) || 7;
+    const daysNum = Number(days);
+    if (!Number.isFinite(daysNum) || daysNum <= 0 || daysNum > 60) {
+      return res.status(400).json({ error: "days must be a valid number (1-60)" });
+    }
 
-      const toDate = new Date(fromDate);
-      toDate.setDate(toDate.getDate() + daysNum - 1);
+    const baseDateStr = from || new Date().toISOString().slice(0, 10);
+    const fromDate = new Date(baseDateStr);
+    if (Number.isNaN(fromDate.getTime())) {
+      return res.status(400).json({ error: "Invalid from date" });
+    }
 
-      const slots = await prisma.slot.findMany({
-        where: {
-          clinicId,
-          doctorId,
-          deletedAt: null,
-          date: { gte: fromDate, lte: toDate },
-          // adjust if you use a different status for available slots
-          status: 'PENDING',
+    const start = new Date(fromDate);
+    start.setHours(0, 0, 0, 0);
+
+    const endExclusive = new Date(start);
+    endExclusive.setDate(endExclusive.getDate() + daysNum);
+    endExclusive.setHours(0, 0, 0, 0);
+
+    // ✅ fetch only appointment slots (hide BREAK/LUNCH) and compute isBooked like your getSlotsForUser
+    const slots = await prisma.slot.findMany({
+      where: {
+        clinicId,
+        doctorId,
+        deletedAt: null,
+        status: "PENDING",       // if PENDING = available
+        kind: "APPOINTMENT",     // ✅ FIX: this hides lunch/break
+        date: { gte: start, lt: endExclusive },
+      },
+      orderBy: [{ date: "asc" }, { time: "asc" }],
+      include: {
+        appointments: {
+          where: {
+            deletedAt: null,
+            status: { in: ["PENDING", "CONFIRMED", "COMPLETED"] },
+            ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {}),
+          },
+          select: { id: true },
+          take: 1,
         },
-        orderBy: [{ date: 'asc' }, { time: 'asc' }],
-      });
+      },
+    });
 
-      const todayStr = new Date().toISOString().slice(0, 10);
-      const tomorrowDate = new Date();
-      tomorrowDate.setDate(tomorrowDate.getDate() + 1);
-      const tomorrowStr = tomorrowDate.toISOString().slice(0, 10);
+    // Labels: Today / Tomorrow / else formatted
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const tomorrowDate = new Date();
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tomorrowStr = tomorrowDate.toISOString().slice(0, 10);
 
-      const byDate = {};
+    const byDate = {};
 
-      for (const s of slots) {
-        const d = s.date.toISOString().slice(0, 10); // "2025-12-17"
+    for (const s of slots) {
+      const d = s.date.toISOString().slice(0, 10);
 
-        if (!byDate[d]) {
-          let label;
-          if (d === todayStr) label = 'Today';
-          else if (d === tomorrowStr) label = 'Tomorrow';
-          else {
-            label = s.date.toLocaleDateString('en-GB', {
-              weekday: 'short',
-              day: '2-digit',
-              month: 'short',
-            }); // e.g. "Wed, 17 Dec"
-          }
-
-          byDate[d] = {
-            date: d,
-            label,
-            slots: [],
-          };
-        }
-
-        // derive Morning / Afternoon / Evening from hour
-        // assuming s.time is "HH:MM"
-        const [hh] = s.time.split(':');
-        const hour = parseInt(hh, 10);
-        const period =
-          hour < 12 ? 'Morning' : hour < 17 ? 'Afternoon' : 'Evening';
-
-        // create a user‑friendly label like "09:30 AM"
-        const [hStr, mStr] = s.time.split(':');
-        let hour12 = ((hour + 11) % 12) + 1;
-        const ampm = hour < 12 ? 'AM' : 'PM';
-        const timeLabel = `${String(hour12).padStart(2, '0')}:${mStr} ${ampm}`;
-
-        // if you store endTime, use it; else compute from duration minutes
-        let endTime = s.endTime;
-        if (!endTime && s.duration) {
-          const start = new Date(`2000-01-01T${s.time}:00`);
-          start.setMinutes(start.getMinutes() + s.duration);
-          const eh = String(start.getHours()).padStart(2, '0');
-          const em = String(start.getMinutes()).padStart(2, '0');
-          endTime = `${eh}:${em}`;
-        }
-
-        byDate[d].slots.push({
-          period,
-          timeLabel,          // "09:30 AM"
-          startTime: s.time,  // "09:30"
-          endTime,            // "09:45"
-        });
-      }
-
-      // ensure days without slots still appear (optional)
-      const daysArray = [];
-      for (let i = 0; i < daysNum; i++) {
-        const d = new Date(fromDate);
-        d.setDate(d.getDate() + i);
-        const dateStr = d.toISOString().slice(0, 10);
-
-        if (byDate[dateStr]) {
-          daysArray.push(byDate[dateStr]);
-        } else {
-          let label;
-          if (dateStr === todayStr) label = 'Today';
-          else if (dateStr === tomorrowStr) label = 'Tomorrow';
-          else {
-            label = d.toLocaleDateString('en-GB', {
-              weekday: 'short',
-              day: '2-digit',
-              month: 'short',
-            });
-          }
-          daysArray.push({
-            date: dateStr,
-            label,
-            slots: [],
+      if (!byDate[d]) {
+        let label;
+        if (d === todayStr) label = "Today";
+        else if (d === tomorrowStr) label = "Tomorrow";
+        else {
+          label = s.date.toLocaleDateString("en-GB", {
+            weekday: "short",
+            day: "2-digit",
+            month: "short",
           });
         }
+        byDate[d] = { date: d, label, slots: [] };
       }
 
-      return res.json(daysArray);
-    } catch (err) {
-      console.error('getDoctorSlotsWindow error', err);
-      return res.status(500).json({ error: 'Failed to load slots' });
+      const hour = parseInt(String(s.time).split(":")[0], 10);
+      const period = hour < 12 ? "Morning" : hour < 17 ? "Afternoon" : "Evening";
+
+      // "09:30 AM"
+      const [, mm] = String(s.time).split(":");
+      const hour12 = ((hour + 11) % 12) + 1;
+      const ampm = hour < 12 ? "AM" : "PM";
+      const timeLabel = `${String(hour12).padStart(2, "0")}:${mm} ${ampm}`;
+
+      let endTime = s.endTime || null;
+      if (!endTime && s.duration) {
+        const t = new Date(`2000-01-01T${String(s.time)}:00`);
+        t.setMinutes(t.getMinutes() + Number(s.duration));
+        const eh = String(t.getHours()).padStart(2, "0");
+        const em = String(t.getMinutes()).padStart(2, "0");
+        endTime = `${eh}:${em}`;
+      }
+
+      byDate[d].slots.push({
+        slotId: s.id,
+        period,
+        timeLabel,
+        startTime: s.time,
+        endTime,
+        isBooked: (s.appointments?.length || 0) > 0, // ✅ modal expects this
+      });
     }
-  };
+
+    // ensure days without slots appear
+    const daysArray = [];
+    for (let i = 0; i < daysNum; i++) {
+      const d = new Date(start);
+      d.setDate(d.getDate() + i);
+      const dateStr = d.toISOString().slice(0, 10);
+
+      if (byDate[dateStr]) {
+        daysArray.push(byDate[dateStr]);
+      } else {
+        let label;
+        if (dateStr === todayStr) label = "Today";
+        else if (dateStr === tomorrowStr) label = "Tomorrow";
+        else {
+          label = d.toLocaleDateString("en-GB", {
+            weekday: "short",
+            day: "2-digit",
+            month: "short",
+          });
+        }
+        daysArray.push({ date: dateStr, label, slots: [] });
+      }
+    }
+
+    return res.json(daysArray);
+  } catch (err) {
+    console.error("getDoctorSlotsWindow error", err);
+    return res.status(500).json({ error: "Failed to load slots" });
+  }
+};
+

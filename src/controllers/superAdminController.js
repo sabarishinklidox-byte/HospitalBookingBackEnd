@@ -110,47 +110,107 @@ export const superAdminLogin = async (req, res) => {
 // -------------------------
 export const createClinic = async (req, res) => {
   try {
-    const { 
-      name, address, city, pincode, 
-      accountNumber, ifscCode, bankName, 
-      timings, details, logo, banner 
+    const {
+      name,
+      address,
+      city,
+      pincode,
+      accountNumber,
+      ifscCode,
+      bankName,
+      timings,
+      details,
+      logo,
+      banner,
+
+      // ✅ new fields from UI
+      planId,
+      isActive,
+      allowAuditView,
     } = req.body;
 
     if (!name || !address || !city || !pincode) {
-      return res.status(400).json({ error: 'All fields are required' });
+      return res.status(400).json({ error: "All fields are required" });
+    }
+    if (!planId) {
+      return res.status(400).json({ error: "planId is required" });
     }
 
-    const slug = name.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+    const slug = name
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
 
-    const clinic = await prisma.clinic.create({
-      data: {
-        slug, name, address, city, pincode,
-        accountNumber: accountNumber || "N/A",
-        ifscCode: ifscCode || "N/A",
-        bankName: bankName || "N/A",
-        timings: timings || {},
-        details: details || '',
-        logo: logo || null,
-        banner: banner || null
-      }
+    // 1) validate plan
+    const plan = await prisma.plan.findFirst({
+      where: { id: planId, isActive: true },
+    });
+    if (!plan) {
+      return res.status(404).json({ error: "Plan not found or inactive" });
+    }
+
+    // 2) plan-gate override
+    const safeAllowAuditView = plan.enableAuditLogs ? !!allowAuditView : false;
+
+    // 3) create clinic + subscription in one transaction
+    const result = await prisma.$transaction(async (tx) => {
+      const clinic = await tx.clinic.create({
+        data: {
+          slug,
+          name,
+          address,
+          city,
+          pincode,
+          accountNumber: accountNumber || "N/A",
+          ifscCode: ifscCode || "N/A",
+          bankName: bankName || "N/A",
+          timings: timings || {},
+          details: details || "",
+          logo: logo || null,
+          banner: banner || null,
+
+          // ✅ toggles
+          isActive: isActive ?? true,
+          allowAuditView: safeAllowAuditView,
+        },
+      });
+
+      // Adjust field names to match your schema: Subscription/ClinicSubscription/etc.
+      const subscription = await tx.subscription.create({
+        data: {
+          clinicId: clinic.id,
+          planId: plan.id,
+          status: "ACTIVE",
+          startDate: new Date(),
+          // If your plan has durationDays/trialDays, compute endDate here
+          // endDate: ...
+        },
+      });
+
+      return { clinic, subscription };
     });
 
     // Safe Audit Log
     try {
       await logAudit({
         userId: req.user.userId || req.user.id,
-        clinicId: clinic.id,
+        clinicId: result.clinic.id,
         action: ACTIONS.CREATE_CLINIC,
         entity: "Clinic",
-        entityId: clinic.id,
-        details: { name: clinic.name, city: clinic.city },
-        req: req
+        entityId: result.clinic.id,
+        details: { name: result.clinic.name, city: result.clinic.city, planId },
+        req,
       });
-    } catch (e) { console.error("Audit Error:", e.message); }
+    } catch (e) {
+      console.error("Audit Error:", e.message);
+    }
 
-    return res.status(201).json(clinic);
+    return res.status(201).json(result);
   } catch (error) {
-    if (error.code === 'P2002') return res.status(400).json({ error: 'Clinic with this name already exists' });
+    if (error.code === "P2002") {
+      return res.status(400).json({ error: "Clinic with this name already exists" });
+    }
     return res.status(500).json({ error: error.message });
   }
 };

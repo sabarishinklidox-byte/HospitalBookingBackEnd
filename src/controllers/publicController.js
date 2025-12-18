@@ -306,3 +306,55 @@ export const getDoctors = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+export const getSlotsForUser = async (req, res, next) => {
+  try {
+    const { clinicId, doctorId, date, excludeAppointmentId } = req.query;
+
+    if (!clinicId || !doctorId || !date) {
+      return res.status(400).json({ error: "clinicId, doctorId, date are required" });
+    }
+
+    const start = new Date(date);
+    start.setHours(0, 0, 0, 0);
+
+    const end = new Date(date);
+    end.setHours(23, 59, 59, 999);
+
+    const slots = await prisma.slot.findMany({
+      where: {
+        clinicId,
+        doctorId,
+        deletedAt: null,
+        kind: "APPOINTMENT",           // ✅ hide BREAK
+        date: { gte: start, lte: end },
+      },
+      orderBy: { time: "asc" },
+      include: {
+        appointments: {
+          where: {
+            deletedAt: null,
+            status: { in: ["PENDING", "CONFIRMED", "COMPLETED"] },
+            ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {}),
+          },
+          select: { id: true },
+          take: 1,
+        },
+      },
+    });
+
+    return res.json({
+      data: slots.map((s) => ({
+        id: s.id,
+        date: s.date,
+        time: s.time,
+        paymentMode: s.paymentMode,
+        kind: s.kind,                  // ✅ return kind (not type)
+        price: s.price,
+        isBooked: (s.appointments?.length || 0) > 0,
+      })),
+    });
+  } catch (error) {
+    console.error("Get Slots For User Error:", error);
+    return next ? next(error) : res.status(500).json({ error: "Failed to load slots" });
+  }
+};

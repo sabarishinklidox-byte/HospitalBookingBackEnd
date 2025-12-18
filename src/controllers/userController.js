@@ -671,10 +671,7 @@ export const rescheduleAppointment = async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 };
-
-// GET /user/slots?clinicId=...&doctorId=...&date=YYYY-MM-DD
-// GET /user/slots?clinicId=...&doctorId=...&date=YYYY-MM-DD&excludeAppointmentId=...
-export const getSlotsForUser = async (req, res) => {
+export const getSlotsForUser = async (req, res, next) => {
   try {
     const { clinicId, doctorId, date, excludeAppointmentId } = req.query;
 
@@ -682,7 +679,6 @@ export const getSlotsForUser = async (req, res) => {
       return res.status(400).json({ error: "clinicId, doctorId, date are required" });
     }
 
-    // ✅ safer date handling (range query)
     const start = new Date(date);
     start.setHours(0, 0, 0, 0);
 
@@ -694,7 +690,8 @@ export const getSlotsForUser = async (req, res) => {
         clinicId,
         doctorId,
         deletedAt: null,
-        date: { gte: start, lte: end }, // ✅ range query
+        kind: "APPOINTMENT",           // ✅ hide BREAK
+        date: { gte: start, lte: end },
       },
       orderBy: { time: "asc" },
       include: {
@@ -702,7 +699,7 @@ export const getSlotsForUser = async (req, res) => {
           where: {
             deletedAt: null,
             status: { in: ["PENDING", "CONFIRMED", "COMPLETED"] },
-            ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {}), // ✅ ignore current appt if provided
+            ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {}),
           },
           select: { id: true },
           take: 1,
@@ -716,14 +713,18 @@ export const getSlotsForUser = async (req, res) => {
         date: s.date,
         time: s.time,
         paymentMode: s.paymentMode,
-        type: s.type,
+        kind: s.kind,                  // ✅ return kind (not type)
         price: s.price,
         isBooked: (s.appointments?.length || 0) > 0,
       })),
     });
   } catch (error) {
     console.error("Get Slots For User Error:", error);
-    return res.status(500).json({ error: error.message });
+    return next ? next(error) : res.status(500).json({ error: "Failed to load slots" });
   }
 };
+
+// GET /user/slots?clinicId=...&doctorId=...&date=YYYY-MM-DD
+// GET /user/slots?clinicId=...&doctorId=...&date=YYYY-MM-DD&excludeAppointmentId=...
+
 

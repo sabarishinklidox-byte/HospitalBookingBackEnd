@@ -2,7 +2,7 @@ import { Router } from 'express';
 import {
   getClinics,
   getDoctorsByClinic,
-  getSlotsByDoctor,getDoctorById,getPublicClinicById
+  getSlotsByDoctor,getDoctorById,getPublicClinicById,getSlotsForUser,
 } from '../controllers/publicController.js';
 import { registerOrganization } from '../controllers/publicOrganizationController.js';
 import {forgotPassword,resetPassword} from '../controllers/authController.js'
@@ -22,5 +22,5 @@ router.post('/reset-password', resetPassword);
 router.post('/organizations/register', registerOrganization);
 router.get('/plans', listPublicPlans);  
 router.get('/google/place-id', getPlaceIdFromText);
-
+router.get("/slots", getSlotsForUser);
 export default router;

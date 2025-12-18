@@ -8,8 +8,8 @@ import {
   updateUserProfile,
   getUserAppointmentHistory,
   cancelUserAppointment,
-  rescheduleAppointment,
-  getSlotsForUser, // ✅ add this export from userController.js
+  rescheduleAppointment,getSlotsForUser
+   // ✅ add this export from userController.js
 } from "../controllers/userController.js";
 
 import { createReview, getDoctorReviews } from "../controllers/reviewController.js";
@@ -32,13 +32,14 @@ router.get("/profile", authMiddleware, requireUser, getUserProfile);
 router.patch("/profile", authMiddleware, requireUser, updateUserProfile);
 
 // Slots for booking UI (so booked slots can be disabled)
-router.get("/slots", authMiddleware, requireUser, getSlotsForUser);
+
 
 // Appointments
 router.post("/appointments", authMiddleware, requireUser, bookAppointment);
 router.get("/appointments", authMiddleware, requireUser, getUserAppointments);
 router.get("/history", authMiddleware, requireUser, getUserAppointmentHistory);
-router.patch("/appointments/:id/cancel", authMiddleware, requireUser, cancelUserAppointment);
+router.post("/appointments/:id/cancel", authMiddleware, requireUser, cancelUserAppointment);
+
 router.patch("/appointments/:id/reschedule", authMiddleware, requireUser, rescheduleAppointment);
 
 // Reviews
@@ -49,5 +50,5 @@ router.get("/doctors/:doctorId/reviews", getDoctorReviews);
 router.post("/book-appointment", authMiddleware, requireUser, createBooking);
 router.post("/verify-payment", authMiddleware, requireUser, verifyPayment);
 router.post("/verify-stripe-payment", authMiddleware, requireUser, verifyStripePayment);
-
+router.get("/slots", getSlotsForUser,authMiddleware,requireUser);
 export default router;

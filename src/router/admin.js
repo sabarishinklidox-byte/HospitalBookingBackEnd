@@ -203,12 +203,12 @@ router.post('/gateway/stripe', authMiddleware, requireAdmin, updateGatewayConfig
 router.get('/reviews', authMiddleware, requireAdmin, getClinicReviews);
 
 // ---------------- Audit logs ----------------
-router.get(
-  '/audit-logs',
-  authMiddleware,
-  requireAdminOrSuperAdmin,
-  getAuditLogs
-);
+  router.get(
+    '/audit-logs',
+    authMiddleware,
+    requireAdminOrSuperAdmin,
+    getAuditLogs
+  );
 
 // ---------------- Analytics ----------------
 router.get(
