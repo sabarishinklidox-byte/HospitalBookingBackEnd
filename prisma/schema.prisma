@@ -208,6 +208,7 @@ model Clinic {
   address       String
   city          String
   pincode       String
+phone     String   @default("0000000000")
   timings       Json
   details       String?
   accountNumber String

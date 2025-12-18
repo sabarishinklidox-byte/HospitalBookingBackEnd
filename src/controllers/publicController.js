@@ -29,6 +29,7 @@ export const getClinics = async (req, res) => {
       select: {
         id: true,
         name: true,
+        phone: true, // ✅ ADDED
         city: true,
         timings: true,
         address: true,
@@ -51,6 +52,7 @@ export const getClinics = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
 
 
 
@@ -231,18 +233,19 @@ export const getPublicClinicById = async (req, res) => {
       select: {
         id: true,
         name: true,
+        phone: true, // ✅ ADDED
         city: true,
         address: true,
         details: true,
         logo: true,
         banner: true,
         linkClicks: true,
-        // ✅ Google reviews fields
+        // Google reviews fields
         googlePlaceId: true,
         googleMapsUrl: true,
         googleReviewsEmbedCode: true,
-        googleRating: true,          // <‑‑ add this
-        googleTotalReviews: true,    // <‑‑ optional
+        googleRating: true,
+        googleTotalReviews: true,
       },
     });
 
@@ -263,7 +266,6 @@ export const getPublicClinicById = async (req, res) => {
     return res.status(500).json({ error: 'Failed to load clinic' });
   }
 };
-
 
 // ----------------------------------------------------------------
 // GET /api/public/doctors (Global List)

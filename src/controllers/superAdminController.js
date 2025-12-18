@@ -112,6 +112,7 @@ export const createClinic = async (req, res) => {
   try {
     const {
       name,
+      phone, // ✅ 1. Capture phone from request
       address,
       city,
       pincode,
@@ -123,15 +124,17 @@ export const createClinic = async (req, res) => {
       logo,
       banner,
 
-      // ✅ new fields from UI
+      // UI Toggles
       planId,
       isActive,
       allowAuditView,
     } = req.body;
 
-    if (!name || !address || !city || !pincode) {
-      return res.status(400).json({ error: "All fields are required" });
+    // ✅ 2. Validate phone is present
+    if (!name || !phone || !address || !city || !pincode) {
+      return res.status(400).json({ error: "Name, Phone, Address, City, and Pincode are required" });
     }
+    
     if (!planId) {
       return res.status(400).json({ error: "planId is required" });
     }
@@ -142,7 +145,6 @@ export const createClinic = async (req, res) => {
       .replace(/-+/g, "-")
       .replace(/^-|-$/g, "");
 
-    // 1) validate plan
     const plan = await prisma.plan.findFirst({
       where: { id: planId, isActive: true },
     });
@@ -150,15 +152,14 @@ export const createClinic = async (req, res) => {
       return res.status(404).json({ error: "Plan not found or inactive" });
     }
 
-    // 2) plan-gate override
     const safeAllowAuditView = plan.enableAuditLogs ? !!allowAuditView : false;
 
-    // 3) create clinic + subscription in one transaction
     const result = await prisma.$transaction(async (tx) => {
       const clinic = await tx.clinic.create({
         data: {
           slug,
           name,
+          phone, // ✅ 3. Save phone to DB
           address,
           city,
           pincode,
@@ -169,29 +170,24 @@ export const createClinic = async (req, res) => {
           details: details || "",
           logo: logo || null,
           banner: banner || null,
-
-          // ✅ toggles
           isActive: isActive ?? true,
           allowAuditView: safeAllowAuditView,
         },
       });
 
-      // Adjust field names to match your schema: Subscription/ClinicSubscription/etc.
       const subscription = await tx.subscription.create({
         data: {
           clinicId: clinic.id,
           planId: plan.id,
           status: "ACTIVE",
           startDate: new Date(),
-          // If your plan has durationDays/trialDays, compute endDate here
-          // endDate: ...
         },
       });
 
       return { clinic, subscription };
     });
 
-    // Safe Audit Log
+    // Audit Log
     try {
       await logAudit({
         userId: req.user.userId || req.user.id,
@@ -199,7 +195,7 @@ export const createClinic = async (req, res) => {
         action: ACTIONS.CREATE_CLINIC,
         entity: "Clinic",
         entityId: result.clinic.id,
-        details: { name: result.clinic.name, city: result.clinic.city, planId },
+        details: { name: result.clinic.name, phone, planId }, // ✅ Log phone in audit
         req,
       });
     } catch (e) {
@@ -209,7 +205,7 @@ export const createClinic = async (req, res) => {
     return res.status(201).json(result);
   } catch (error) {
     if (error.code === "P2002") {
-      return res.status(400).json({ error: "Clinic with this name already exists" });
+      return res.status(400).json({ error: "Clinic with this name/slug already exists" });
     }
     return res.status(500).json({ error: error.message });
   }
@@ -220,22 +216,84 @@ export const createClinic = async (req, res) => {
 // -------------------------
 export const getClinics = async (req, res) => {
   try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+    const search = req.query.search || ''; // ✅ Get search query
+
+    // ✅ Build search condition
+    const searchCondition = search
+      ? {
+          OR: [
+            { name: { contains: search, mode: 'insensitive' } },
+            { city: { contains: search, mode: 'insensitive' } },
+            { address: { contains: search, mode: 'insensitive' } },
+            { phone: { contains: search, mode: 'insensitive' } },
+            { slug: { contains: search, mode: 'insensitive' } },
+          ],
+        }
+      : {};
+
+    const whereCondition = {
+      deletedAt: null,
+      ...searchCondition, // ✅ Add search condition
+    };
+
+    // ✅ Get total count with search filter
+    const total = await prisma.clinic.count({ where: whereCondition });
+
     const clinics = await prisma.clinic.findMany({
-      where: { deletedAt: null },
+      where: whereCondition,
       include: {
-        admins: { where: { deletedAt: null } },
-        doctors: { where: { isActive: true, deletedAt: null } },
-        gateways: true,
+        admins: {
+          where: { deletedAt: null },
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            phone: true,
+          },
+        },
+        doctors: {
+          where: { isActive: true, deletedAt: null },
+          select: {
+            id: true,
+            name: true,
+            speciality: true,
+            avatar: true,
+          },
+        },
+        gateways: {
+          select: {
+            id: true,
+            name: true,
+            isActive: true,
+          },
+        },
       },
+      skip: skip,
+      take: limit,
+      orderBy: { createdAt: 'desc' },
     });
 
-    // clinics[i].linkClicks is available here
-    return res.json(clinics);
+    return res.json({
+      data: clinics,
+      pagination: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+        hasNextPage: page < Math.ceil(total / limit),
+        hasPrevPage: page > 1,
+      },
+      search: search || null, // ✅ Return search term
+    });
   } catch (error) {
-    console.error('getClinics error', error);
+    console.error('getClinics error:', error);
     return res.status(500).json({ error: error.message });
   }
 };
+
 // -------------------------
 // GET CLINIC BY ID
 // -------------------------
@@ -395,20 +453,45 @@ export const getClinicAdmins = async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 10;
     const skip = (page - 1) * limit;
+    const search = req.query.search || ''; // ✅ Get search query
 
-    const whereCondition = { 
+    // ✅ Build search condition
+    const searchCondition = search
+      ? {
+          OR: [
+            { name: { contains: search, mode: 'insensitive' } },
+            { email: { contains: search, mode: 'insensitive' } },
+            { phone: { contains: search, mode: 'insensitive' } },
+            { clinic: { name: { contains: search, mode: 'insensitive' } } },
+          ],
+        }
+      : {};
+
+    const whereCondition = {
       role: 'ADMIN',
-      deletedAt: null // ✅ Filter out deleted admins
+      deletedAt: null,
+      ...searchCondition, // ✅ Add search condition
     };
 
+    // ✅ Get total count with search filter
     const total = await prisma.user.count({ where: whereCondition });
 
     const admins = await prisma.user.findMany({
       where: whereCondition,
-      include: { clinic: true },
+      include: {
+        clinic: {
+          select: {
+            id: true,
+            name: true,
+            phone: true,
+            city: true,
+            address: true,
+          },
+        },
+      },
       skip: skip,
       take: limit,
-      orderBy: { createdAt: 'desc' }
+      orderBy: { createdAt: 'desc' },
     });
 
     return res.json({
@@ -417,11 +500,14 @@ export const getClinicAdmins = async (req, res) => {
         total,
         page,
         limit,
-        totalPages: Math.ceil(total / limit)
-      }
+        totalPages: Math.ceil(total / limit),
+        hasNextPage: page < Math.ceil(total / limit),
+        hasPrevPage: page > 1,
+      },
+      search: search || null, // ✅ Return search term
     });
-
   } catch (error) {
+    console.error('getClinicAdmins error:', error);
     return res.status(500).json({ error: error.message });
   }
 };

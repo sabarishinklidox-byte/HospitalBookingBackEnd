@@ -1,6 +1,7 @@
 // src/controllers/publicOrganizationController.js
 import prisma from '../prisma.js';
 import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken'; // ✅ ADDED
 import { logAudit } from '../utils/audit.js';
 
 // Helper to generate clinic slug from name
@@ -8,9 +9,9 @@ const toSlug = (str) =>
   str
     .toLowerCase()
     .trim()
-    .replace(/[^a-z0-9]/g, '-')   // non-alnum → dash
-    .replace(/-+/g, '-')          // collapse ---
-    .replace(/^-|-$/g, '');       // trim
+    .replace(/[^a-z0-9]/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
 
 // Helper to ensure slug is unique
 async function generateUniqueClinicSlug(tx, clinicName) {
@@ -26,11 +27,11 @@ async function generateUniqueClinicSlug(tx, clinicName) {
   }
 }
 
-// POST /api/public/organizations/register
 export const registerOrganization = async (req, res) => {
   try {
     const {
       clinicName,
+      clinicPhone,
       ownerName,
       ownerEmail,
       ownerPhone,
@@ -42,13 +43,17 @@ export const registerOrganization = async (req, res) => {
       ownerPassword,
     } = req.body;
 
+    // Validation
+    if (!clinicName || !clinicPhone) {
+      return res.status(400).json({ error: 'Clinic name and phone are required' });
+    }
+
     if (!planId) {
       return res.status(400).json({ error: 'planId is required' });
     }
+
     if (!ownerPassword || ownerPassword.length < 6) {
-      return res
-        .status(400)
-        .json({ error: 'Password must be at least 6 characters' });
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
     }
 
     // 1) Validate plan
@@ -56,9 +61,7 @@ export const registerOrganization = async (req, res) => {
       where: { id: planId, isActive: true, deletedAt: null },
     });
     if (!plan) {
-      return res
-        .status(400)
-        .json({ error: 'Selected plan is not available' });
+      return res.status(400).json({ error: 'Selected plan is not available' });
     }
 
     // 2) Ensure email not already used
@@ -76,18 +79,19 @@ export const registerOrganization = async (req, res) => {
         .filter(Boolean)
         .join(', ');
 
-      // Create clinic
+      // Create clinic WITH phone number
       const clinic = await tx.clinic.create({
         data: {
           slug,
           name: clinicName,
+          phone: clinicPhone,
           address: fullAddress || clinicName,
           city: city || '',
           pincode: pincode || '',
           accountNumber: 'N/A',
           ifscCode: 'N/A',
           bankName: 'N/A',
-          timings: {}, // required Json field
+          timings: {},
           details: '',
           logo: null,
           banner: null,
@@ -105,21 +109,17 @@ export const registerOrganization = async (req, res) => {
           password: hashedPassword,
           role: 'ADMIN',
           phone: ownerPhone || null,
-          clinic: {
-            connect: { id: clinic.id },
-          },
+          clinicId: clinic.id,
         },
       });
 
-      // Create subscription with snapshot of plan terms
+      // Create subscription
       const subscription = await tx.subscription.create({
         data: {
           clinicId: clinic.id,
           planId: plan.id,
           status: 'ACTIVE',
           startDate: new Date(),
-
-          // snapshot fields – make sure these exist on Subscription model
           priceAtPurchase: plan.priceMonthly,
           maxDoctors: plan.maxDoctors,
           maxBookingsPerPeriod: plan.maxBookingsPerMonth,
@@ -132,7 +132,7 @@ export const registerOrganization = async (req, res) => {
       return { clinic, ownerUser, subscription };
     });
 
-    // 4) Audit log (outside transaction; failures should not break response)
+    // 4) Audit log
     try {
       await logAudit({
         userId: result.ownerUser.id,
@@ -143,6 +143,7 @@ export const registerOrganization = async (req, res) => {
         details: {
           planId,
           clinicName,
+          clinicPhone,
           ownerEmail,
         },
         req,
@@ -151,11 +152,38 @@ export const registerOrganization = async (req, res) => {
       console.error('Audit log failed for clinic register', e);
     }
 
+    // 5) Generate JWT token
+    const token = jwt.sign(
+      {
+        id: result.ownerUser.id,
+        email: result.ownerUser.email,
+        role: result.ownerUser.role,
+        clinicId: result.clinic.id,
+      },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+
+    // 6) Return response
     return res.status(201).json({
       message: 'Organization registered successfully',
-      clinicId: result.clinic.id,
-      ownerId: result.ownerUser.id,
-      subscriptionId: result.subscription.id,
+      token,
+      user: {
+        id: result.ownerUser.id,
+        name: result.ownerUser.name,
+        email: result.ownerUser.email,
+        role: result.ownerUser.role,
+      },
+      clinic: {
+        id: result.clinic.id,
+        name: result.clinic.name,
+        phone: result.clinic.phone,
+        slug: result.clinic.slug,
+      },
+      subscription: {
+        id: result.subscription.id,
+        status: result.subscription.status,
+      },
     });
   } catch (err) {
     console.error('Register Organization Error:', err);
