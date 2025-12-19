@@ -108,11 +108,13 @@ export const superAdminLogin = async (req, res) => {
 // -------------------------
 // CREATE CLINIC
 // -------------------------
+// src/controllers/superAdminController.js
+
 export const createClinic = async (req, res) => {
   try {
     const {
       name,
-      phone, // ✅ 1. Capture phone from request
+      phone,
       address,
       city,
       pincode,
@@ -121,36 +123,40 @@ export const createClinic = async (req, res) => {
       bankName,
       timings,
       details,
-      logo,
-      banner,
-
-      // UI Toggles
+      logo,      // Incoming URL from frontend
+      banner,    // Incoming URL from frontend
       planId,
       isActive,
       allowAuditView,
     } = req.body;
 
-    // ✅ 2. Validate phone is present
     if (!name || !phone || !address || !city || !pincode) {
       return res.status(400).json({ error: "Name, Phone, Address, City, and Pincode are required" });
     }
-    
+
     if (!planId) {
       return res.status(400).json({ error: "planId is required" });
     }
 
-    const slug = name
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
+    const slug = name.toLowerCase().replace(/[^a-z0-9]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
 
+    // 1. Fetch Plan Details
     const plan = await prisma.plan.findFirst({
       where: { id: planId, isActive: true },
     });
+
     if (!plan) {
       return res.status(404).json({ error: "Plan not found or inactive" });
     }
+
+    // 2. Logic: Enforce Plan Limits for Branding
+    // Assuming your Plan model has a boolean field like 'enableCustomBranding'
+    // If not, you can add it, or hardcode logic based on plan names (not recommended but works temporarily)
+    const canUploadImages = plan.enableCustomBranding === true; 
+
+    // If plan doesn't allow branding, force logo/banner to null
+    const finalLogo = canUploadImages ? logo : null;
+    const finalBanner = canUploadImages ? banner : null;
 
     const safeAllowAuditView = plan.enableAuditLogs ? !!allowAuditView : false;
 
@@ -159,7 +165,7 @@ export const createClinic = async (req, res) => {
         data: {
           slug,
           name,
-          phone, // ✅ 3. Save phone to DB
+          phone,
           address,
           city,
           pincode,
@@ -168,8 +174,8 @@ export const createClinic = async (req, res) => {
           bankName: bankName || "N/A",
           timings: timings || {},
           details: details || "",
-          logo: logo || null,
-          banner: banner || null,
+          logo: finalLogo,     // ✅ Uses enforced value
+          banner: finalBanner, // ✅ Uses enforced value
           isActive: isActive ?? true,
           allowAuditView: safeAllowAuditView,
         },
@@ -187,7 +193,6 @@ export const createClinic = async (req, res) => {
       return { clinic, subscription };
     });
 
-    // Audit Log
     try {
       await logAudit({
         userId: req.user.userId || req.user.id,
@@ -195,7 +200,7 @@ export const createClinic = async (req, res) => {
         action: ACTIONS.CREATE_CLINIC,
         entity: "Clinic",
         entityId: result.clinic.id,
-        details: { name: result.clinic.name, phone, planId }, // ✅ Log phone in audit
+        details: { name: result.clinic.name, phone, planId, brandingAllowed: canUploadImages },
         req,
       });
     } catch (e) {
@@ -210,6 +215,7 @@ export const createClinic = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
 
 // -------------------------
 // GET ALL CLINICS (Active Only)

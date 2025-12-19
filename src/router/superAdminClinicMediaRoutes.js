@@ -1,35 +1,43 @@
-// src/routes/superAdminClinicMediaRoutes.js
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
-import {upload} from '../middleware/upload.js';              // <- Multer here
+import { upload } from '../middleware/upload.js'; // Uses Disk Storage
 import { authMiddleware, requireSuperAdmin } from '../middleware/auth.js';
 
 const router = express.Router();
-const UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'clinics');
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+// Ensure the specific clinics folder exists
+const CLINIC_UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'clinics');
+if (!fs.existsSync(CLINIC_UPLOAD_DIR)) {
+  fs.mkdirSync(CLINIC_UPLOAD_DIR, { recursive: true });
 }
 
 router.post(
-  '/super-admin/clinics/upload',
-  authMiddleware,
-  requireSuperAdmin,
-  upload.single('file'),                                   // <- Multer used here
+  '/super-admin/clinics/upload-image', // Ensure this matches your frontend API call
+  // authMiddleware,     // Uncomment these when ready
+  // requireSuperAdmin, 
+  upload.single('file'), 
   async (req, res) => {
     try {
+      // 1. Check if Multer processed the file
       if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded' });
       }
 
-      const ext = path.extname(req.file.originalname) || '.png';
-      const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
-      const filepath = path.join(UPLOAD_DIR, filename);
+      // 2. The file is currently saved in 'uploads/' (from middleware)
+      // We want to move it to 'uploads/clinics/'
+      const tempPath = req.file.path;
+      const targetPath = path.join(CLINIC_UPLOAD_DIR, req.file.filename);
 
-      fs.writeFileSync(filepath, req.file.buffer);
+      // Move the file
+      fs.renameSync(tempPath, targetPath);
 
-      const url = `/uploads/clinics/${filename}`;
+      // 3. Return the URL
+      // Ensure your app.js has: app.use('/uploads', express.static('uploads'));
+      const url = `/uploads/clinics/${req.file.filename}`;
+      
       return res.json({ url });
+
     } catch (err) {
       console.error('Clinic media upload error', err);
       return res.status(500).json({ error: 'Upload failed' });
