@@ -161,7 +161,7 @@ export const getDoctorsByClinic = async (req, res) => {
 
     // ✅ Get current date/time to filter out past slots
     const now = new Date();
-    const currentDateString = now.toISOString().split('T')[0]; // "YYYY-MM-DD"
+    const currentDateString = now.toISOString().split('T')[0]; 
     const currentHours = now.getHours();
     const currentMinutes = now.getMinutes();
 
