@@ -345,6 +345,8 @@ export const deleteSlot = async (req, res) => {
   // ----------------------------------------------------------------
   // BULK CREATE (gated by enableAuditLogs)
   // ----------------------------------------------------------------
+// src/controllers/slotsController.js
+
 export const createBulkSlots = async (req, res) => {
   try {
     const { clinicId, userId } = req.user;
@@ -353,103 +355,111 @@ export const createBulkSlots = async (req, res) => {
       doctorId,
       startDate,
       endDate,
-      startTime,
-      duration,
-      days,
+      startTime,   // e.g., "09:00"
+      endTime,     // e.g., "18:00" (NEW REQUIRED FIELD)
+      duration,    // e.g., 30 (minutes)
+      days,        // e.g., [1, 2, 3, 4, 5] (Mon-Fri)
       paymentMode,
-      kind, // ✅ added for BREAK/LUNCH
+      kind,
+      lunchStart,  // e.g., "13:00" (Optional)
+      lunchEnd     // e.g., "14:00" (Optional)
     } = req.body;
 
-    if (!doctorId || !startDate || !endDate || !startTime || !duration) {
-      return res.status(400).json({ error: "Missing required fields" });
+    // 1. Validation
+    if (!doctorId || !startDate || !endDate || !startTime || !endTime || !duration) {
+      return res.status(400).json({ error: "Missing required fields (startTime, endTime, duration)" });
     }
 
     if (!Array.isArray(days) || days.length === 0) {
       return res.status(400).json({ error: "Days must be a non-empty array" });
     }
 
+    // 2. Plan Checks (Keep your existing plan logic)
     const plan = await getClinicPlan(clinicId);
-    if (!plan) {
-      return res
-        .status(400)
-        .json({ error: "No active subscription plan for this clinic." });
-    }
-
-    // ✅ gate bulk slots on enableAuditLogs (advanced tools)
-    if (!plan.enableAuditLogs) {
-      return res.status(403).json({
-        error:
-          "Bulk slot creation is not available on your current plan. Please upgrade to enable this feature.",
-      });
+    if (!plan || !plan.enableAuditLogs) {
+      return res.status(403).json({ error: "Upgrade plan to use Bulk Slot Creation." });
     }
 
     const slotKind = kind || "APPOINTMENT";
-
-    // ✅ BREAK/LUNCH rule: always FREE
     const mode = slotKind === "BREAK" ? "FREE" : paymentMode || "ONLINE";
     const isPaidMode = mode === "ONLINE" || mode === "OFFLINE";
 
     if (isPaidMode && !plan.allowOnlinePayments) {
-      return res.status(403).json({
-        error:
-          "Paid/online slots are disabled on your current plan. Use FREE mode instead.",
-      });
+      return res.status(403).json({ error: "Paid slots disabled on current plan." });
     }
 
+    // 3. Verify Doctor
     const doctor = await prisma.doctor.findUnique({
       where: { id: doctorId },
       select: { clinicId: true, name: true, deletedAt: true },
     });
 
-    if (!doctor || doctor.deletedAt) {
-      return res.status(404).json({ error: "Doctor not found" });
+    if (!doctor || doctor.clinicId !== clinicId) {
+      return res.status(403).json({ error: "Invalid doctor." });
     }
 
-    // ✅ IMPORTANT security check
-    if (doctor.clinicId !== clinicId) {
-      return res
-        .status(403)
-        .json({ error: "Doctor does not belong to this clinic" });
-    }
+    // 4. Helper to Convert Time "HH:MM" to Minutes
+    const timeToMinutes = (timeStr) => {
+        const [h, m] = timeStr.split(':').map(Number);
+        return h * 60 + m;
+    };
 
-    const selectedDays = days.map((d) => parseInt(d, 10)).filter(Number.isFinite);
+    const startMins = timeToMinutes(startTime);
+    const endMins = timeToMinutes(endTime);
+    const lunchStartMins = lunchStart ? timeToMinutes(lunchStart) : -1;
+    const lunchEndMins = lunchEnd ? timeToMinutes(lunchEnd) : -1;
+    const durationMins = parseInt(duration, 10);
 
+    const selectedDays = days.map((d) => parseInt(d, 10));
     const slotsToCreate = [];
+    const slotPrice = mode === "FREE" ? 0 : 500; // or from body
 
+    // 5. Date Loop
     let currentDate = new Date(startDate);
-    currentDate.setHours(12, 0, 0, 0);
+    currentDate.setUTCHours(0,0,0,0); // Normalize to midnight UTC
 
     const finalDate = new Date(endDate);
-    finalDate.setHours(12, 0, 0, 0);
-
-    const slotPrice = mode === "FREE" ? 0 : 500;
+    finalDate.setUTCHours(0,0,0,0);
 
     while (currentDate <= finalDate) {
-      const dayIndex = currentDate.getDay();
+      const dayIndex = currentDate.getDay(); // 0=Sun, 1=Mon...
 
       if (selectedDays.includes(dayIndex)) {
-        slotsToCreate.push({
-          doctorId,
-          clinicId: doctor.clinicId,
-          date: new Date(currentDate),
-          time: startTime,
-          duration: parseInt(duration, 10),
-          paymentMode: mode,
-          price: slotPrice,
-          // Keep your existing `type` field behavior, but include BREAK:
-          type: slotKind === "BREAK" ? "BREAK" : mode === "FREE" ? "FREE" : "PAID",
-          // If your Slot model has `kind`, store it too:
-          // kind: slotKind,
-        });
-      }
+        
+        // 6. Time Loop (Generate multiple slots for this day)
+        for (let time = startMins; time < endMins; time += durationMins) {
+            
+            // Lunch Break Check
+            if (lunchStartMins !== -1 && lunchEndMins !== -1) {
+                // If current slot start is inside lunch window
+                if (time >= lunchStartMins && time < lunchEndMins) {
+                    continue; // Skip this slot
+                }
+            }
 
+            // Convert minutes back to "HH:MM" for storage
+            const h = Math.floor(time / 60).toString().padStart(2, '0');
+            const m = (time % 60).toString().padStart(2, '0');
+            const timeString = `${h}:${m}`;
+
+            slotsToCreate.push({
+                doctorId,
+                clinicId: doctor.clinicId,
+                date: new Date(currentDate), // Clone date object
+                time: timeString,
+                duration: durationMins,
+                paymentMode: mode,
+                price: slotPrice,
+                type: slotKind === "BREAK" ? "BREAK" : mode === "FREE" ? "FREE" : "PAID",
+                // kind: slotKind // Uncomment if schema has this
+            });
+        }
+      }
+      // Next Day
       currentDate.setDate(currentDate.getDate() + 1);
     }
 
-    if (slotsToCreate.length === 0) {
-      return res.status(400).json({ error: "No slots generated." });
-    }
-
+    // 7. Bulk Insert (One by One to handle duplicates gracefully)
     let successCount = 0;
     let duplicateCount = 0;
 
@@ -458,15 +468,13 @@ export const createBulkSlots = async (req, res) => {
         await prisma.slot.create({ data: slot });
         successCount++;
       } catch (error) {
-        // Prisma P2002 means unique constraint failed (duplicate). [web:2269]
         if (error.code === "P2002") {
           duplicateCount++;
-        } else {
-          console.error("Failed to create slot:", error.message);
         }
       }
     }
 
+    // 8. Audit Log
     if (successCount > 0) {
       await logAudit({
         userId: userId || req.user.userId,
@@ -478,24 +486,24 @@ export const createBulkSlots = async (req, res) => {
           doctorName: doctor.name,
           count: successCount,
           skipped: duplicateCount,
-          startDate,
-          endDate,
-          paymentMode: mode,
-          kind: slotKind,
+          range: `${startTime} - ${endTime}`,
+          lunch: lunchStart ? `${lunchStart}-${lunchEnd}` : "None"
         },
         req,
       });
     }
 
     return res.json({
-      message: `Created: ${successCount}, Skipped: ${duplicateCount}`,
+      message: `Created: ${successCount} slots, Skipped: ${duplicateCount} duplicates`,
       count: successCount,
     });
+
   } catch (error) {
     console.error("Bulk Create Error:", error);
     return res.status(500).json({ error: error.message });
   }
 };
+
 
   // controllers/slotController.js
   // controllers/slotController.js
