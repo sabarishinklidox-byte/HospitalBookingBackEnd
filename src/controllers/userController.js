@@ -252,7 +252,15 @@ export const updateUserProfile = async (req, res) => {
     const updatedUser = await prisma.user.update({
       where: { id: userId },
       data,
-      select: { id: true, name: true, email: true, phone: true },
+      select: { 
+        id: true, 
+        name: true, 
+        email: true, 
+        phone: true, 
+        role: true,       // ✅ CRITICAL: Needed for permission checks
+        clinicId: true,   // ✅ CRITICAL: Needed for Admins/Doctors (Null for Patients)
+        createdAt: true 
+      },
     });
 
     await logAudit({
@@ -270,6 +278,7 @@ export const updateUserProfile = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
 
 // ----------------------------------------------------------------
 // 6. GET HISTORY (With Soft Delete Filter)

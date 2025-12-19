@@ -88,72 +88,76 @@ enum BookingSection {
 // --- SAAS SUBSCRIPTION MODELS (NEW) ---
 
 model Plan {
-  id                   String   @id @default(uuid())
-  name                 String
-  slug                 String   @unique
-  priceMonthly         Decimal
-  currency             String   @default("INR")
+  id           String  @id @default(uuid())
+  name         String
+  slug         String  @unique
+  priceMonthly Decimal
+  currency     String  @default("INR")
 
   // Feature Limits
-  maxDoctors           Int      @default(1)
-  maxBookingsPerMonth  Int      @default(100)
-  allowOnlinePayments  Boolean  @default(false)
-  allowCustomBranding  Boolean  @default(false)
+  maxDoctors          Int     @default(1)
+  maxBookingsPerMonth Int     @default(100)
+  allowOnlinePayments Boolean @default(false)
+  allowCustomBranding Boolean @default(false)
 
   // Feature flags
-  enableReviews        Boolean  @default(true)
-  enableBulkSlots      Boolean  @default(true)
-  enableExports        Boolean  @default(true)
-  enableAuditLogs      Boolean  @default(true)
-  enableGoogleReviews  Boolean  @default(false)
+  enableReviews       Boolean @default(true)
+  enableBulkSlots     Boolean @default(true)
+  enableExports       Boolean @default(true)
+  enableAuditLogs     Boolean @default(true)
+  
+  // ✅ REVIEWS & EMBEDS
+  enableGoogleReviews Boolean @default(false) // Enables "Google Place ID" field
+  allowEmbedReviews   Boolean @default(false) // ✅ ADDED: Enables "Embed Code" field
 
   // NEW: duration / trial
-  isTrial              Boolean  @default(false)
-  durationDays         Int?     // null = recurring plan, value = fixed-length plan (e.g. 15)
-  trialDays            Int?     // optional extra free trial days
+  isTrial      Boolean @default(false)
+  durationDays Int? // null = recurring plan, value = fixed-length plan (e.g. 15)
+  trialDays    Int? // optional extra free trial days
 
-  isActive             Boolean  @default(true)
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
-  deletedAt            DateTime?
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
 
-  subscriptions        Subscription[]
+  subscriptions Subscription[]
 
   @@map("plans")
 }
 
 
 model Subscription {
-  id                    String             @id @default(uuid())
-  clinicId              String             @unique
-  planId                String
-  status                SubscriptionStatus @default(ACTIVE)
+  id                   String             @id @default(uuid())
+  clinicId             String             @unique
+  planId               String
+  status               SubscriptionStatus @default(ACTIVE)
 
-  startDate             DateTime           @default(now())
-  endDate               DateTime?
-  nextBillingDate       DateTime?
+  startDate       DateTime  @default(now())
+  endDate         DateTime?
+  nextBillingDate DateTime?
 
   // Snapshot from plan at time of subscription/upgrade
-  priceAtPurchase       Decimal?          // <-- made optional
-  maxDoctors            Int?              // <-- made optional
-  maxBookingsPerPeriod  Int?              // <-- made optional
-  durationDays          Int?
-  isTrial               Boolean           @default(false)
-  trialDays             Int?
+  priceAtPurchase      Decimal?
+  maxDoctors           Int?
+  maxBookingsPerPeriod Int?
+  durationDays         Int?
+  isTrial              Boolean  @default(false)
+  trialDays            Int?
 
   // External Payment Gateway IDs
   gatewaySubscriptionId String?
   gatewayCustomerId     String?
 
-  createdAt             DateTime          @default(now())
-  updatedAt             DateTime          @updatedAt
-  deletedAt             DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
 
-  clinic                Clinic            @relation(fields: [clinicId], references: [id])
-  plan                  Plan              @relation(fields: [planId], references: [id])
+  clinic Clinic @relation(fields: [clinicId], references: [id])
+  plan   Plan   @relation(fields: [planId], references: [id])
 
   @@map("subscriptions")
 }
+
 
 
 // --- EXISTING CORE MODELS ---

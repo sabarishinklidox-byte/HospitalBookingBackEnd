@@ -19,7 +19,6 @@ const logPlanAudit = async (userId, action, planId, details = null) => {
   }
 };
 
-
 // GET /api/super-admin/plans
 export const listPlans = async (req, res) => {
   try {
@@ -33,7 +32,6 @@ export const listPlans = async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 };
-
 
 // POST /api/super-admin/plans
 export const createPlan = async (req, res) => {
@@ -51,15 +49,14 @@ export const createPlan = async (req, res) => {
       allowCustomBranding,
       enableAuditLogs = true,
       enableGoogleReviews = false,
+      allowEmbedReviews = false, // ✅ ADDED
       isActive = true,
 
-      // NEW
       isTrial = false,
-      durationDays,          // e.g. 15
-      trialDays,             // optional separate trial
+      durationDays,
+      trialDays,
     } = req.body;
 
-    // Basic validation example
     if (!name || !slug || priceMonthly == null) {
       return res.status(400).json({ error: 'name, slug, priceMonthly are required' });
     }
@@ -69,7 +66,6 @@ export const createPlan = async (req, res) => {
     }
 
     if (isTrial && !durationDays) {
-      // you can enforce that trial plans must have a duration
       return res.status(400).json({ error: 'Trial plans must have durationDays' });
     }
 
@@ -85,8 +81,8 @@ export const createPlan = async (req, res) => {
         allowCustomBranding,
         enableAuditLogs,
         enableGoogleReviews,
+        allowEmbedReviews, // ✅ ADDED
         isActive,
-
         isTrial,
         durationDays: durationDays ?? null,
         trialDays: trialDays ?? null,
@@ -104,8 +100,6 @@ export const createPlan = async (req, res) => {
   }
 };
 
-
-
 // PUT /api/super-admin/plans/:id
 export const updatePlan = async (req, res) => {
   try {
@@ -119,13 +113,11 @@ export const updatePlan = async (req, res) => {
       return res.status(404).json({ error: 'Plan not found' });
     }
 
-    // Count active subscriptions for this plan
     const activeSubCount = await prisma.subscription.count({
       where: { planId: id, status: 'ACTIVE' },
     });
 
     const {
-      // allowed always
       name,
       allowOnlinePayments,
       allowCustomBranding,
@@ -133,40 +125,34 @@ export const updatePlan = async (req, res) => {
       enableExports,
       enableAuditLogs,
       enableGoogleReviews,
+      allowEmbedReviews, // ✅ ADDED
       isActive,
-
-      // dangerous if there are active subs
       priceMonthly,
       maxDoctors,
       maxBookingsPerMonth,
       durationDays,
       isTrial,
       trialDays,
-
       ...rest
     } = req.body;
 
     const data = {
       ...rest,
       name: name ?? existing.name,
-      allowOnlinePayments:
-        allowOnlinePayments ?? existing.allowOnlinePayments,
-      allowCustomBranding:
-        allowCustomBranding ?? existing.allowCustomBranding,
+      allowOnlinePayments: allowOnlinePayments ?? existing.allowOnlinePayments,
+      allowCustomBranding: allowCustomBranding ?? existing.allowCustomBranding,
       enableBulkSlots: enableBulkSlots ?? existing.enableBulkSlots,
       enableExports: enableExports ?? existing.enableExports,
       enableAuditLogs: enableAuditLogs ?? existing.enableAuditLogs,
-      enableGoogleReviews:
-        enableGoogleReviews ?? existing.enableGoogleReviews,
-      isActive:
-        typeof isActive === 'boolean' ? isActive : existing.isActive,
+      enableGoogleReviews: enableGoogleReviews ?? existing.enableGoogleReviews,
+      allowEmbedReviews: allowEmbedReviews ?? existing.allowEmbedReviews, // ✅ ADDED
+      isActive: typeof isActive === 'boolean' ? isActive : existing.isActive,
     };
 
     if (activeSubCount === 0) {
       if (priceMonthly != null) data.priceMonthly = priceMonthly;
       if (maxDoctors != null) data.maxDoctors = maxDoctors;
-      if (maxBookingsPerMonth != null)
-        data.maxBookingsPerMonth = maxBookingsPerMonth;
+      if (maxBookingsPerMonth != null) data.maxBookingsPerMonth = maxBookingsPerMonth;
       if (durationDays !== undefined) data.durationDays = durationDays;
       if (isTrial !== undefined) data.isTrial = isTrial;
       if (trialDays !== undefined) data.trialDays = trialDays;
@@ -180,8 +166,7 @@ export const updatePlan = async (req, res) => {
         trialDays !== undefined
       ) {
         return res.status(400).json({
-          error:
-            'Cannot change price, limits or duration while plan has active subscriptions. Create a new plan instead.',
+          error: 'Cannot change price, limits or duration while plan has active subscriptions. Create a new plan instead.',
         });
       }
     }
@@ -191,7 +176,6 @@ export const updatePlan = async (req, res) => {
       data,
     });
 
-    // Audit as generic log
     await logAudit({
       userId,
       clinicId: null,
@@ -209,8 +193,6 @@ export const updatePlan = async (req, res) => {
   }
 };
 
-
-// DELETE (soft) /api/super-admin/plans/:id
 // DELETE (soft) /api/super-admin/plans/:id
 export const deletePlan = async (req, res) => {
   try {
@@ -230,8 +212,7 @@ export const deletePlan = async (req, res) => {
 
     if (activeSubCount > 0) {
       return res.status(400).json({
-        error:
-          'Cannot delete a plan that has active subscriptions. Deactivate it instead.',
+        error: 'Cannot delete a plan that has active subscriptions. Deactivate it instead.',
       });
     }
 
