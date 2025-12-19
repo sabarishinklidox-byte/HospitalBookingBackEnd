@@ -118,61 +118,85 @@ export const getDoctorsByClinic = async (req, res) => {
 // GET /api/public/doctors/:doctorId/slots
 // ----------------------------------------------------------------
       export const getSlotsByDoctor = async (req, res) => {
-        try {
-          const { doctorId } = req.params;
-          const { date } = req.query;
+  try {
+    const { doctorId } = req.params;
+    const { date } = req.query;
 
-          const doctor = await prisma.doctor.findUnique({
-            where: { id: doctorId },
-            include: { clinic: true },
-          });
+    const doctor = await prisma.doctor.findUnique({
+      where: { id: doctorId },
+      include: { clinic: true },
+    });
 
-          if (
-            !doctor ||
-            !doctor.isActive ||
-            doctor.deletedAt ||
-            doctor.clinic.deletedAt
-          ) {
-            return res.status(404).json({ error: 'Doctor unavailable.' });
-          }
+    if (
+      !doctor ||
+      !doctor.isActive ||
+      doctor.deletedAt ||
+      doctor.clinic.deletedAt
+    ) {
+      return res.status(404).json({ error: 'Doctor unavailable.' });
+    }
 
-          const where = {
-            doctorId,
-            deletedAt: null,
-            kind: 'APPOINTMENT',          // ✅ hide BREAK / lunch slots
-          };
+    const where = {
+      doctorId,
+      deletedAt: null,
+      kind: 'APPOINTMENT', // hide BREAK / lunch slots
+    };
 
-          if (date) {
-            const d = new Date(date);
-            const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-            const end = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
-            where.date = { gte: start, lt: end };
-          }
+    if (date) {
+      const d = new Date(date);
+      const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+      const end = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+      where.date = { gte: start, lt: end };
+    }
 
-          const slots = await prisma.slot.findMany({
-            where,
-            orderBy: [{ date: 'asc' }, { time: 'asc' }],
-            include: {
-              appointments: {
-                where: { deletedAt: null },
-              },
-            },
-          });
+    const slots = await prisma.slot.findMany({
+      where,
+      orderBy: [{ date: 'asc' }, { time: 'asc' }],
+      include: {
+        appointments: {
+          where: { deletedAt: null },
+        },
+      },
+    });
 
-          const data = slots.map((slot) => {
-            const isBooked = slot.appointments.some((a) =>
-              ['PENDING', 'CONFIRMED', 'COMPLETED'].includes(a.status)
-            );
-            const { appointments, ...rest } = slot;
-            return { ...rest, isBooked };
-          });
+    // ✅ Get current date/time to filter out past slots
+    const now = new Date();
+    const currentDateString = now.toISOString().split('T')[0]; // "YYYY-MM-DD"
+    const currentHours = now.getHours();
+    const currentMinutes = now.getMinutes();
 
-          res.json(data);
-        } catch (error) {
-          console.error('Slot Fetch Error:', error);
-          res.status(500).json({ error: 'Failed to load slots.' });
+    const data = slots
+      .map((slot) => {
+        // 1. Check if booked
+        const isBooked = slot.appointments.some((a) =>
+          ['PENDING', 'CONFIRMED', 'COMPLETED'].includes(a.status)
+        );
+
+        const { appointments, ...rest } = slot;
+        return { ...rest, isBooked };
+      })
+      .filter((slot) => {
+        // 2. Filter out past times IF the slot is for today
+        const slotDateString = new Date(slot.date).toISOString().split('T')[0];
+
+        if (slotDateString === currentDateString) {
+          const [slotHour, slotMinute] = slot.time.split(':').map(Number);
+          
+          // If slot hour is less than current hour, it's passed.
+          // If slot hour equals current hour, check minutes.
+          if (slotHour < currentHours) return false;
+          if (slotHour === currentHours && slotMinute <= currentMinutes) return false;
         }
-      };
+
+        return true;
+      });
+
+    res.json(data);
+  } catch (error) {
+    console.error('Slot Fetch Error:', error);
+    res.status(500).json({ error: 'Failed to load slots.' });
+  }
+};
 
 
 

@@ -2,8 +2,11 @@ import prisma from '../prisma.js';
 import bcrypt from 'bcryptjs';
 import { logAudit } from '../utils/audit.js';
 
-// helper to get current plan for a clinic
+// ----------------------------------------------------------------
+// Helper: Get current plan for a clinic
+// ----------------------------------------------------------------
 async function getClinicPlan(clinicId) {
+  if (!clinicId) return null;
   const clinic = await prisma.clinic.findUnique({
     where: { id: clinicId },
     include: {
@@ -12,18 +15,23 @@ async function getClinicPlan(clinicId) {
       },
     },
   });
-
-  return clinic?.subscription?.plan || null; // Plan has allowOnlinePayments, allowCustomBranding, enableAuditLogs, etc. [web:1186]
+  return clinic?.subscription?.plan || null; 
 }
 
 // ----------------------------------------------------------------
-// GET /api/admin/profile (admin + clinic info)
+// GET /api/admin/profile (User + Clinic Info)
 // ----------------------------------------------------------------
 export const getAdminProfile = async (req, res) => {
   try {
-    const { userId, clinicId } = req.user;
+    // 1. Get ID from token (Handle both 'id' and 'userId' formats)
+    const userId = req.user.id || req.user.userId;
 
-    const admin = await prisma.user.findUnique({
+    if (!userId) {
+        return res.status(401).json({ error: "Invalid token payload" });
+    }
+
+    // 2. Fetch User directly
+    const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
         id: true,
@@ -31,19 +39,27 @@ export const getAdminProfile = async (req, res) => {
         email: true,
         phone: true,
         role: true,
-        clinicId: true,
+        clinicId: true, // ✅ We get clinicId directly from User
         deletedAt: true,
       },
     });
 
-    if (!admin || admin.deletedAt) {
-      return res
-        .status(404)
-        .json({ error: 'Admin account not found or inactive.' });
+    if (!user || user.deletedAt) {
+      return res.status(404).json({ error: 'User account not found.' });
     }
 
+    // 3. Resolve Clinic ID
+    // ❌ REMOVED: The fallback to prisma.admin because that table doesn't exist
+    const resolvedClinicId = user.clinicId;
+
+    if (!resolvedClinicId) {
+       // Valid user, but no clinic linked
+       return res.json({ admin: user, clinic: null, plan: null });
+    }
+
+    // 4. Fetch Clinic
     const clinic = await prisma.clinic.findUnique({
-      where: { id: clinicId },
+      where: { id: resolvedClinicId },
       select: {
         id: true,
         name: true,
@@ -54,6 +70,14 @@ export const getAdminProfile = async (req, res) => {
         details: true,
         logo: true,
         banner: true,
+        googlePlaceId: true,
+        googleMapsUrl: true,
+        googleReviewsEmbedCode: true,
+        googleRating: true,
+        // Bank Details
+        bankName: true,
+        accountNumber: true,
+        ifscCode: true,
         deletedAt: true,
       },
     });
@@ -62,28 +86,40 @@ export const getAdminProfile = async (req, res) => {
       return res.status(404).json({ error: 'Clinic not found or inactive.' });
     }
 
-    // get current plan for this clinic
-    const plan = await getClinicPlan(clinicId);
+    // 5. Fetch Plan
+    const plan = await getClinicPlan(resolvedClinicId);
 
-    delete admin.deletedAt;
+    delete user.deletedAt;
     delete clinic.deletedAt;
 
-    return res.json({ admin, clinic, plan }); // ✅ send plan
+    // Return merged data
+    return res.json({ admin: user, clinic, plan });
+
   } catch (error) {
     console.error('Get Admin Profile Error:', error);
+    // Return actual error message for debugging instead of generic 500
     return res.status(500).json({ error: error.message });
   }
 };
 
-
+// ----------------------------------------------------------------
+// PATCH /api/admin/profile
+// ----------------------------------------------------------------
 // ----------------------------------------------------------------
 // PATCH /api/admin/profile
 // ----------------------------------------------------------------
 export const updateAdminProfile = async (req, res) => {
   try {
-    const { userId, clinicId } = req.user;
+    // 1. Safe ID Extraction
+    const userId = req.user.id || req.user.userId;
+
+    if (!userId) {
+        return res.status(401).json({ error: 'Unauthorized: Invalid token payload' });
+    }
+
     const { name, phone, password } = req.body;
 
+    // 2. Fetch Current User
     const currentAdmin = await prisma.user.findUnique({
       where: { id: userId },
     });
@@ -92,20 +128,19 @@ export const updateAdminProfile = async (req, res) => {
       return res.status(404).json({ error: 'User not found.' });
     }
 
+    // 3. Prepare Update Data
     const data = {};
     if (name !== undefined) data.name = name;
     if (phone !== undefined) data.phone = phone;
 
     if (password) {
       if (password.length < 6) {
-        return res
-          .status(400)
-          .json({ error: 'Password must be at least 6 characters' });
+        return res.status(400).json({ error: 'Password must be at least 6 characters' });
       }
-      const hashed = await bcrypt.hash(password, 12);
-      data.password = hashed;
+      data.password = await bcrypt.hash(password, 12);
     }
 
+    // 4. Update User
     const updated = await prisma.user.update({
       where: { id: userId },
       data,
@@ -119,20 +154,26 @@ export const updateAdminProfile = async (req, res) => {
       },
     });
 
+    // 5. Audit Log
     const changes = {};
     if (name && name !== currentAdmin.name) changes.name = name;
     if (phone && phone !== currentAdmin.phone) changes.phone = phone;
     if (password) changes.password = 'Password Changed';
 
-    await logAudit({
-      userId,
-      clinicId,
-      action: 'UPDATE_ADMIN_PROFILE',
-      entity: 'User',
-      entityId: userId,
-      details: changes,
-      req,
-    });
+    // ✅ FIXED: Only check user.clinicId (Removed prisma.admin lookup)
+    const auditClinicId = currentAdmin.clinicId; 
+
+    if (auditClinicId) {
+        await logAudit({
+            userId,
+            clinicId: auditClinicId,
+            action: 'UPDATE_ADMIN_PROFILE',
+            entity: 'User',
+            entityId: userId,
+            details: changes,
+            req,
+        });
+    }
 
     return res.json({ admin: updated });
   } catch (error) {
@@ -141,30 +182,41 @@ export const updateAdminProfile = async (req, res) => {
   }
 };
 
+
+// ----------------------------------------------------------------
+// PATCH /api/admin/clinic
+// ----------------------------------------------------------------
+// src/controllers/adminController.js
+
+// ... (keep getAdminProfile as is)
+
 // ----------------------------------------------------------------
 // PATCH /api/admin/clinic
 // ----------------------------------------------------------------
 export const updateClinicSettings = async (req, res) => {
   try {
-    const { clinicId, userId } = req.user;
-    const {
-      address,
-      city,
-      pincode,
-      timings,
-      details,
-      googlePlaceId,
-      googleMapsUrl,
-      googleReviewsEmbedCode,
-      googleRating,           // ✅ new field from body
-    } = req.body;
+    // 1. Get User ID from Token
+    const userId = req.user.id || req.user.userId;
 
-    const existingClinic = await prisma.clinic.findUnique({
-      where: { id: clinicId },
+    // 2. Fetch User to get the secure Clinic ID
+    const user = await prisma.user.findUnique({ 
+        where: { id: userId },
+        select: { clinicId: true }
     });
-    if (!existingClinic || existingClinic.deletedAt) {
-      return res.status(404).json({ error: 'Clinic not found.' });
+    
+    // 3. Validate Clinic ID
+    const clinicId = user?.clinicId;
+
+    if (!clinicId) {
+        return res.status(404).json({ error: "No clinic linked to this user." });
     }
+
+    const {
+      address, city, pincode, timings, details,
+      googlePlaceId, googleMapsUrl, googleReviewsEmbedCode, googleRating,
+      // Bank details might be updated here too if your form allows
+      bankName, accountNumber, ifscCode
+    } = req.body;
 
     const data = {};
     if (address !== undefined) data.address = address;
@@ -172,36 +224,28 @@ export const updateClinicSettings = async (req, res) => {
     if (pincode !== undefined) data.pincode = pincode;
     if (timings !== undefined) data.timings = timings;
     if (details !== undefined) data.details = details;
-
-    // ✅ Google config fields
+    
+    // Google Integration
     if (googlePlaceId !== undefined) data.googlePlaceId = googlePlaceId;
     if (googleMapsUrl !== undefined) data.googleMapsUrl = googleMapsUrl;
-    if (googleReviewsEmbedCode !== undefined) {
-      data.googleReviewsEmbedCode = googleReviewsEmbedCode;
-    }
+    if (googleReviewsEmbedCode !== undefined) data.googleReviewsEmbedCode = googleReviewsEmbedCode;
+    if (googleRating !== undefined && googleRating !== '') data.googleRating = Number(googleRating);
 
-    // ✅ numeric rating only (0–5, manual or synced)
-    if (googleRating !== undefined && googleRating !== '') {
-      data.googleRating = Number(googleRating);
-    }
+    // Bank Details
+    if (bankName !== undefined) data.bankName = bankName;
+    if (accountNumber !== undefined) data.accountNumber = accountNumber;
+    if (ifscCode !== undefined) data.ifscCode = ifscCode;
 
+    // File Uploads (Multer)
     const logoFile = req.files?.logo?.[0];
     const bannerFile = req.files?.banner?.[0];
 
-    if (logoFile) {
-      const baseUrl =
-        process.env.APP_BASE_URL ||
-        `http://localhost:${process.env.PORT || 5000}`;
-      data.logo = `${baseUrl}/uploads/${logoFile.filename}`;
-    }
+    const baseUrl = process.env.APP_BASE_URL || `http://localhost:${process.env.PORT || 5000}`;
 
-    if (bannerFile) {
-      const baseUrl =
-        process.env.APP_BASE_URL ||
-        `http://localhost:${process.env.PORT || 5000}`;
-      data.banner = `${baseUrl}/uploads/${bannerFile.filename}`;
-    }
+    if (logoFile) data.logo = `${baseUrl}/uploads/${logoFile.filename}`;
+    if (bannerFile) data.banner = `${baseUrl}/uploads/${bannerFile.filename}`;
 
+    // 4. Update Clinic
     const clinic = await prisma.clinic.update({
       where: { id: clinicId },
       data,
@@ -218,17 +262,21 @@ export const updateClinicSettings = async (req, res) => {
         googlePlaceId: true,
         googleMapsUrl: true,
         googleReviewsEmbedCode: true,
-        googleRating: true,      // ✅ include in response
+        googleRating: true,
+        bankName: true,
+        accountNumber: true,
+        ifscCode: true,
       },
     });
 
+    // 5. Audit Log
     await logAudit({
-      userId: userId || req.user.userId,
+      userId,
       clinicId,
       action: 'UPDATE_CLINIC_SETTINGS',
       entity: 'Clinic',
       entityId: clinicId,
-      details: data,
+      details: data, // Logs what changed
       req,
     });
 
@@ -239,23 +287,45 @@ export const updateClinicSettings = async (req, res) => {
   }
 };
 
+
+// ----------------------------------------------------------------
+// PATCH /api/admin/clinic/gateway
+// ----------------------------------------------------------------
 // ----------------------------------------------------------------
 // PATCH /api/admin/clinic/gateway
 // ----------------------------------------------------------------
 export const updateClinicGateway = async (req, res) => {
   try {
-    const { clinicId, userId } = req.user;
+    // 1. Safe ID Extraction
+    const userId = req.user.id || req.user.userId;
+
+    if (!userId) {
+        return res.status(401).json({ error: 'Unauthorized: Invalid token payload' });
+    }
+    
+    // 2. Resolve Clinic ID securely (Only check User table)
+    const user = await prisma.user.findUnique({ 
+        where: { id: userId },
+        select: { clinicId: true }
+    });
+    
+    // ✅ FIXED: Removed fallback to prisma.admin
+    const clinicId = user?.clinicId;
+
+    if (!clinicId) {
+        return res.status(404).json({ error: "Clinic not found for this user" });
+    }
+
     const { provider, apiKey, secretKey, isActive } = req.body;
 
-    // 1) Check clinic validity
     const clinicCheck = await prisma.clinic.findUnique({
       where: { id: clinicId },
     });
+    
     if (!clinicCheck || clinicCheck.deletedAt) {
       return res.status(404).json({ error: 'Clinic not found' });
     }
 
-    // 2) Gate by plan: only plans with allowOnlinePayments can configure gateways
     const plan = await getClinicPlan(clinicId);
     if (!plan || !plan.allowOnlinePayments) {
       return res.status(403).json({
@@ -271,7 +341,7 @@ export const updateClinicGateway = async (req, res) => {
       where: {
         clinicId_name: {
           clinicId,
-          name: provider, // matches your PaymentGateway.name field
+          name: provider,
         },
       },
       update: {
@@ -289,7 +359,7 @@ export const updateClinicGateway = async (req, res) => {
     });
 
     await logAudit({
-      userId: userId || req.user.userId,
+      userId,
       clinicId,
       action: 'UPDATE_PAYMENT_GATEWAY',
       entity: 'PaymentGateway',

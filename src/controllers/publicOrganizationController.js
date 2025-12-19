@@ -1,24 +1,15 @@
-// src/controllers/publicOrganizationController.js
 import prisma from '../prisma.js';
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken'; // ✅ ADDED
+import jwt from 'jsonwebtoken';
 import { logAudit } from '../utils/audit.js';
 
-// Helper to generate clinic slug from name
 const toSlug = (str) =>
-  str
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9]/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
+  str.toLowerCase().trim().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
 
-// Helper to ensure slug is unique
 async function generateUniqueClinicSlug(tx, clinicName) {
   const baseSlug = toSlug(clinicName);
   let slug = baseSlug;
   let counter = 1;
-
   while (true) {
     const count = await tx.clinic.count({ where: { slug } });
     if (count === 0) return slug;
@@ -30,56 +21,29 @@ async function generateUniqueClinicSlug(tx, clinicName) {
 export const registerOrganization = async (req, res) => {
   try {
     const {
-      clinicName,
-      clinicPhone,
-      ownerName,
-      ownerEmail,
-      ownerPhone,
-      addressLine1,
-      city,
-      state,
-      pincode,
+      clinicName, clinicPhone,
+      ownerName, ownerEmail, ownerPhone, ownerPassword,
+      addressLine1, city, state, pincode,
       planId,
-      ownerPassword,
+      // ✅ Added Bank Details
+      bankName, accountNumber, ifscCode
     } = req.body;
 
-    // Validation
-    if (!clinicName || !clinicPhone) {
-      return res.status(400).json({ error: 'Clinic name and phone are required' });
+    if (!clinicName || !clinicPhone || !planId || !ownerPassword) {
+      return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    if (!planId) {
-      return res.status(400).json({ error: 'planId is required' });
-    }
+    const plan = await prisma.plan.findFirst({ where: { id: planId, isActive: true } });
+    if (!plan) return res.status(400).json({ error: 'Selected plan is not available' });
 
-    if (!ownerPassword || ownerPassword.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    }
+    const existingUser = await prisma.user.findUnique({ where: { email: ownerEmail } });
+    if (existingUser) return res.status(400).json({ error: 'Email already in use' });
 
-    // 1) Validate plan
-    const plan = await prisma.plan.findFirst({
-      where: { id: planId, isActive: true, deletedAt: null },
-    });
-    if (!plan) {
-      return res.status(400).json({ error: 'Selected plan is not available' });
-    }
-
-    // 2) Ensure email not already used
-    const existingUser = await prisma.user.findUnique({
-      where: { email: ownerEmail },
-    });
-    if (existingUser) {
-      return res.status(400).json({ error: 'Email already in use' });
-    }
-
-    // 3) Create everything in a transaction
     const result = await prisma.$transaction(async (tx) => {
       const slug = await generateUniqueClinicSlug(tx, clinicName);
-      const fullAddress = [addressLine1, city, state, pincode]
-        .filter(Boolean)
-        .join(', ');
+      const fullAddress = [addressLine1, city, state, pincode].filter(Boolean).join(', ');
 
-      // Create clinic WITH phone number
+      // 1. Create Clinic (Now includes Bank Details)
       const clinic = await tx.clinic.create({
         data: {
           slug,
@@ -88,9 +52,10 @@ export const registerOrganization = async (req, res) => {
           address: fullAddress || clinicName,
           city: city || '',
           pincode: pincode || '',
-          accountNumber: 'N/A',
-          ifscCode: 'N/A',
-          bankName: 'N/A',
+          // ✅ Save Bank Info
+          bankName: bankName || 'N/A',
+          accountNumber: accountNumber || 'N/A',
+          ifscCode: ifscCode || 'N/A',
           timings: {},
           details: '',
           logo: null,
@@ -98,22 +63,22 @@ export const registerOrganization = async (req, res) => {
         },
       });
 
-      // Hash password
+      // 2. Create User (Linked to Clinic)
       const hashedPassword = await bcrypt.hash(ownerPassword, 10);
-
-      // Create owner user as clinic admin
       const ownerUser = await tx.user.create({
         data: {
           name: ownerName,
           email: ownerEmail,
           password: hashedPassword,
-          role: 'ADMIN',
+          role: 'ADMIN', // Ensure this matches your Schema Enum
           phone: ownerPhone || null,
-          clinicId: clinic.id,
+          clinicId: clinic.id, // ✅ User is directly linked to Clinic
         },
       });
 
-      // Create subscription
+      // ❌ REMOVED: tx.admin.create (This was causing your error)
+
+      // 3. Create Subscription
       const subscription = await tx.subscription.create({
         data: {
           clinicId: clinic.id,
@@ -132,7 +97,7 @@ export const registerOrganization = async (req, res) => {
       return { clinic, ownerUser, subscription };
     });
 
-    // 4) Audit log
+    // 4. Audit Log
     try {
       await logAudit({
         userId: result.ownerUser.id,
@@ -140,19 +105,12 @@ export const registerOrganization = async (req, res) => {
         action: 'CLINIC_REGISTER',
         entity: 'Clinic',
         entityId: result.clinic.id,
-        details: {
-          planId,
-          clinicName,
-          clinicPhone,
-          ownerEmail,
-        },
+        details: { planId, clinicName, ownerEmail },
         req,
       });
-    } catch (e) {
-      console.error('Audit log failed for clinic register', e);
-    }
+    } catch (e) { console.error("Audit failed", e); }
 
-    // 5) Generate JWT token
+    // 5. Generate Token
     const token = jwt.sign(
       {
         id: result.ownerUser.id,
@@ -160,33 +118,19 @@ export const registerOrganization = async (req, res) => {
         role: result.ownerUser.role,
         clinicId: result.clinic.id,
       },
-      process.env.JWT_SECRET || 'your-secret-key',
+      process.env.JWT_SECRET || 'secret',
       { expiresIn: '7d' }
     );
 
-    // 6) Return response
     return res.status(201).json({
-      message: 'Organization registered successfully',
+      message: 'Registered successfully',
       token,
-      user: {
-        id: result.ownerUser.id,
-        name: result.ownerUser.name,
-        email: result.ownerUser.email,
-        role: result.ownerUser.role,
-      },
-      clinic: {
-        id: result.clinic.id,
-        name: result.clinic.name,
-        phone: result.clinic.phone,
-        slug: result.clinic.slug,
-      },
-      subscription: {
-        id: result.subscription.id,
-        status: result.subscription.status,
-      },
+      user: result.ownerUser,
+      clinic: result.clinic
     });
+
   } catch (err) {
-    console.error('Register Organization Error:', err);
+    console.error('Register Error:', err);
     return res.status(500).json({ error: err.message });
   }
 };

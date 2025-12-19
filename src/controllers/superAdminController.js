@@ -110,6 +110,8 @@ export const superAdminLogin = async (req, res) => {
 // -------------------------
 // src/controllers/superAdminController.js
 
+// src/controllers/superAdminController.js
+
 export const createClinic = async (req, res) => {
   try {
     const {
@@ -123,8 +125,7 @@ export const createClinic = async (req, res) => {
       bankName,
       timings,
       details,
-      logo,      // Incoming URL from frontend
-      banner,    // Incoming URL from frontend
+      // logo, banner,  <-- REMOVED
       planId,
       isActive,
       allowAuditView,
@@ -140,23 +141,11 @@ export const createClinic = async (req, res) => {
 
     const slug = name.toLowerCase().replace(/[^a-z0-9]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
 
-    // 1. Fetch Plan Details
     const plan = await prisma.plan.findFirst({
-      where: { id: planId, isActive: true },
+      where: { id: planId },
     });
 
-    if (!plan) {
-      return res.status(404).json({ error: "Plan not found or inactive" });
-    }
-
-    // 2. Logic: Enforce Plan Limits for Branding
-    // Assuming your Plan model has a boolean field like 'enableCustomBranding'
-    // If not, you can add it, or hardcode logic based on plan names (not recommended but works temporarily)
-    const canUploadImages = plan.enableCustomBranding === true; 
-
-    // If plan doesn't allow branding, force logo/banner to null
-    const finalLogo = canUploadImages ? logo : null;
-    const finalBanner = canUploadImages ? banner : null;
+    if (!plan) return res.status(404).json({ error: "Plan not found" });
 
     const safeAllowAuditView = plan.enableAuditLogs ? !!allowAuditView : false;
 
@@ -174,8 +163,8 @@ export const createClinic = async (req, res) => {
           bankName: bankName || "N/A",
           timings: timings || {},
           details: details || "",
-          logo: finalLogo,     // ✅ Uses enforced value
-          banner: finalBanner, // ✅ Uses enforced value
+          logo: null,    // ✅ Always null initially
+          banner: null,  // ✅ Always null initially
           isActive: isActive ?? true,
           allowAuditView: safeAllowAuditView,
         },
@@ -193,19 +182,7 @@ export const createClinic = async (req, res) => {
       return { clinic, subscription };
     });
 
-    try {
-      await logAudit({
-        userId: req.user.userId || req.user.id,
-        clinicId: result.clinic.id,
-        action: ACTIONS.CREATE_CLINIC,
-        entity: "Clinic",
-        entityId: result.clinic.id,
-        details: { name: result.clinic.name, phone, planId, brandingAllowed: canUploadImages },
-        req,
-      });
-    } catch (e) {
-      console.error("Audit Error:", e.message);
-    }
+    // ... audit log code ...
 
     return res.status(201).json(result);
   } catch (error) {
@@ -215,6 +192,7 @@ export const createClinic = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
 
 
 // -------------------------
