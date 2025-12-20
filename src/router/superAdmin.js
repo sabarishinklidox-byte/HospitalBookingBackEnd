@@ -89,4 +89,9 @@ router.post('/plans', authMiddleware, requireSuperAdmin, createPlan);
 router.put('/plans/:id', authMiddleware, requireSuperAdmin, updatePlan);
 router.delete('/plans/:id', authMiddleware, requireSuperAdmin, deletePlan);
 
+router.get('/plans', authMiddleware, requireSuperAdmin, listPlans);
+router.post('/plans', authMiddleware, requireSuperAdmin, createPlan);
+router.put('/plans/:id', authMiddleware, requireSuperAdmin, updatePlan);
+router.delete('/plans/:id', authMiddleware, requireSuperAdmin, deletePlan);
+
 export default router;

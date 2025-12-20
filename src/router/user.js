@@ -50,5 +50,6 @@ router.get("/doctors/:doctorId/reviews", getDoctorReviews);
 router.post("/book-appointment", authMiddleware, requireUser, createBooking);
 router.post("/verify-payment", authMiddleware, requireUser, verifyPayment);
 router.post("/verify-stripe-payment", authMiddleware, requireUser, verifyStripePayment);
+
 router.get("/slots", getSlotsForUser,authMiddleware,requireUser);
 export default router;

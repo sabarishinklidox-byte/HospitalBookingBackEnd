@@ -1,48 +1,92 @@
 import prisma from '../prisma.js';
 
-// GET: Fetch current config (Hide Secret Key)
+// GET: Fetch configuration for a specific gateway
+// GET /api/admin/payment-settings?gateway=STRIPE|RAZORPAY
 export const getGatewayConfig = async (req, res) => {
   try {
     const { clinicId } = req.user;
 
+    const gatewayName = (req.query.gateway || 'STRIPE').toUpperCase();
+
+    if (!['STRIPE', 'RAZORPAY'].includes(gatewayName)) {
+      return res.json({ apiKey: '', isActive: false });
+    }
+
     const gateway = await prisma.paymentGateway.findFirst({
-      where: { 
-        clinicId, 
-        name: 'STRIPE',
-        deletedAt: null
+      where: {
+        clinicId,
+        name: gatewayName,
+        deletedAt: null,
       },
-      select: { 
-        apiKey: true,   // Send Public Key
-        isActive: true  // Send Status
-        // NEVER send 'secret' back to frontend
-      } 
+      select: {
+        apiKey: true,   // public key (Stripe PK or Razorpay Key ID)
+        isActive: true, // status
+      },
     });
 
-    // Return empty if not found, rather than 404
     res.json(gateway || { apiKey: '', isActive: false });
   } catch (error) {
-    console.error("Get Gateway Error:", error);
+    console.error('Get Gateway Error:', error);
     res.status(500).json({ error: error.message });
   }
 };
 
-// POST: Update or Create Configuration
+// GET: which gateway is currently active for this clinic
+// GET /api/admin/payment-settings/active
+export const getActiveGatewayForClinic = async (req, res) => {
+  try {
+    const { clinicId } = req.user;
+
+    const gw = await prisma.paymentGateway.findFirst({
+      where: {
+        clinicId,
+        isActive: true,
+        deletedAt: null,
+      },
+      select: {
+        name: true,
+      },
+    });
+
+    res.json({ activeGateway: gw?.name || 'STRIPE' });
+  } catch (error) {
+    console.error('Get Active Gateway Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// POST: Update or Create Configuration for a specific gateway
+// POST /api/admin/payment-settings
+// Body: { gatewayName: 'RAZORPAY', publishableKey: '...', secretKey: '...', isActive: true }
 export const updateGatewayConfig = async (req, res) => {
   try {
     const { clinicId } = req.user;
-    const { publishableKey, secretKey, isActive } = req.body;
+    const { gatewayName, publishableKey, secretKey, isActive } = req.body;
 
-    if (!publishableKey) {
-      return res.status(400).json({ error: 'Publishable Key is required' });
+    const name = (gatewayName || 'STRIPE').toUpperCase();
+    if (!['STRIPE', 'RAZORPAY'].includes(name)) {
+      return res
+        .status(400)
+        .json({ error: 'Invalid gateway name. Use STRIPE or RAZORPAY.' });
     }
 
-    // Logic: Only update secretKey if user provided a new one. 
-    // If it's empty string, keep the old one (assuming they are just toggling active status).
+    if (!publishableKey) {
+      return res.status(400).json({
+        error:
+          name === 'RAZORPAY'
+            ? 'Key ID is required'
+            : 'Publishable Key is required',
+      });
+    }
+
     const updateData = {
       apiKey: publishableKey,
-      isActive: isActive,
-      deletedAt: null
+      deletedAt: null,
     };
+
+    if (typeof isActive === 'boolean') {
+      updateData.isActive = isActive;
+    }
 
     if (secretKey && secretKey.trim() !== '') {
       updateData.secret = secretKey;
@@ -52,20 +96,31 @@ export const updateGatewayConfig = async (req, res) => {
       where: {
         clinicId_name: {
           clinicId,
-          name: 'STRIPE'
-        }
+          name,
+        },
       },
       update: updateData,
       create: {
         clinicId,
-        name: 'STRIPE',
+        name,
         apiKey: publishableKey,
-        secret: secretKey, // Required on creation
-        isActive: isActive
-      }
+        secret: secretKey || '',
+        isActive: typeof isActive === 'boolean' ? isActive : true,
+      },
     });
 
-    res.json({ message: 'Payment settings updated successfully', gateway });
+    // if this one is active, deactivate all others for this clinic
+    if (gateway.isActive) {
+      await prisma.paymentGateway.updateMany({
+        where: {
+          clinicId,
+          NOT: { id: gateway.id },
+        },
+        data: { isActive: false },
+      });
+    }
+
+    res.json({ message: `${name} settings updated successfully`, gateway });
   } catch (error) {
     console.error('Update Gateway Error:', error);
     res.status(500).json({ error: error.message });

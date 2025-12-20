@@ -54,7 +54,7 @@ import {
   getAdminProfile,
   updateAdminProfile,
   updateClinicSettings,
-  updateClinicGateway,
+ 
 } from '../controllers/adminProfileController.js';
 
 import { getClinicReviews } from '../controllers/adminReviewController.js';
@@ -70,7 +70,9 @@ import { upgradeClinicPlan } from '../controllers/adminSubscriptionController.js
 import {
   getGatewayConfig,
   updateGatewayConfig,
+  getActiveGatewayForClinic,
 } from '../controllers/adminGatewayController.js';
+
 
 import { upload } from '../middleware/upload.js';
 
@@ -188,16 +190,26 @@ router.patch(
   updateClinicSettings
 );
 
-router.patch(
-  '/clinic/gateway',
+router.get(
+  '/payment-settings',
   authMiddleware,
   requireAdmin,
-  updateClinicGateway
+  getGatewayConfig
 );
 
-// Stripe gateway config
-router.get('/gateway/stripe', authMiddleware, requireAdmin, getGatewayConfig);
-router.post('/gateway/stripe', authMiddleware, requireAdmin, updateGatewayConfig);
+router.get(
+  '/payment-settings/active',
+  authMiddleware,
+  requireAdmin,
+  getActiveGatewayForClinic
+);
+
+router.post(
+  '/payment-settings',
+  authMiddleware,
+  requireAdmin,
+  updateGatewayConfig
+);
 
 // ---------------- Reviews ----------------
 router.get('/reviews', authMiddleware, requireAdmin, getClinicReviews);

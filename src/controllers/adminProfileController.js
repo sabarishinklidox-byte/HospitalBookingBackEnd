@@ -294,88 +294,103 @@ export const updateClinicSettings = async (req, res) => {
 // ----------------------------------------------------------------
 // PATCH /api/admin/clinic/gateway
 // ----------------------------------------------------------------
-export const updateClinicGateway = async (req, res) => {
+export const updateGatewayConfig = async (req, res) => {
   try {
-    // 1. Safe ID Extraction
-    const userId = req.user.id || req.user.userId;
+    const { clinicId } = req.user;
+    const { gatewayName, publishableKey, secretKey, isActive } = req.body;
 
-    if (!userId) {
-        return res.status(401).json({ error: 'Unauthorized: Invalid token payload' });
-    }
-    
-    // 2. Resolve Clinic ID securely (Only check User table)
-    const user = await prisma.user.findUnique({ 
-        where: { id: userId },
-        select: { clinicId: true }
-    });
-    
-    // ✅ FIXED: Removed fallback to prisma.admin
-    const clinicId = user?.clinicId;
-
-    if (!clinicId) {
-        return res.status(404).json({ error: "Clinic not found for this user" });
+    const name = (gatewayName || 'STRIPE').toUpperCase();
+    if (!['STRIPE', 'RAZORPAY'].includes(name)) {
+      return res
+        .status(400)
+        .json({ error: 'Invalid gateway name. Use STRIPE or RAZORPAY.' });
     }
 
-    const { provider, apiKey, secretKey, isActive } = req.body;
-
-    const clinicCheck = await prisma.clinic.findUnique({
-      where: { id: clinicId },
-    });
-    
-    if (!clinicCheck || clinicCheck.deletedAt) {
-      return res.status(404).json({ error: 'Clinic not found' });
-    }
-
-    const plan = await getClinicPlan(clinicId);
-    if (!plan || !plan.allowOnlinePayments) {
-      return res.status(403).json({
-        error: 'Online payments are disabled on your current plan.',
+    if (!publishableKey) {
+      return res.status(400).json({
+        error:
+          name === 'RAZORPAY'
+            ? 'Key ID is required'
+            : 'Publishable Key is required',
       });
     }
 
-    if (!provider) {
-      return res.status(400).json({ error: 'provider is required' });
+    const updateData = {
+      apiKey: publishableKey,
+      deletedAt: null,
+    };
+
+    if (typeof isActive === 'boolean') {
+      updateData.isActive = isActive;
+    }
+
+    if (secretKey && secretKey.trim() !== '') {
+      updateData.secret = secretKey;
     }
 
     const gateway = await prisma.paymentGateway.upsert({
       where: {
         clinicId_name: {
           clinicId,
-          name: provider,
+          name,
         },
       },
-      update: {
-        apiKey: apiKey ?? undefined,
-        secret: secretKey ?? undefined,
-        isActive: typeof isActive === 'boolean' ? isActive : undefined,
-      },
+      update: updateData,
       create: {
         clinicId,
-        name: provider,
-        apiKey: apiKey || '',
+        name,
+        apiKey: publishableKey,
         secret: secretKey || '',
-        isActive: isActive ?? true,
+        isActive: typeof isActive === 'boolean' ? isActive : true,
       },
     });
 
-    await logAudit({
-      userId,
-      clinicId,
-      action: 'UPDATE_PAYMENT_GATEWAY',
-      entity: 'PaymentGateway',
-      entityId: gateway.id,
-      details: {
-        provider,
-        isActive,
-        apiKey: apiKey ? '***UPDATED***' : 'Unchanged',
-        secretKey: secretKey ? '***UPDATED***' : 'Unchanged',
-      },
-      req,
-    });
+    // ensure only this gateway is active for the clinic
+    if (gateway.isActive) {
+      await prisma.paymentGateway.updateMany({
+        where: {
+          clinicId,
+          NOT: { id: gateway.id },
+        },
+        data: { isActive: false },
+      });
+    }
 
-    return res.json({ gateway });
+    res.json({
+      message: `${name} settings updated successfully`,
+      gateway,
+    });
   } catch (error) {
-    console.error('Update Clinic Gateway Error:', error);
-    return res.status(500).json({ error: error.message });
+    console.error('Update Gateway Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+export const getGatewayConfig = async (req, res) => {
+  try {
+    const { clinicId } = req.user;
+
+    const gatewayName = (req.query.gateway || 'STRIPE').toUpperCase();
+
+    if (!['STRIPE', 'RAZORPAY'].includes(gatewayName)) {
+      return res.json({ apiKey: '', isActive: false });
+    }
+
+    const gateway = await prisma.paymentGateway.findFirst({
+      where: {
+        clinicId,
+        name: gatewayName,
+        deletedAt: null,
+      },
+      select: {
+        apiKey: true,
+        isActive: true,
+      },
+    });
+
+    res.json(gateway || { apiKey: '', isActive: false });
+  } catch (error) {
+    console.error('Get Gateway Error:', error);
+    res.status(500).json({ error: error.message });
   }
 };

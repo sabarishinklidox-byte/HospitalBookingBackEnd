@@ -9,7 +9,7 @@ import adminRoutes from './router/admin.js';
 import publicRoutes from './router/public.js';
 import userRoutes from './router/user.js';
 import superAdminClinicMediaRoutes from './router/superAdminClinicMediaRoutes.js';
-
+import { startReminderJob } from './services/reminderService.js'; 
 dotenv.config();
 
 const app = express();
@@ -24,7 +24,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/public', publicRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api', superAdminClinicMediaRoutes); // <- add this
-
+startReminderJob();
 
 // ...
 app.use('/api/payment', paymentRoutes);

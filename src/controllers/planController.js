@@ -19,21 +19,58 @@ const logPlanAudit = async (userId, action, planId, details = null) => {
   }
 };
 
-
 // GET /api/super-admin/plans
 export const listPlans = async (req, res) => {
   try {
     const plans = await prisma.plan.findMany({
       where: { deletedAt: null },
       orderBy: { priceMonthly: 'asc' },
+      select: {
+        id: true,
+        name: true,
+        slug: true,
+        priceMonthly: true,
+        currency: true,
+        maxDoctors: true,
+        maxBookingsPerMonth: true,
+        allowOnlinePayments: true,
+        allowCustomBranding: true,
+        enableReviews: true,
+        enableBulkSlots: true,
+        enableExports: true,
+        enableAuditLogs: true,
+        enableGoogleReviews: true,
+        isTrial: true,
+        durationDays: true,
+        trialDays: true,
+        isActive: true,
+        createdAt: true,
+        updatedAt: true,
+        // Count active subscriptions
+        _count: {
+          select: {
+            subscriptions: {
+              where: { status: 'ACTIVE' }
+            }
+          }
+        }
+      }
     });
-    return res.json(plans);
+
+    return res.json({
+      success: true,
+      plans,
+      planTiers: [
+        { name: 'Basic', allowOnlinePayments: false, maxDoctors: 1 },
+        { name: 'Pro', allowOnlinePayments: true, maxDoctors: 5 },
+        { name: 'Enterprise', allowOnlinePayments: true, maxDoctors: 50 }
+      ]
+    });
   } catch (err) {
     console.error('List Plans Error:', err);
     return res.status(500).json({ error: err.message });
   }
 };
-
 
 // POST /api/super-admin/plans
 export const createPlan = async (req, res) => {
@@ -45,23 +82,24 @@ export const createPlan = async (req, res) => {
       slug,
       priceMonthly,
       currency = 'INR',
-      maxDoctors,
-      maxBookingsPerMonth,
-      allowOnlinePayments,
-      allowCustomBranding,
+      maxDoctors = 1,
+      maxBookingsPerMonth = 100,
+      allowOnlinePayments = false,        // 🔒 PLAN FEATURE
+      allowCustomBranding = false,       // 🔒 PLAN FEATURE
+      enableReviews = true,
+      enableBulkSlots = true,
+      enableExports = true,
       enableAuditLogs = true,
       enableGoogleReviews = false,
       isActive = true,
-
-      // NEW
       isTrial = false,
-      durationDays,          // e.g. 15
-      trialDays,             // optional separate trial
+      durationDays,
+      trialDays,
     } = req.body;
 
-    // Basic validation example
+    // Validation
     if (!name || !slug || priceMonthly == null) {
-      return res.status(400).json({ error: 'name, slug, priceMonthly are required' });
+      return res.status(400).json({ error: 'name, slug, priceMonthly required' });
     }
 
     if (durationDays != null && durationDays <= 0) {
@@ -69,8 +107,15 @@ export const createPlan = async (req, res) => {
     }
 
     if (isTrial && !durationDays) {
-      // you can enforce that trial plans must have a duration
       return res.status(400).json({ error: 'Trial plans must have durationDays' });
+    }
+
+    // Check slug uniqueness
+    const slugExists = await prisma.plan.findFirst({
+      where: { slug, deletedAt: null }
+    });
+    if (slugExists) {
+      return res.status(400).json({ error: 'Slug already exists' });
     }
 
     const plan = await prisma.plan.create({
@@ -81,30 +126,32 @@ export const createPlan = async (req, res) => {
         currency,
         maxDoctors,
         maxBookingsPerMonth,
-        allowOnlinePayments,
+        allowOnlinePayments,           // ✅ Controls payment gateways
         allowCustomBranding,
+        enableReviews,
+        enableBulkSlots,
+        enableExports,
         enableAuditLogs,
         enableGoogleReviews,
         isActive,
-
         isTrial,
         durationDays: durationDays ?? null,
         trialDays: trialDays ?? null,
       },
     });
 
-    if (plan.enableAuditLogs) {
-      await logPlanAudit(userId, 'PLAN_CREATED', plan.id, { new: plan });
-    }
+    await logPlanAudit(userId, 'PLAN_CREATED', plan.id, { new: plan });
 
-    return res.status(201).json(plan);
+    return res.status(201).json({
+      success: true,
+      plan,
+      message: `Plan "${name}" created successfully`
+    });
   } catch (err) {
     console.error('Create Plan Error:', err);
     return res.status(500).json({ error: err.message });
   }
 };
-
-
 
 // PUT /api/super-admin/plans/:id
 export const updatePlan = async (req, res) => {
@@ -119,79 +166,80 @@ export const updatePlan = async (req, res) => {
       return res.status(404).json({ error: 'Plan not found' });
     }
 
-    // Count active subscriptions for this plan
     const activeSubCount = await prisma.subscription.count({
       where: { planId: id, status: 'ACTIVE' },
     });
 
     const {
-      // allowed always
       name,
+      slug,
       allowOnlinePayments,
       allowCustomBranding,
+      enableReviews,
       enableBulkSlots,
       enableExports,
       enableAuditLogs,
       enableGoogleReviews,
       isActive,
-
-      // dangerous if there are active subs
+      // Dangerous fields (pricing/limits)
       priceMonthly,
       maxDoctors,
       maxBookingsPerMonth,
       durationDays,
       isTrial,
       trialDays,
-
-      ...rest
     } = req.body;
 
-    const data = {
-      ...rest,
+    // Safe updates (always allowed)
+    const safeData = {
       name: name ?? existing.name,
-      allowOnlinePayments:
-        allowOnlinePayments ?? existing.allowOnlinePayments,
-      allowCustomBranding:
-        allowCustomBranding ?? existing.allowCustomBranding,
-      enableBulkSlots: enableBulkSlots ?? existing.enableBulkSlots,
-      enableExports: enableExports ?? existing.enableExports,
-      enableAuditLogs: enableAuditLogs ?? existing.enableAuditLogs,
-      enableGoogleReviews:
-        enableGoogleReviews ?? existing.enableGoogleReviews,
-      isActive:
-        typeof isActive === 'boolean' ? isActive : existing.isActive,
+      slug: slug ?? existing.slug,
+      allowOnlinePayments: allowOnlinePayments !== undefined ? allowOnlinePayments : existing.allowOnlinePayments,
+      allowCustomBranding: allowCustomBranding !== undefined ? allowCustomBranding : existing.allowCustomBranding,
+      enableReviews: enableReviews !== undefined ? enableReviews : existing.enableReviews,
+      enableBulkSlots: enableBulkSlots !== undefined ? enableBulkSlots : existing.enableBulkSlots,
+      enableExports: enableExports !== undefined ? enableExports : existing.enableExports,
+      enableAuditLogs: enableAuditLogs !== undefined ? enableAuditLogs : existing.enableAuditLogs,
+      enableGoogleReviews: enableGoogleReviews !== undefined ? enableGoogleReviews : existing.enableGoogleReviews,
+      isActive: isActive !== undefined ? isActive : existing.isActive,
     };
 
+    // Pricing/limits - only if NO active subscriptions
     if (activeSubCount === 0) {
-      if (priceMonthly != null) data.priceMonthly = priceMonthly;
-      if (maxDoctors != null) data.maxDoctors = maxDoctors;
-      if (maxBookingsPerMonth != null)
-        data.maxBookingsPerMonth = maxBookingsPerMonth;
-      if (durationDays !== undefined) data.durationDays = durationDays;
-      if (isTrial !== undefined) data.isTrial = isTrial;
-      if (trialDays !== undefined) data.trialDays = trialDays;
+      if (priceMonthly !== undefined) safeData.priceMonthly = priceMonthly;
+      if (maxDoctors !== undefined) safeData.maxDoctors = maxDoctors;
+      if (maxBookingsPerMonth !== undefined) safeData.maxBookingsPerMonth = maxBookingsPerMonth;
+      if (durationDays !== undefined) safeData.durationDays = durationDays ?? null;
+      if (isTrial !== undefined) safeData.isTrial = isTrial;
+      if (trialDays !== undefined) safeData.trialDays = trialDays ?? null;
     } else {
-      if (
-        priceMonthly != null ||
-        maxDoctors != null ||
-        maxBookingsPerMonth != null ||
-        durationDays !== undefined ||
-        isTrial !== undefined ||
-        trialDays !== undefined
-      ) {
+      // Block pricing changes
+      if (priceMonthly !== undefined || maxDoctors !== undefined || 
+          maxBookingsPerMonth !== undefined || durationDays !== undefined ||
+          isTrial !== undefined || trialDays !== undefined) {
         return res.status(400).json({
-          error:
-            'Cannot change price, limits or duration while plan has active subscriptions. Create a new plan instead.',
+          error: 'Cannot change pricing/limits while plan has active subscriptions. Create new plan.',
+          activeSubs: activeSubCount
         });
       }
     }
 
+    // Check slug uniqueness (if changed)
+    if (slug && slug !== existing.slug) {
+      const slugExists = await prisma.plan.findFirst({
+        where: { slug, deletedAt: null, id: { not: id } }
+      });
+      if (slugExists) {
+        return res.status(400).json({ error: 'Slug already exists' });
+      }
+      safeData.slug = slug;
+    }
+
     const updated = await prisma.plan.update({
       where: { id },
-      data,
+      data: safeData,
     });
 
-    // Audit as generic log
     await logAudit({
       userId,
       clinicId: null,
@@ -202,15 +250,17 @@ export const updatePlan = async (req, res) => {
       req,
     });
 
-    return res.json(updated);
+    return res.json({
+      success: true,
+      plan: updated,
+      message: `Plan "${updated.name}" updated successfully`
+    });
   } catch (err) {
     console.error('Update Plan Error:', err);
     return res.status(500).json({ error: err.message });
   }
 };
 
-
-// DELETE (soft) /api/super-admin/plans/:id
 // DELETE (soft) /api/super-admin/plans/:id
 export const deletePlan = async (req, res) => {
   try {
@@ -230,8 +280,7 @@ export const deletePlan = async (req, res) => {
 
     if (activeSubCount > 0) {
       return res.status(400).json({
-        error:
-          'Cannot delete a plan that has active subscriptions. Deactivate it instead.',
+        error: `Cannot delete plan with ${activeSubCount} active subscriptions. Deactivate instead.`,
       });
     }
 
@@ -246,13 +295,47 @@ export const deletePlan = async (req, res) => {
       action: 'PLAN_DELETED',
       entity: 'Plan',
       entityId: id,
-      details: { before: existing },
+      details: { plan: existing },
       req,
     });
 
-    return res.json({ message: 'Plan deleted (soft)' });
+    return res.json({ 
+      success: true,
+      message: `Plan "${existing.name}" soft deleted successfully` 
+    });
   } catch (err) {
     console.error('Delete Plan Error:', err);
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+// NEW: Get Plan Stats for Dashboard
+export const getPlanStats = async (req, res) => {
+  try {
+    const stats = await prisma.plan.groupBy({
+      by: ['allowOnlinePayments', 'isTrial'],
+      _count: {
+        id: true,
+        subscriptions: {
+          where: { status: 'ACTIVE' }
+        }
+      },
+      where: { deletedAt: null, isActive: true }
+    });
+
+    return res.json({
+      success: true,
+      stats,
+      summary: {
+        totalPlans: await prisma.plan.count({ where: { deletedAt: null } }),
+        activePlans: await prisma.plan.count({ where: { deletedAt: null, isActive: true } }),
+        paymentEnabledPlans: await prisma.plan.count({ 
+          where: { deletedAt: null, isActive: true, allowOnlinePayments: true } 
+        })
+      }
+    });
+  } catch (err) {
+    console.error('Plan Stats Error:', err);
     return res.status(500).json({ error: err.message });
   }
 };
