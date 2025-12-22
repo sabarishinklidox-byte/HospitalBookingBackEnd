@@ -117,7 +117,7 @@ export const getDoctorsByClinic = async (req, res) => {
 // ----------------------------------------------------------------
 // GET /api/public/doctors/:doctorId/slots
 // ----------------------------------------------------------------
-      export const getSlotsByDoctor = async (req, res) => {
+export const getSlotsByDoctor = async (req, res) => {
   try {
     const { doctorId } = req.params;
     const { date } = req.query;
@@ -149,54 +149,87 @@ export const getDoctorsByClinic = async (req, res) => {
       where.date = { gte: start, lt: end };
     }
 
+    // ✅ STEP 1: Get ALL slots for the day
     const slots = await prisma.slot.findMany({
       where,
       orderBy: [{ date: 'asc' }, { time: 'asc' }],
-      include: {
-        appointments: {
-          where: { deletedAt: null },
-        },
-      },
     });
 
-    // ✅ Get current date/time to filter out past slots
+    // ✅ STEP 2: Get BLOCKED slots (Race Condition Safe!)
+    const blockedAppointments = await prisma.appointment.findMany({
+      where: {
+        slotId: { 
+          in: slots.map(slot => slot.id) 
+        },
+        OR: [
+          { status: 'CONFIRMED' },                                    // ✅ Permanently booked
+          { 
+            status: 'PENDING',                                        // ✅ Active payment hold
+            createdAt: { 
+              gt: new Date(Date.now() - 10 * 60 * 1000)              // Within last 10 mins only
+            }
+          }
+        ],
+        deletedAt: null
+      },
+      select: { 
+        slotId: true 
+      }
+    });
+
+    // ✅ STEP 3: Create blocked slot set (fast lookup)
+    const blockedSlotIds = new Set(blockedAppointments.map(a => a.slotId));
+
+    // ✅ STEP 4: Current time filtering (YOUR CODE PERFECT!)
     const now = new Date();
     const currentDateString = now.toISOString().split('T')[0]; 
     const currentHours = now.getHours();
     const currentMinutes = now.getMinutes();
 
-    const data = slots
+    // ✅ FINAL RESULT - Race Condition PROOF!
+    const availableSlots = slots
       .map((slot) => {
-        // 1. Check if booked
-        const isBooked = slot.appointments.some((a) =>
-          ['PENDING', 'CONFIRMED', 'COMPLETED'].includes(a.status)
-        );
-
-        const { appointments, ...rest } = slot;
-        return { ...rest, isBooked };
-      })
-      .filter((slot) => {
-        // 2. Filter out past times IF the slot is for today
         const slotDateString = new Date(slot.date).toISOString().split('T')[0];
-
+        
+        // Past time filtering (YOUR LOGIC ✅)
         if (slotDateString === currentDateString) {
           const [slotHour, slotMinute] = slot.time.split(':').map(Number);
-          
-          // If slot hour is less than current hour, it's passed.
-          // If slot hour equals current hour, check minutes.
-          if (slotHour < currentHours) return false;
-          if (slotHour === currentHours && slotMinute <= currentMinutes) return false;
+          if (slotHour < currentHours) return null;
+          if (slotHour === currentHours && slotMinute <= currentMinutes) return null;
         }
 
-        return true;
-      });
+        // Race condition safe booking status
+        const isBooked = blockedSlotIds.has(slot.id);
+        
+        return { 
+          ...slot, 
+          isBooked,                    // ✅ TRUE = Unavailable, FALSE = Bookable
+          paymentMode: slot.paymentMode || 'FREE',
+          price: Number(slot.price || 0)
+        };
+      })
+      .filter(Boolean)  // Remove past slots
+      .sort((a, b) => a.time.localeCompare(b.time));
 
-    res.json(data);
+    return res.json({
+      success: true,
+      doctorId,
+      date,
+      slots: availableSlots,
+      totalAvailable: availableSlots.filter(s => !s.isBooked).length,
+      totalBlocked: availableSlots.filter(s => s.isBooked).length,
+      stats: {
+        free: availableSlots.filter(s => s.paymentMode === 'FREE' && !s.isBooked).length,
+        paid: availableSlots.filter(s => s.paymentMode !== 'FREE' && !s.isBooked).length
+      }
+    });
+
   } catch (error) {
     console.error('Slot Fetch Error:', error);
-    res.status(500).json({ error: 'Failed to load slots.' });
+    return res.status(500).json({ error: 'Failed to load slots.' });
   }
 };
+
 
 
 

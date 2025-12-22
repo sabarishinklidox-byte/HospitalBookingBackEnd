@@ -7,12 +7,313 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// --- ENUMS ---
+model Plan {
+  id                  String         @id @default(uuid())
+  name                String
+  slug                String         @unique
+  priceMonthly        Decimal
+  currency            String         @default("INR")
+  maxDoctors          Int            @default(1)
+  maxBookingsPerMonth Int            @default(100)
+  allowOnlinePayments Boolean        @default(false)
+  allowCustomBranding Boolean        @default(false)
+  isActive            Boolean        @default(true)
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+  deletedAt           DateTime?
+  enableAuditLogs     Boolean        @default(true)
+  enableGoogleReviews Boolean        @default(false)
+  enableBulkSlots     Boolean        @default(true)
+  enableExports       Boolean        @default(true)
+  enableReviews       Boolean        @default(true)
+  durationDays        Int?
+  isTrial             Boolean        @default(false)
+  trialDays           Int?
+  subscriptions       Subscription[]
+
+  @@map("plans")
+}
+
+model Subscription {
+  id                    String             @id @default(uuid())
+  clinicId              String             @unique
+  planId                String
+  status                SubscriptionStatus @default(ACTIVE)
+  startDate             DateTime           @default(now())
+  endDate               DateTime?
+  nextBillingDate       DateTime?
+  gatewaySubscriptionId String?
+  gatewayCustomerId     String?
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+  deletedAt             DateTime?
+  durationDays          Int?
+  isTrial               Boolean            @default(false)
+  maxBookingsPerPeriod  Int?
+  maxDoctors            Int?
+  priceAtPurchase       Decimal?
+  trialDays             Int?
+  clinic                Clinic             @relation(fields: [clinicId], references: [id])
+  plan                  Plan               @relation(fields: [planId], references: [id])
+
+  @@map("subscriptions")
+}
+
+model PaymentGateway {
+  id            String    @id @default(uuid())
+  name          String
+  apiKey        String?
+  secret        String?
+  webhookSecret String?
+  isActive      Boolean   @default(true)
+  clinicId      String
+  createdAt     DateTime  @default(now())
+  deletedAt     DateTime?
+  clinic        Clinic    @relation(fields: [clinicId], references: [id])
+  payments      Payment[]
+
+  @@unique([clinicId, name])
+  @@map("payment_gateways")
+}
+
+model User {
+  id           String        @id @default(uuid())
+  email        String        @unique
+  password     String
+  name         String
+  phone        String?
+  avatar       String?
+  role         Role
+  clinicId     String?
+  doctorId     String?       @unique
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  deletedAt    DateTime?
+  appointments Appointment[]
+  auditLogs    AuditLog[]
+  reviews      Review[]
+  clinic       Clinic?       @relation("ClinicAdmins", fields: [clinicId], references: [id])
+  doctor       Doctor?       @relation("DoctorUser", fields: [doctorId], references: [id])
+
+  @@map("user")
+}
+
+model Clinic {
+  id                     String           @id @default(uuid())
+  slug                   String           @unique
+  name                   String
+  logo                   String?
+  banner                 String?
+  address                String
+  city                   String
+  pincode                String
+  timings                Json
+  details                String?
+  accountNumber          String
+  ifscCode               String
+  bankName               String
+  createdAt              DateTime         @default(now())
+  updatedAt              DateTime         @updatedAt
+  allowAuditView         Boolean          @default(false)
+  isActive               Boolean          @default(true)
+  deletedAt              DateTime?
+  linkClicks             Int              @default(0)
+  googleMapsUrl          String?
+  googlePlaceId          String?
+  googleReviewsEmbedCode String?
+  googleRating           Decimal?
+  googleReviewsCache     Json?
+  googleTotalReviews     Int?
+  lastGoogleSync         DateTime?
+  phone                  String           @default("0000000000")
+  appointments           Appointment[]
+  auditLogs              AuditLog[]
+  doctors                Doctor[]
+  gateways               PaymentGateway[]
+  payments               Payment[]
+  slots                  Slot[]
+  subscription           Subscription?
+  admins                 User[]           @relation("ClinicAdmins")
+
+  @@map("clinics")
+}
+
+model Doctor {
+  id           String           @id @default(uuid())
+  slug         String           @unique
+  name         String
+  avatar       String?
+  speciality   DoctorSpeciality
+  phone        String
+  experience   Int
+  clinicId     String
+  isActive     Boolean          @default(true)
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  deletedAt    DateTime?
+  appointments Appointment[]
+  clinic       Clinic           @relation(fields: [clinicId], references: [id])
+  payments     Payment[]
+  reviews      Review[]
+  slots        Slot[]
+  user         User?            @relation("DoctorUser")
+
+  @@map("doctors")
+}
+
+model Slot {
+  id           String            @id @default(uuid())
+  doctorId     String
+  clinicId     String
+  date         DateTime
+  time         String
+  duration     Int               @default(30)
+  type         SlotType          @default(FREE)
+  price        Decimal           @default(0)
+  status       AppointmentStatus @default(PENDING_PAYMENT)
+  createdAt    DateTime          @default(now())
+  deletedAt    DateTime?
+  paymentMode  SlotPaymentMode   @default(ONLINE)
+  kind         String            @default("APPOINTMENT")
+  appointments Appointment?
+  clinic       Clinic            @relation(fields: [clinicId], references: [id])
+  doctor       Doctor            @relation(fields: [doctorId], references: [id])
+
+  @@unique([doctorId, date, time])
+  @@map("slots")
+}
+
+model Appointment {
+  id                  String               @id @default(uuid())
+  slug                String               @unique
+  userId              String
+  doctorId            String
+  clinicId            String
+  slotId              String               @unique
+  section             BookingSection
+  status              AppointmentStatus    @default(PENDING_PAYMENT)
+  paymentId           String?
+  notes               String?
+  symptoms            String?
+  prescription        String?
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  deletedAt           DateTime?
+  cancelReason        String?
+  cancelledBy         CancellationActor?
+  amount              Decimal?
+  orderId             String?
+  paymentExpiry       DateTime?
+  paymentStatus       PaymentStatus        @default(PENDING)
+  logs                AppointmentLog[]
+  clinic              Clinic               @relation(fields: [clinicId], references: [id])
+  doctor              Doctor               @relation(fields: [doctorId], references: [id])
+  slot                Slot                 @relation(fields: [slotId], references: [id])
+  user                User                 @relation(fields: [userId], references: [id])
+  cancellationRequest CancellationRequest?
+  payment             Payment?
+  review              Review?
+
+  @@map("appointments")
+}
+
+model CancellationRequest {
+  id            String      @id @default(uuid())
+  appointmentId String      @unique
+  status        String
+  reason        String?
+  createdAt     DateTime    @default(now())
+  processedAt   DateTime?
+  processedById String?
+  appointment   Appointment @relation(fields: [appointmentId], references: [id])
+
+  @@map("cancellation_requests")
+}
+
+model Payment {
+  id            String         @id @default(uuid())
+  appointmentId String         @unique
+  clinicId      String
+  doctorId      String
+  gatewayId     String
+  amount        Decimal
+  status        PaymentStatus
+  gatewayRefId  String?
+  createdAt     DateTime       @default(now())
+  appointment   Appointment    @relation(fields: [appointmentId], references: [id])
+  clinic        Clinic         @relation(fields: [clinicId], references: [id])
+  doctor        Doctor         @relation(fields: [doctorId], references: [id])
+  gateway       PaymentGateway @relation(fields: [gatewayId], references: [id])
+
+  @@map("payments")
+}
+
+model AppointmentLog {
+  id            String      @id @default(uuid())
+  appointmentId String
+  oldDate       DateTime
+  oldTime       String
+  newDate       DateTime
+  newTime       String
+  reason        String?
+  changedBy     String
+  createdAt     DateTime    @default(now())
+  appointment   Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+
+  @@map("appointment_logs")
+}
+
+model Review {
+  id            String      @id @default(uuid())
+  appointmentId String      @unique
+  doctorId      String
+  userId        String
+  rating        Int
+  comment       String?
+  createdAt     DateTime    @default(now())
+  deletedAt     DateTime?
+  appointment   Appointment @relation(fields: [appointmentId], references: [id])
+  doctor        Doctor      @relation(fields: [doctorId], references: [id])
+  user          User        @relation(fields: [userId], references: [id])
+
+  @@map("reviews")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String
+  action    String
+  entity    String
+  entityId  String?
+  details   Json?
+  ipAddress String?
+  createdAt DateTime @default(now())
+  clinicId  String?
+  clinic    Clinic?  @relation(fields: [clinicId], references: [id])
+  user      User     @relation(fields: [userId], references: [id])
+
+  @@map("audit_logs")
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  clinicId  String
+  type      NotificationType
+  entityId  String
+  message   String
+  createdAt DateTime         @default(now())
+  readAt    DateTime?
+
+  @@index([clinicId, type, readAt])
+  @@index([clinicId, readAt])
+}
+
 enum NotificationType {
   CANCELLATION
   RESCHEDULE
   CANCEL_REQUEST
 }
+
 enum Role {
   SUPER_ADMIN
   ADMIN
@@ -26,13 +327,14 @@ enum AppointmentStatus {
   CANCELLED
   COMPLETED
   NO_SHOW
+  PENDING_PAYMENT
 }
 
-// Keep this for backward compatibility if old data exists
 enum SlotType {
   FREE
   PAID
 }
+
 enum CancellationActor {
   USER
   ADMIN
@@ -83,350 +385,4 @@ enum BookingSection {
   OPHTHALMOLOGY
   GENERAL
   OTHER
-}
-
-// --- SAAS SUBSCRIPTION MODELS (NEW) ---
-
-model Plan {
-  id                   String   @id @default(uuid())
-  name                 String
-  slug                 String   @unique
-  priceMonthly         Decimal
-  currency             String   @default("INR")
-
-  // Feature Limits
-  maxDoctors           Int      @default(1)
-  maxBookingsPerMonth  Int      @default(100)
-  allowOnlinePayments  Boolean  @default(false)
-  allowCustomBranding  Boolean  @default(false)
-
-  // Feature flags
-  enableReviews        Boolean  @default(true)
-  enableBulkSlots      Boolean  @default(true)
-  enableExports        Boolean  @default(true)
-  enableAuditLogs      Boolean  @default(true)
-  enableGoogleReviews  Boolean  @default(false)
-
-  // NEW: duration / trial
-  isTrial              Boolean  @default(false)
-  durationDays         Int?     // null = recurring plan, value = fixed-length plan (e.g. 15)
-  trialDays            Int?     // optional extra free trial days
-
-  isActive             Boolean  @default(true)
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
-  deletedAt            DateTime?
-
-  subscriptions        Subscription[]
-
-  @@map("plans")
-}
-
-
-model Subscription {
-  id                    String             @id @default(uuid())
-  clinicId              String             @unique
-  planId                String
-  status                SubscriptionStatus @default(ACTIVE)
-
-  startDate             DateTime           @default(now())
-  endDate               DateTime?
-  nextBillingDate       DateTime?
-
-  // Snapshot from plan at time of subscription/upgrade
-  priceAtPurchase       Decimal?          // <-- made optional
-  maxDoctors            Int?              // <-- made optional
-  maxBookingsPerPeriod  Int?              // <-- made optional
-  durationDays          Int?
-  isTrial               Boolean           @default(false)
-  trialDays             Int?
-
-  // External Payment Gateway IDs
-  gatewaySubscriptionId String?
-  gatewayCustomerId     String?
-
-  createdAt             DateTime          @default(now())
-  updatedAt             DateTime          @updatedAt
-  deletedAt             DateTime?
-
-  clinic                Clinic            @relation(fields: [clinicId], references: [id])
-  plan                  Plan              @relation(fields: [planId], references: [id])
-
-  @@map("subscriptions")
-}
-
-
-// --- EXISTING CORE MODELS ---
-
-model PaymentGateway {
-  id            String   @id @default(uuid())
-  name          String
-  apiKey        String?
-  secret        String?
-  webhookSecret String?
-  isActive      Boolean  @default(true)
-  clinicId      String
-  createdAt     DateTime @default(now())
-  deletedAt     DateTime? // Soft Delete
-
-  clinic        Clinic   @relation(fields: [clinicId], references: [id])
-  payments      Payment[]
-
-  @@unique([clinicId, name])
-  @@map("payment_gateways")
-}
-
-model User {
-  id         String    @id @default(uuid())
-  email      String    @unique
-  password   String
-  name       String
-  phone      String?
-  avatar     String?
-  role       Role
-  clinicId   String?
-  doctorId   String?   @unique
-  createdAt  DateTime  @default(now())
-  updatedAt  DateTime  @updatedAt
-  deletedAt  DateTime? // Soft Delete
-
-  clinic      Clinic?      @relation("ClinicAdmins", fields: [clinicId], references: [id])
-  doctor      Doctor?      @relation("DoctorUser", fields: [doctorId], references: [id])
-  appointments Appointment[]
-
-  reviews      Review[]
-  auditLogs    AuditLog[]
-
-  @@map("user")
-}
-model Clinic {
-  id            String   @id @default(uuid())
-  slug          String   @unique
-  name          String
-  logo          String?
-  banner        String?
-  address       String
-  city          String
-  pincode       String
-phone     String   @default("0000000000")
-  timings       Json
-  details       String?
-  accountNumber String
-  ifscCode      String
-  bankName      String
-
-  // Super admin control
-  isActive       Boolean  @default(true)
-  allowAuditView Boolean  @default(false)
-
-  // Google integration
-  googlePlaceId         String?
-  googleMapsUrl         String?
-  googleReviewsEmbedCode String?
-  googleRating          Decimal?
-  googleTotalReviews    Int?
-  googleReviewsCache    Json?
-  lastGoogleSync        DateTime?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  deletedAt DateTime?
-
-  admins       User[]        @relation("ClinicAdmins")
-  doctors      Doctor[]
-  appointments Appointment[]
-  slots        Slot[]
-  payments     Payment[]
-  gateways     PaymentGateway[]
-  auditLogs    AuditLog[]
-  linkClicks   Int           @default(0)
-
-  subscription Subscription?
-
-  @@map("clinics")
-}
-
-
-
-model Doctor {
-  id         String           @id @default(uuid())
-  slug       String           @unique
-  name       String
-  avatar     String?
-  speciality DoctorSpeciality
-  phone      String
-  experience Int
-  clinicId   String
-  isActive   Boolean          @default(true)
-  createdAt  DateTime         @default(now())
-  updatedAt  DateTime         @updatedAt
-  deletedAt  DateTime?        // Soft Delete
-
-  clinic       Clinic       @relation(fields: [clinicId], references: [id])
-  user         User?        @relation("DoctorUser")
-  appointments Appointment[]
-  slots        Slot[]
-  payments     Payment[]
-  reviews      Review[]
-
-  @@map("doctors")
-}
-
-model Slot {
-  id          String            @id @default(uuid())
-  doctorId    String
-  clinicId    String
-  date        DateTime
-  time        String
-  duration    Int               @default(30)
-  type        SlotType          @default(FREE)
-  price       Decimal           @default(0)
-  status      AppointmentStatus @default(PENDING)
-  createdAt   DateTime          @default(now())
-  deletedAt   DateTime?
-
-  paymentMode SlotPaymentMode   @default(ONLINE)
-  kind        String            @default("APPOINTMENT") // NEW
-
-  doctor      Doctor            @relation(fields: [doctorId], references: [id])
-  clinic      Clinic            @relation(fields: [clinicId], references: [id])
-  appointments Appointment[]
-
-  @@unique([doctorId, date, time])
-  @@map("slots")
-}
-
-
-
-model Appointment {
-  id           String             @id @default(uuid())
-  slug         String             @unique
-  userId       String
-  doctorId     String
-  clinicId     String
-  slotId       String             @unique
-  section      BookingSection
-  status       AppointmentStatus  @default(PENDING)
-  paymentId    String?
-  notes        String?
-  symptoms     String?
-  prescription String?
-  cancelReason String?
-  cancelledBy  CancellationActor?  // ✅ add this
-
-  createdAt    DateTime           @default(now())
-  updatedAt    DateTime           @updatedAt
-  deletedAt    DateTime?
-
-  user         User               @relation(fields: [userId], references: [id])
-  doctor       Doctor             @relation(fields: [doctorId], references: [id])
-  clinic       Clinic             @relation(fields: [clinicId], references: [id])
-  slot         Slot               @relation(fields: [slotId], references: [id])
-  payment      Payment?
-
-  logs         AppointmentLog[]
-  review       Review?
-  cancellationRequest CancellationRequest?
-
-  @@map("appointments")
-}
-
-
-model CancellationRequest {
-  id            String       @id @default(uuid())
-  appointmentId String       @unique
-  appointment   Appointment  @relation(fields: [appointmentId], references: [id])
-  status        String       // PENDING, APPROVED, REJECTED
-  reason        String?
-  createdAt     DateTime     @default(now())
-  processedAt   DateTime?
-  processedById String?
-
-  @@map("cancellation_requests")
-}
-
-model Payment {
-  id           String       @id @default(uuid())
-  appointmentId String      @unique
-  clinicId     String
-  doctorId     String
-  gatewayId    String
-  amount       Decimal
-  status       PaymentStatus
-  gatewayRefId String?
-  createdAt    DateTime     @default(now())
-
-  appointment Appointment   @relation(fields: [appointmentId], references: [id])
-  clinic      Clinic        @relation(fields: [clinicId], references: [id])
-  doctor      Doctor        @relation(fields: [doctorId], references: [id])
-  gateway     PaymentGateway @relation(fields: [gatewayId], references: [id])
-
-  @@map("payments")
-}
-
-// --- HISTORY & LOGS ---
-
-model AppointmentLog {
-  id           String   @id @default(uuid())
-  appointmentId String
-  oldDate      DateTime
-  oldTime      String
-  newDate      DateTime
-  newTime      String
-  reason       String?
-  changedBy    String
-  createdAt    DateTime @default(now())
-
-  appointment  Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
-
-  @@map("appointment_logs")
-}
-
-model Review {
-  id           String   @id @default(uuid())
-  appointmentId String  @unique
-  doctorId     String
-  userId       String
-  rating       Int
-  comment      String?
-  createdAt    DateTime @default(now())
-  deletedAt    DateTime? // Soft Delete
-
-  appointment  Appointment @relation(fields: [appointmentId], references: [id])
-  doctor       Doctor      @relation(fields: [doctorId], references: [id])
-  user         User        @relation(fields: [userId], references: [id])
-
-  @@map("reviews")
-}
-
-model AuditLog {
-  id        String   @id @default(uuid())
-  userId    String
-  clinicId  String?
-  action    String
-  entity    String
-  entityId  String?
-  details   Json?
-  ipAddress String?
-  createdAt DateTime @default(now())
-
-  user      User    @relation(fields: [userId], references: [id])
-  clinic    Clinic? @relation(fields: [clinicId], references: [id])
-
-  @@map("audit_logs")
-}
-
-
-
-model Notification {
-  id        String           @id @default(uuid())
-  clinicId  String
-  type      NotificationType
-  entityId  String           // appointmentId
-  message   String
-  createdAt DateTime         @default(now())
-  readAt    DateTime?
-
-  @@index([clinicId, type, readAt])
-  @@index([clinicId, readAt])
 }
