@@ -117,118 +117,6 @@ export const getDoctorsByClinic = async (req, res) => {
 // ----------------------------------------------------------------
 // GET /api/public/doctors/:doctorId/slots
 // ----------------------------------------------------------------
-export const getSlotsByDoctor = async (req, res) => {
-  try {
-    const { doctorId } = req.params;
-    const { date } = req.query;
-
-    const doctor = await prisma.doctor.findUnique({
-      where: { id: doctorId },
-      include: { clinic: true },
-    });
-
-    if (
-      !doctor ||
-      !doctor.isActive ||
-      doctor.deletedAt ||
-      doctor.clinic.deletedAt
-    ) {
-      return res.status(404).json({ error: 'Doctor unavailable.' });
-    }
-
-    const where = {
-      doctorId,
-      deletedAt: null,
-      kind: 'APPOINTMENT', // hide BREAK / lunch slots
-    };
-
-    if (date) {
-      const d = new Date(date);
-      const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-      const end = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
-      where.date = { gte: start, lt: end };
-    }
-
-    // ✅ STEP 1: Get ALL slots for the day
-    const slots = await prisma.slot.findMany({
-      where,
-      orderBy: [{ date: 'asc' }, { time: 'asc' }],
-    });
-
-    // ✅ STEP 2: Get BLOCKED slots (Race Condition Safe!)
-    const blockedAppointments = await prisma.appointment.findMany({
-      where: {
-        slotId: { 
-          in: slots.map(slot => slot.id) 
-        },
-        OR: [
-          { status: 'CONFIRMED' },                                    // ✅ Permanently booked
-          { 
-            status: 'PENDING',                                        // ✅ Active payment hold
-            createdAt: { 
-              gt: new Date(Date.now() - 10 * 60 * 1000)              // Within last 10 mins only
-            }
-          }
-        ],
-        deletedAt: null
-      },
-      select: { 
-        slotId: true 
-      }
-    });
-
-    // ✅ STEP 3: Create blocked slot set (fast lookup)
-    const blockedSlotIds = new Set(blockedAppointments.map(a => a.slotId));
-
-    // ✅ STEP 4: Current time filtering (YOUR CODE PERFECT!)
-    const now = new Date();
-    const currentDateString = now.toISOString().split('T')[0]; 
-    const currentHours = now.getHours();
-    const currentMinutes = now.getMinutes();
-
-    // ✅ FINAL RESULT - Race Condition PROOF!
-    const availableSlots = slots
-      .map((slot) => {
-        const slotDateString = new Date(slot.date).toISOString().split('T')[0];
-        
-        // Past time filtering (YOUR LOGIC ✅)
-        if (slotDateString === currentDateString) {
-          const [slotHour, slotMinute] = slot.time.split(':').map(Number);
-          if (slotHour < currentHours) return null;
-          if (slotHour === currentHours && slotMinute <= currentMinutes) return null;
-        }
-
-        // Race condition safe booking status
-        const isBooked = blockedSlotIds.has(slot.id);
-        
-        return { 
-          ...slot, 
-          isBooked,                    // ✅ TRUE = Unavailable, FALSE = Bookable
-          paymentMode: slot.paymentMode || 'FREE',
-          price: Number(slot.price || 0)
-        };
-      })
-      .filter(Boolean)  // Remove past slots
-      .sort((a, b) => a.time.localeCompare(b.time));
-
-    return res.json({
-      success: true,
-      doctorId,
-      date,
-      slots: availableSlots,
-      totalAvailable: availableSlots.filter(s => !s.isBooked).length,
-      totalBlocked: availableSlots.filter(s => s.isBooked).length,
-      stats: {
-        free: availableSlots.filter(s => s.paymentMode === 'FREE' && !s.isBooked).length,
-        paid: availableSlots.filter(s => s.paymentMode !== 'FREE' && !s.isBooked).length
-      }
-    });
-
-  } catch (error) {
-    console.error('Slot Fetch Error:', error);
-    return res.status(500).json({ error: 'Failed to load slots.' });
-  }
-};
 
 
 
@@ -365,26 +253,44 @@ export const getDoctors = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+function isSlotPassedIst(dateStr, timeStr) {
+  // Treat date+time as IST wall-clock and compare with current IST time
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+  // Current time in IST (as timestamp)
+  const nowUtc = Date.now();
+  const nowIst = nowUtc + IST_OFFSET_MS;
+
+  // Slot time in IST (as timestamp)
+  // 1) Build ISO without offset -> JS treats as local, so strip local offset:
+  const slotLocal = new Date(`${dateStr}T${timeStr}:00`).getTime();
+  // 2) Convert that local timestamp to IST-equivalent by *adding* or *subtracting*
+  //    your server offset. If your server is running in UTC, do NOT adjust it.
+  //    Assuming server is UTC:
+  const slotIst = slotLocal + IST_OFFSET_MS;
+
+  return slotIst < nowIst;
+}
+
 export const getSlotsForUser = async (req, res, next) => {
   try {
     const { clinicId, doctorId, date, excludeAppointmentId } = req.query;
 
     if (!clinicId || !doctorId || !date) {
-      return res.status(400).json({ error: "clinicId, doctorId, date are required" });
+      return res
+        .status(400)
+        .json({ error: "clinicId, doctorId, date are required" });
     }
 
-    const start = new Date(date);
-    start.setHours(0, 0, 0, 0);
-
-    const end = new Date(date);
-    end.setHours(23, 59, 59, 999);
+    const start = new Date(`${date}T00:00:00+05:30`);
+    const end = new Date(`${date}T23:59:59+05:30`);
 
     const slots = await prisma.slot.findMany({
       where: {
         clinicId,
         doctorId,
         deletedAt: null,
-        kind: "APPOINTMENT",           // ✅ hide BREAK
+        kind: "APPOINTMENT",
         date: { gte: start, lte: end },
       },
       orderBy: { time: "asc" },
@@ -393,7 +299,9 @@ export const getSlotsForUser = async (req, res, next) => {
           where: {
             deletedAt: null,
             status: { in: ["PENDING", "CONFIRMED", "COMPLETED"] },
-            ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {}),
+            ...(excludeAppointmentId
+              ? { NOT: { id: excludeAppointmentId } }
+              : {}),
           },
           select: { id: true },
           take: 1,
@@ -402,18 +310,136 @@ export const getSlotsForUser = async (req, res, next) => {
     });
 
     return res.json({
-      data: slots.map((s) => ({
-        id: s.id,
-        date: s.date,
-        time: s.time,
-        paymentMode: s.paymentMode,
-        kind: s.kind,                  // ✅ return kind (not type)
-        price: s.price,
-        isBooked: (s.appointments?.length || 0) > 0,
-      })),
+      data: slots.map((s) => {
+        const isPassed = isSlotPassedIst(date, s.time);
+
+        return {
+          id: s.id,
+          date: s.date,
+          time: s.time,
+          paymentMode: s.paymentMode,
+          kind: s.kind,
+          price: s.price,
+          isBooked: (s.appointments?.length || 0) > 0,
+          isPassed,
+        };
+      }),
     });
   } catch (error) {
     console.error("Get Slots For User Error:", error);
-    return next ? next(error) : res.status(500).json({ error: "Failed to load slots" });
+    return next
+      ? next(error)
+      : res.status(500).json({ error: "Failed to load slots" });
   }
 };
+
+/* ---------------- getSlotsByDoctor ---------------- */
+
+export const getSlotsByDoctor = async (req, res) => {
+  try {
+    const { doctorId } = req.params;
+    const { date } = req.query;
+
+    const doctor = await prisma.doctor.findUnique({
+      where: { id: doctorId },
+      include: { clinic: true },
+    });
+
+    if (
+      !doctor ||
+      !doctor.isActive ||
+      doctor.deletedAt ||
+      doctor.clinic.deletedAt
+    ) {
+      return res.status(404).json({ error: "Doctor unavailable." });
+    }
+
+    const where = {
+      doctorId,
+      deletedAt: null,
+      kind: "APPOINTMENT", // hide BREAK / lunch slots
+    };
+
+    let dateStrForPassed = null;
+
+    if (date) {
+      // date is already 'YYYY-MM-DD' from query
+      dateStrForPassed = date;
+
+      const start = new Date(`${date}T00:00:00+05:30`);
+      const end = new Date(`${date}T23:59:59+05:30`);
+      where.date = { gte: start, lte: end };
+    }
+
+    // 1) All slots for the day
+    const slots = await prisma.slot.findMany({
+      where,
+      orderBy: [{ date: "asc" }, { time: "asc" }],
+    });
+
+    // 2) Blocked slots (confirmed + recent pending)
+    const blockedAppointments = await prisma.appointment.findMany({
+      where: {
+        slotId: { in: slots.map((slot) => slot.id) },
+        OR: [
+          { status: "CONFIRMED" }, // permanently booked
+          {
+            status: "PENDING", // active payment hold within last 10 minutes
+            createdAt: {
+              gt: new Date(Date.now() - 10 * 60 * 1000),
+            },
+          },
+        ],
+        deletedAt: null,
+      },
+      select: { slotId: true },
+    });
+
+    const blockedSlotIds = new Set(blockedAppointments.map((a) => a.slotId));
+
+    // If no date query, still compute date string per-slot from DB date
+    const resultSlots = slots
+      .map((slot) => {
+        const slotDateStr =
+          dateStrForPassed ||
+          new Date(slot.date).toISOString().split("T")[0];
+
+        const isPassed = isSlotPassedIst(slotDateStr, slot.time);
+        const isBooked = blockedSlotIds.has(slot.id);
+
+        return {
+          id: slot.id,
+          date: slot.date,
+          time: slot.time,
+          paymentMode: slot.paymentMode || "FREE",
+          kind: slot.kind,
+          price: Number(slot.price || 0),
+          isBooked,
+          isPassed,
+        };
+      })
+      .sort((a, b) => a.time.localeCompare(b.time));
+
+    return res.json({
+      success: true,
+      doctorId,
+      date,
+      slots: resultSlots,
+      totalAvailable: resultSlots.filter((s) => !s.isBooked && !s.isPassed)
+        .length,
+      totalBlocked: resultSlots.filter((s) => s.isBooked).length,
+      stats: {
+        free: resultSlots.filter(
+          (s) => s.paymentMode === "FREE" && !s.isBooked && !s.isPassed
+        ).length,
+        paid: resultSlots.filter(
+          (s) => s.paymentMode !== "FREE" && !s.isBooked && !s.isPassed
+        ).length,
+      },
+    });
+  } catch (error) {
+    console.error("Slot Fetch Error:", error);
+    return res.status(500).json({ error: "Failed to load slots." });
+  }
+}
+

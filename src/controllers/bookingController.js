@@ -3,7 +3,7 @@ import Razorpay from 'razorpay';
 import Stripe from 'stripe';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
-
+import { sendBookingEmails } from '../utils/email.js'
 // ----------------------------------------------------------------
 // Helper: load plan for a clinic
 // ----------------------------------------------------------------
@@ -69,6 +69,8 @@ const getPaymentInstance = async (clinicId, provider = 'RAZORPAY') => {
 // ----------------------------------------------------------------
 // src/controllers/bookingController.js
 
+// ✅ ADD THIS IMPORT
+
 export const createBooking = async (req, res) => {
   try {
     const { slotId, paymentMethod = 'ONLINE', provider = 'RAZORPAY' } = req.body;
@@ -85,12 +87,15 @@ export const createBooking = async (req, res) => {
     const now = new Date();
 
     // 1. Fetch Slot + Clinic + Doctor
-    const slot = await prisma.slot.findUnique({
+    const slotData = await prisma.slot.findUnique({
       where: { id: slotId },
-      include: { clinic: true, doctor: true },
+      include: { 
+        clinic: true, 
+        doctor: true 
+      },
     });
 
-    if (!slot) {
+    if (!slotData) {
       return res.status(404).json({ error: 'Slot not found' });
     }
 
@@ -146,11 +151,10 @@ export const createBooking = async (req, res) => {
         });
 
         if (remainingMs > 0) {
-          // ♻️ Still valid: reuse appointment, refresh payment order
           const remainingSeconds = Math.floor(remainingMs / 1000);
 
-          const gateway = await getPaymentInstance(slot.clinicId, provider);
-          const orderData = await createPaymentOrder(gateway, slot, provider);
+          const gateway = await getPaymentInstance(slotData.clinicId, provider);
+          const orderData = await createPaymentOrder(gateway, slotData, provider);
 
           await prisma.appointment.update({
             where: { id: existing.id },
@@ -170,7 +174,7 @@ export const createBooking = async (req, res) => {
             message: `Complete payment within ${Math.floor(
               remainingSeconds / 60
             )}:${(remainingSeconds % 60).toString().padStart(2, '0')} to confirm ₹${
-              slot.price
+              slotData.price
             } booking`,
           });
         }
@@ -178,8 +182,8 @@ export const createBooking = async (req, res) => {
         // 2d. Same user, hold expired → reuse SAME ROW with fresh hold
         console.log('🗑️ Expired old hold (same user):', existing.id);
 
-        const gateway = await getPaymentInstance(slot.clinicId, provider);
-        const orderData = await createPaymentOrder(gateway, slot, provider);
+        const gateway = await getPaymentInstance(slotData.clinicId, provider);
+        const orderData = await createPaymentOrder(gateway, slotData, provider);
 
         const refreshed = await prisma.appointment.update({
           where: { id: existing.id },
@@ -187,7 +191,7 @@ export const createBooking = async (req, res) => {
             status: 'PENDING_PAYMENT',
             paymentStatus: 'PENDING',
             orderId: orderData.orderId || orderData.sessionId,
-            amount: Number(slot.price),
+            amount: Number(slotData.price),
             paymentExpiry: new Date(now.getTime() + HOLD_MS),
             updatedAt: now,
           },
@@ -202,7 +206,7 @@ export const createBooking = async (req, res) => {
           isOnline: true,
           ...orderData,
           expiresIn,
-          message: `Complete payment within 10 minutes to confirm ₹${slot.price} booking`,
+          message: `Complete payment within 10 minutes to confirm ₹${slotData.price} booking`,
         });
       }
 
@@ -213,8 +217,8 @@ export const createBooking = async (req, res) => {
       });
     }
 
-    // 3. Plan gating check (no appointment for this slot yet)
-    const plan = await getClinicPlan(slot.clinicId);
+    // 3. Plan gating check
+    const plan = await getClinicPlan(slotData.clinicId);
     if (!plan) {
       return res
         .status(400)
@@ -228,69 +232,47 @@ export const createBooking = async (req, res) => {
       });
     }
 
-    // 4. FREE SLOT – instant booking
-    if (slot.paymentMode === 'FREE') {
+    // 4. FREE / OFFLINE → PENDING (Clinic Admin confirms) + ✅ EMAILS
+    if (slotData.paymentMode === 'FREE' || paymentMethod === 'OFFLINE' || slotData.paymentMode === 'OFFLINE') {
       const appointment = await prisma.appointment.create({
         data: {
           userId: authUserId,
           slotId,
-          clinicId: slot.clinicId,
-          doctorId: slot.doctorId,
-          status: 'CONFIRMED',
-          paymentStatus: 'PAID',
-          amount: 0,
-          slug: `free_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          clinicId: slotData.clinicId,
+          doctorId: slotData.doctorId,
+          status: 'PENDING', // ✅ FIXED: PENDING (Clinic confirms)
+          paymentStatus: slotData.paymentMode === 'FREE' ? 'PAID' : 'PENDING',
+          amount: slotData.paymentMode === 'FREE' ? 0 : Number(slotData.price),
+          slug: `${slotData.paymentMode?.toLowerCase() || 'offline'}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
           section: 'GENERAL',
         },
       });
 
-      await prisma.slot.update({
-        where: { id: slotId },
-        data: { status: 'CONFIRMED' },
-      });
+      // ✅ NO slot.update() - stays available until clinic confirms
 
-      return res.json({
-        success: true,
-        appointmentId: appointment.id,
-        message: 'Free booking confirmed instantly!',
-        isOnline: false,
-      });
-    }
-
-    // 5. OFFLINE PAYMENT – instant confirm
-    if (paymentMethod === 'OFFLINE' || slot.paymentMode === 'OFFLINE') {
-      const appointment = await prisma.appointment.create({
-        data: {
-          userId: authUserId,
-          slotId,
-          clinicId: slot.clinicId,
-          doctorId: slot.doctorId,
-          status: 'CONFIRMED',
-          paymentStatus: 'PENDING', // pay at clinic
-          amount: Number(slot.price),
-          slug: `offline_${Date.now()}_${Math.random()
-            .toString(36)
-            .substr(2, 9)}`,
-          section: 'GENERAL',
-        },
-      });
-
-      await prisma.slot.update({
-        where: { id: slotId },
-        data: { status: 'CONFIRMED' },
-      });
+      // ✅ SEND INSTANT NOTIFICATION EMAILS (NON-BLOCKING)
+      getUserById(authUserId).then(user => {
+        sendBookingEmails({
+          id: appointment.id,
+          clinic: slotData.clinic,
+          doctor: slotData.doctor,
+          slot: slotData,
+          user: user || { name: 'Patient', phone: 'N/A' }
+        }).catch(err => console.error('Pending booking emails failed:', err));
+      }).catch(() => {});
 
       return res.json({
         success: true,
         appointmentId: appointment.id,
         isOnline: false,
-        message: `Booking confirmed! Pay ₹${slot.price} at clinic.`,
+        status: 'PENDING', // ✅ Clear communication
+        message: slotData.paymentMode === 'FREE' 
+          ? 'Free booking created! Clinic will confirm soon.'
+          : `Booking created! Pay ₹${slotData.price} at clinic. Clinic will confirm.`,
       });
     }
 
     // 6. ONLINE PAYMENT – FRESH hold (no existing appointment for this slot)
-
-    // HARD GUARD: ensure we still have no appointment for this slot
     const guardExisting = await prisma.appointment.findFirst({
       where: { slotId, deletedAt: null },
     });
@@ -309,19 +291,19 @@ export const createBooking = async (req, res) => {
       });
     }
 
-    const gateway = await getPaymentInstance(slot.clinicId, provider);
-    const orderData = await createPaymentOrder(gateway, slot, provider);
+    const gateway = await getPaymentInstance(slotData.clinicId, provider);
+    const orderData = await createPaymentOrder(gateway, slotData, provider);
 
     const appointment = await prisma.appointment.create({
       data: {
         userId: authUserId,
         slotId,
-        clinicId: slot.clinicId,
-        doctorId: slot.doctorId,
+        clinicId: slotData.clinicId,
+        doctorId: slotData.doctorId,
         status: 'PENDING_PAYMENT',
         paymentStatus: 'PENDING',
         orderId: orderData.orderId || orderData.sessionId,
-        amount: Number(slot.price),
+        amount: Number(slotData.price),
         slug: `hold_${Date.now()}_${Math.random()
           .toString(36)
           .substr(2, 9)}`,
@@ -343,8 +325,8 @@ export const createBooking = async (req, res) => {
       gatewayId: gateway.gatewayId,
       isOnline: true,
       ...orderData,
-      expiresIn: HOLD_MS / 1000, // 600
-      message: `Complete payment within 10 minutes to confirm ₹${slot.price} booking`,
+      expiresIn: HOLD_MS / 1000,
+      message: `Complete payment within 10 minutes to confirm ₹${slotData.price} booking`,
     });
   } catch (error) {
     console.error('CRITICAL BOOKING ERROR:', error);
@@ -354,6 +336,20 @@ export const createBooking = async (req, res) => {
   }
 };
 
+// ✅ HELPER FUNCTION - Get user data for emails
+const getUserById = async (userId) => {
+  try {
+    return await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, name: true, phone: true, email: true }
+    });
+  } catch {
+    return null;
+  }
+};
+
+
+// ✅ HELPER - Get user data for emails
 
 
 

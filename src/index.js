@@ -23,7 +23,7 @@ app.use(cors({
   origin: [
     process.env.FRONTEND_URL || 'http://localhost:3000',
     'http://localhost:5173',     // ✅ Vite dev server
-    'http://127.0.0.1:5173'      // ✅ Vite IP binding
+    'http://127.0.0.1:5173' ,"http://192.168.29.118:5173"     // ✅ Vite IP binding
   ],
   credentials: true
 }));
@@ -44,7 +44,7 @@ app.use(cors({
 
   // ✅ Static files
   app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
-
+ 
   // ✅ Health check
   app.get('/health', (req, res) => {
     res.json({ 

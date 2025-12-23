@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
 import { logAudit } from '../utils/audit.js';
+import { sendBookingEmails } from '../utils/email.js'
 
 // ----------------------------------------------------------------
 // 1. SIGNUP
@@ -475,9 +476,17 @@ export const rescheduleAppointment = async (req, res) => {
     if (!newSlotId) return res.status(400).json({ error: "New Slot ID is required" });
 
     const result = await prisma.$transaction(async (tx) => {
+      // ✅ ENHANCED QUERY - Get FULL data for emails
       const appointment = await tx.appointment.findFirst({
         where: { id, userId, deletedAt: null },
-        include: { slot: true, doctor: { select: { name: true } } },
+        include: { 
+          slot: true, 
+          doctor: true, 
+          clinic: true,
+          user: {
+            select: { id: true, name: true, phone: true, email: true }
+          }
+        },
       });
 
       if (!appointment) {
@@ -499,7 +508,15 @@ export const rescheduleAppointment = async (req, res) => {
           doctorId: appointment.doctorId,
           deletedAt: null,
         },
-        include: { appointments: true },
+        include: { 
+          appointments: {
+            where: {
+              deletedAt: null,
+              status: { in: ["PENDING", "CONFIRMED", "COMPLETED"] }
+            },
+            select: { id: true }
+          }
+        },
       });
 
       if (!newSlot) {
@@ -508,10 +525,8 @@ export const rescheduleAppointment = async (req, res) => {
         throw err;
       }
 
-      const isTaken = newSlot.appointments.some(
-        (a) => ["CONFIRMED", "PENDING", "COMPLETED"].includes(a.status) && !a.deletedAt && a.id !== appointment.id
-      );
-      if (isTaken) {
+      // ✅ NO .some() ERROR
+      if (newSlot.appointments && newSlot.appointments.length > 0) {
         const err = new Error("Slot already booked.");
         err.statusCode = 409;
         throw err;
@@ -519,8 +534,19 @@ export const rescheduleAppointment = async (req, res) => {
 
       const updatedAppointment = await tx.appointment.update({
         where: { id: appointment.id },
-        data: { slotId: newSlotId, status: "PENDING" },
-        include: { slot: true },
+        data: { 
+          slotId: newSlotId, 
+          status: "PENDING",
+          updatedAt: new Date()
+        },
+        include: { 
+          slot: true,
+          doctor: true,
+          clinic: true,
+          user: {
+            select: { id: true, name: true, phone: true }
+          }
+        },
       });
 
       await tx.appointmentLog.create({
@@ -536,9 +562,13 @@ export const rescheduleAppointment = async (req, res) => {
       });
 
       const doctorName = appointment.doctor?.name || "Doctor";
-      const oldDateStr = appointment.slot?.date ? new Date(appointment.slot.date).toLocaleDateString() : "N/A";
+      const oldDateStr = appointment.slot?.date 
+        ? new Date(appointment.slot.date).toLocaleDateString('en-IN') 
+        : "N/A";
       const oldTimeStr = appointment.slot?.time || "N/A";
-      const newDateStr = newSlot?.date ? new Date(newSlot.date).toLocaleDateString() : "N/A";
+      const newDateStr = newSlot?.date 
+        ? new Date(newSlot.date).toLocaleDateString('en-IN') 
+        : "N/A";
       const newTimeStr = newSlot?.time || "N/A";
 
       await tx.notification.create({
@@ -550,8 +580,34 @@ export const rescheduleAppointment = async (req, res) => {
         },
       });
 
-      return { updatedAppointment, oldDateStr, oldTimeStr, newDateStr, newTimeStr };
+      return { 
+        updatedAppointment, 
+        oldDateStr, 
+        oldTimeStr, 
+        newDateStr, 
+        newTimeStr,
+        oldSlot: appointment.slot, // ✅ PASS OLD SLOT
+        newSlot,
+        clinic: appointment.clinic,
+        doctor: appointment.doctor,
+        user: appointment.user
+      };
     });
+
+    // ✅ UNIFIED RESCHEDULE EMAIL CALL
+    sendBookingEmails({
+      type: 'RESCHEDULE',           // ✅ TRIGGER RESCHEDULE TEMPLATE
+      id: result.updatedAppointment.id,
+      clinic: result.clinic,
+      doctor: result.doctor,
+      slot: result.newSlot,
+      oldSlot: result.oldSlot,      // ✅ SHOW OLD TIME
+      user: result.user
+    }).catch(err => {
+      console.error('Reschedule emails failed:', err);
+    });
+
+    // ❌ DELETED: sendRescheduleNotification (Fixed the crash!)
 
     await logAudit({
       userId,
@@ -568,7 +624,7 @@ export const rescheduleAppointment = async (req, res) => {
     });
 
     return res.json({
-      message: "Reschedule Successful",
+      message: "Reschedule successful",
       details: {
         from: `${result.oldDateStr} at ${result.oldTimeStr}`,
         to: `${result.newDateStr} at ${result.newTimeStr}`,
@@ -576,16 +632,22 @@ export const rescheduleAppointment = async (req, res) => {
       appointment: result.updatedAppointment,
     });
   } catch (error) {
-    if (error?.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    if (error?.statusCode) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
 
     if (error?.code === "P2002") {
       return res.status(409).json({ error: "Slot already booked. Please choose another slot." });
     }
 
     console.error("Reschedule Error:", error);
-    return res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: "Internal server error" });
   }
 };
+
+
+// ✅ BONUS: Reschedule-specific notification email
+
 
 
 
@@ -690,7 +752,7 @@ export const getSlotsForUser = async (req, res, next) => {
         clinicId,
         doctorId,
         deletedAt: null,
-        kind: "APPOINTMENT",           // ✅ hide BREAK
+        kind: "APPOINTMENT",
         date: { gte: start, lte: end },
       },
       orderBy: { time: "asc" },
@@ -702,7 +764,7 @@ export const getSlotsForUser = async (req, res, next) => {
             ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {}),
           },
           select: { id: true },
-          take: 1,
+          // ✅ REMOVED: take: 1  (not allowed in Prisma 6+ include)
         },
       },
     });
@@ -713,7 +775,7 @@ export const getSlotsForUser = async (req, res, next) => {
         date: s.date,
         time: s.time,
         paymentMode: s.paymentMode,
-        kind: s.kind,                  // ✅ return kind (not type)
+        kind: s.kind,
         price: s.price,
         isBooked: (s.appointments?.length || 0) > 0,
       })),
@@ -723,6 +785,7 @@ export const getSlotsForUser = async (req, res, next) => {
     return next ? next(error) : res.status(500).json({ error: "Failed to load slots" });
   }
 };
+
 
 // GET /user/slots?clinicId=...&doctorId=...&date=YYYY-MM-DD
 // GET /user/slots?clinicId=...&doctorId=...&date=YYYY-MM-DD&excludeAppointmentId=...

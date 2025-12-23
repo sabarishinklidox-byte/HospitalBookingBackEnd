@@ -2,6 +2,7 @@
 import prisma from '../prisma.js';
 import crypto from 'crypto';
 import Stripe from 'stripe';
+import { sendBookingEmails } from '../utils/email.js'; // ✅ ADD EMAIL IMPORT
 
 export const razorpayWebhook = async (req, res) => {
   try {
@@ -13,7 +14,7 @@ export const razorpayWebhook = async (req, res) => {
       return res.status(400).send('Missing signature');
     }
 
-    // ✅ RAZORPAY SIGNATURE (YOUR CODE PERFECT!)
+    // ✅ RAZORPAY SIGNATURE VERIFICATION (PERFECT)
     const shasum = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET);
     shasum.update(JSON.stringify(payload));
     const digest = shasum.digest('hex');
@@ -23,9 +24,8 @@ export const razorpayWebhook = async (req, res) => {
       return res.status(400).send('Invalid signature');
     }
 
-    // ✅ FIX 1: Use order_id (correct field name)
     const notes = payload.payload.payment.entity.notes;
-    const orderId = payload.payload.payment.entity.order_id; // ← CORRECT field
+    const orderId = payload.payload.payment.entity.order_id;
     const appointmentTempId = notes.appointmentTempId;
 
     if (!orderId && !appointmentTempId) {
@@ -33,22 +33,27 @@ export const razorpayWebhook = async (req, res) => {
       return res.status(400).send('Missing appointment reference');
     }
 
-    // ✅ Find appointment (YOUR LOGIC PERFECT!)
+    // ✅ ENHANCED QUERY - Get FULL appointment data for emails
     const appointment = await prisma.appointment.findFirst({
       where: {
         OR: [
-          { orderId },                    // Razorpay order_id
-          { id: appointmentTempId }       // Temp UUID backup
+          { orderId },
+          { id: appointmentTempId }
         ],
-        status: 'PENDING',
+        status: 'PENDING_PAYMENT', // ✅ More specific
         createdAt: { 
           gt: new Date(Date.now() - 15 * 60 * 1000) 
         }
       },
       include: {
         slot: true,
+        clinic: true,
+        doctor: true,
+        user: {
+          select: { id: true, name: true, phone: true, email: true }
+        },
         clinic: { 
-          include: { gateways: true }     // ✅ FIX 2: Get gateway ID
+          include: { gateways: true }
         }
       }
     });
@@ -58,23 +63,25 @@ export const razorpayWebhook = async (req, res) => {
       return res.status(400).send('Appointment expired or not found');
     }
 
-    // ✅ ATOMIC TRANSACTION (YOUR CODE PERFECT!)
+    // ✅ ATOMIC TRANSACTION + EMAILS
     await prisma.$transaction(async (tx) => {
       const stillPending = await tx.appointment.findUnique({
         where: { id: appointment.id }
       });
 
-      if (stillPending?.status !== 'PENDING') {
+      if (stillPending?.status !== 'PENDING_PAYMENT') {
         console.log(`⚠️ Already processed: ${appointment.id}`);
         return;
       }
 
+      // ✅ CONFIRM PAYMENT
       await tx.appointment.update({
         where: { id: appointment.id },
         data: {
           status: 'CONFIRMED',
           paymentStatus: 'PAID',
           paymentId: payload.payload.payment.entity.id,
+          updatedAt: new Date()
         }
       });
 
@@ -83,7 +90,7 @@ export const razorpayWebhook = async (req, res) => {
         data: { isBooked: true }
       });
 
-      // ✅ FIX 3: Proper gatewayId
+      // ✅ CREATE PAYMENT RECORD
       const razorpayGateway = appointment.clinic.gateways.find(g => g.name === 'RAZORPAY');
       await tx.payment.create({
         data: {
@@ -98,7 +105,16 @@ export const razorpayWebhook = async (req, res) => {
       });
     });
 
-    console.log(`✅ Razorpay CONFIRMED: ${appointment.id}`);
+    // ✅ SEND EMAILS AFTER PAYMENT SUCCESS (NON-BLOCKING)
+    sendBookingEmails({
+      id: appointment.id,
+      clinic: appointment.clinic,
+      doctor: appointment.doctor,
+      slot: appointment.slot,
+      user: appointment.user
+    }).catch(err => console.error('Payment confirmation emails failed:', err));
+
+    console.log(`✅ Razorpay CONFIRMED + EMAILS SENT: ${appointment.id}`);
     return res.status(200).json({ success: true });
 
   } catch (error) {
@@ -114,7 +130,7 @@ export const stripeWebhook = async (req, res) => {
 
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
     const event = stripe.webhooks.constructEvent(
-      payload.toString(),  // ✅ FIX: raw string
+      payload.toString(),
       sig, 
       process.env.STRIPE_WEBHOOK_SECRET || ''
     );
@@ -126,17 +142,23 @@ export const stripeWebhook = async (req, res) => {
         const orderId = session.id;
         const appointmentTempId = session.metadata.appointmentTempId;
 
+        // ✅ ENHANCED QUERY - Get FULL data for emails
         const appointment = await prisma.appointment.findFirst({
           where: {
             OR: [
               { orderId },
               { id: appointmentTempId }
             ],
-            status: 'PENDING',
+            status: 'PENDING_PAYMENT',
             createdAt: { gt: new Date(Date.now() - 15 * 60 * 1000) }
           },
           include: {
             slot: true,
+            clinic: true,
+            doctor: true,
+            user: {
+              select: { id: true, name: true, phone: true, email: true }
+            },
             clinic: { 
               include: { gateways: true } 
             }
@@ -149,7 +171,7 @@ export const stripeWebhook = async (req, res) => {
               where: { id: appointment.id }
             });
 
-            if (stillPending?.status !== 'PENDING') return;
+            if (stillPending?.status !== 'PENDING_PAYMENT') return;
 
             await tx.appointment.update({
               where: { id: appointment.id },
@@ -157,6 +179,7 @@ export const stripeWebhook = async (req, res) => {
                 status: 'CONFIRMED',
                 paymentStatus: 'PAID',
                 paymentId: session.payment_intent,
+                updatedAt: new Date()
               }
             });
 
@@ -179,7 +202,16 @@ export const stripeWebhook = async (req, res) => {
             });
           });
 
-          console.log(`✅ Stripe CONFIRMED: ${appointment.id}`);
+          // ✅ SEND EMAILS AFTER STRIPE PAYMENT SUCCESS
+          sendBookingEmails({
+            id: appointment.id,
+            clinic: appointment.clinic,
+            doctor: appointment.doctor,
+            slot: appointment.slot,
+            user: appointment.user
+          }).catch(err => console.error('Stripe confirmation emails failed:', err));
+
+          console.log(`✅ Stripe CONFIRMED + EMAILS SENT: ${appointment.id}`);
         }
       }
     }

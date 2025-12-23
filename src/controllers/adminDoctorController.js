@@ -36,7 +36,6 @@ export const createDoctor = async (req, res) => {
       return res.status(400).json({ error: 'Clinic ID missing in token' });
     }
 
-    // ✅ Enforce plan doctor limit
     const plan = await getClinicPlan(clinicId);
     if (!plan) {
       return res
@@ -64,7 +63,7 @@ export const createDoctor = async (req, res) => {
 
     let avatar = null;
     if (req.file) {
-      avatar = `/uploads/${req.file.filename}`;
+      avatar = `/uploads/${req.file.filename}`; // relative URL
     } else if (req.body.avatar) {
       avatar = req.body.avatar;
     }
@@ -173,37 +172,48 @@ export const updateDoctor = async (req, res) => {
   try {
     const { clinicId, userId } = req.user;
     const { id } = req.params;
-    const { name, email, phone, speciality, experience, avatar, password } = req.body;
+    const { name, email, phone, speciality, experience, password } = req.body;
 
-    // Ensure doctor belongs to this clinic AND NOT DELETED
+    const file = req.file;
+
     const existingDoctor = await prisma.doctor.findFirst({
-      where: { 
-        id, 
+      where: {
+        id,
         clinicId,
-        deletedAt: null 
-      }
+        deletedAt: null,
+      },
     });
 
     if (!existingDoctor) {
       return res.status(404).json({ error: 'Doctor not found in this clinic' });
     }
 
-    // Update doctor profile
+    let avatar = existingDoctor.avatar;
+    if (file) {
+      avatar = `/uploads/${file.filename}`;
+    } else if (req.body.avatar !== undefined) {
+      avatar = req.body.avatar || existingDoctor.avatar;
+    }
+
     const doctorUpdated = await prisma.doctor.update({
       where: { id },
       data: {
         name: name ?? existingDoctor.name,
-        avatar: avatar !== undefined ? avatar : existingDoctor.avatar,
+        avatar,
         speciality: speciality ?? existingDoctor.speciality,
         phone: phone ?? existingDoctor.phone,
-        experience: experience !== undefined ? Number(experience) : existingDoctor.experience
-      }
+        experience:
+          experience !== undefined
+            ? Number(experience)
+            : existingDoctor.experience,
+      },
     });
 
-    // Update linked user login
     const user = await prisma.user.findFirst({ where: { doctorId: id } });
     if (!user) {
-      return res.status(404).json({ error: 'User login for doctor not found' });
+      return res
+        .status(404)
+        .json({ error: 'User login for doctor not found' });
     }
 
     const userData = {};
@@ -219,22 +229,25 @@ export const updateDoctor = async (req, res) => {
     }
     if (password) {
       if (password.length < 6) {
-        return res.status(400).json({ error: 'Password must be at least 6 characters' });
+        return res
+          .status(400)
+          .json({ error: 'Password must be at least 6 characters' });
       }
       userData.password = await bcrypt.hash(password, 12);
     }
 
     const userUpdated = await prisma.user.update({
       where: { id: user.id },
-      data: userData
+      data: userData,
     });
 
-    // ✅ LOG AUDIT
     const changes = {};
-    if (name !== existingDoctor.name) changes.name = name;
-    if (speciality !== existingDoctor.speciality) changes.speciality = speciality;
-    if (email !== user.email) changes.email = email;
-    if (password) changes.password = "Password Changed";
+    if (name && name !== existingDoctor.name) changes.name = name;
+    if (speciality && speciality !== existingDoctor.speciality)
+      changes.speciality = speciality;
+    if (email && email !== user.email) changes.email = email;
+    if (password) changes.password = 'Password Changed';
+    if (avatar !== existingDoctor.avatar) changes.avatar = avatar;
 
     await logAudit({
       userId: userId || req.user.userId,
@@ -243,7 +256,7 @@ export const updateDoctor = async (req, res) => {
       entity: 'Doctor',
       entityId: id,
       details: changes,
-      req
+      req,
     });
 
     return res.json({ doctor: doctorUpdated, user: userUpdated });

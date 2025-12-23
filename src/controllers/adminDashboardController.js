@@ -1,6 +1,8 @@
+// src/controllers/adminDashboardController.js
 import prisma from '../prisma.js';
 
 export const getAdminDashboard = async (req, res) => {
+  console.log('>>> getAdminDashboard v2 running, with bookingUrl');
   try {
     const { clinicId } = req.user;
 
@@ -12,9 +14,7 @@ export const getAdminDashboard = async (req, res) => {
     const clinicWithSub = await prisma.clinic.findUnique({
       where: { id: clinicId },
       include: {
-        subscription: {
-          include: { plan: true },
-        },
+        subscription: { include: { plan: true } },
       },
     });
 
@@ -30,7 +30,13 @@ export const getAdminDashboard = async (req, res) => {
 
     const plan = clinicWithSub.subscription?.plan || null;
 
-    // 2. Date ranges
+    // 1.1 SaaS booking URL for this clinic - FIXED
+    const appBaseUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+    console.log('DEBUG - CLIENT_URL:', process.env.CLIENT_URL); // Remove after testing
+    console.log('DEBUG - appBaseUrl:', appBaseUrl); // Remove after testing
+    const publicBookingUrl = `${appBaseUrl}/visit/${clinicWithSub.id}`;
+
+    // 2. Date ranges (server local time)
     const todayStart = new Date();
     todayStart.setHours(0, 0, 0, 0);
 
@@ -43,6 +49,8 @@ export const getAdminDashboard = async (req, res) => {
     const yesterdayEnd = new Date(todayEnd);
     yesterdayEnd.setDate(yesterdayEnd.getDate() - 1);
 
+    const now = new Date();
+
     // 3. Active Doctors
     const activeDoctors = await prisma.doctor.count({
       where: {
@@ -52,7 +60,7 @@ export const getAdminDashboard = async (req, res) => {
       },
     });
 
-    // 4. Today's Appointments (non-cancelled)
+    // 4. Today's Appointments (non‑cancelled)
     const todayAppointments = await prisma.appointment.count({
       where: {
         clinicId,
@@ -67,7 +75,7 @@ export const getAdminDashboard = async (req, res) => {
       },
     });
 
-    // 5. Yesterday's Appointments (non-cancelled)
+    // 5. Yesterday's Appointments (non‑cancelled)
     const yesterdayAppointments = await prisma.appointment.count({
       where: {
         clinicId,
@@ -142,7 +150,7 @@ export const getAdminDashboard = async (req, res) => {
       },
     });
 
-    // 9.1 Status-wise totals
+    // 9.1 Status‑wise totals
     const [
       totalBookings,
       totalPending,
@@ -171,10 +179,61 @@ export const getAdminDashboard = async (req, res) => {
       }),
     ]);
 
-    // 10. Response with plan and totals
+    // 10. Slot‑level metrics (today): open + expired‑unbooked
+    const occupyingStatuses = [
+      'PENDING',
+      'PENDING_PAYMENT',
+      'CONFIRMED',
+      'COMPLETED',
+    ];
+
+    const todaySlots = await prisma.slot.findMany({
+      where: {
+        clinicId,
+        deletedAt: null,
+        date: {
+          gte: todayStart,
+          lte: todayEnd,
+        },
+      },
+      include: {
+        appointments: {
+          where: {
+            deletedAt: null,
+            status: { in: occupyingStatuses },
+          },
+          select: { id: true },
+        },
+      },
+    });
+
+    let openSlotsToday = 0;
+    let expiredUnbookedSlotsToday = 0;
+
+    for (const slot of todaySlots) {
+      const hasActiveAppointment =
+        Array.isArray(slot.appointments) && slot.appointments.length > 0;
+
+      const slotDate = new Date(slot.date);
+      const [h, m] = slot.time.split(':').map(Number);
+      slotDate.setHours(h, m ?? 0, 0, 0);
+
+      const isPassed = slotDate < now;
+
+      if (!hasActiveAppointment && !isPassed) {
+        openSlotsToday += 1;
+      }
+      if (!hasActiveAppointment && isPassed) {
+        expiredUnbookedSlotsToday += 1;
+      }
+    }
+
+    // 11. Response
     return res.json({
       clinic,
       plan,
+      publicBookingUrl,
+
       todayAppointments,
       yesterdayAppointments,
       upcomingAppointments,
@@ -183,13 +242,15 @@ export const getAdminDashboard = async (req, res) => {
       yesterdayRevenue,
       totalRevenue,
 
-      // new aggregates
       totalBookings,
       totalPending,
       totalConfirmed,
       totalCompleted,
       totalNoShow,
       totalCancelled,
+
+      openSlotsToday,
+      expiredUnbookedSlotsToday,
     });
   } catch (error) {
     console.error('Dashboard Error:', error);

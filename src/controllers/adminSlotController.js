@@ -295,7 +295,7 @@ export const deleteSlot = async (req, res) => {
         appointments: {
           where: {
             deletedAt: null,
-            status: { in: ['PENDING', 'CONFIRMED'] }, // treat these as active
+            status: { in: ['PENDING', 'CONFIRMED'] },
           },
           select: { id: true },
         },
@@ -306,11 +306,13 @@ export const deleteSlot = async (req, res) => {
       return res.status(404).json({ error: 'Slot not found' });
     }
 
-    // ❌ block delete if there are active bookings
-    if (existing.appointments.length > 0) {
+    // ✅ FIXED: Safe null check
+    const activeAppointments = existing.appointments || [];
+    if (activeAppointments.length > 0) {
       return res.status(400).json({
         error:
           'Cannot delete this slot because it has active bookings. Cancel or move those appointments first.',
+        count: activeAppointments.length, // Bonus: show count
       });
     }
 
@@ -340,10 +342,7 @@ export const deleteSlot = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
-
-
-
-
+  
 
 
 export const createBulkSlots = async (req, res) => {
