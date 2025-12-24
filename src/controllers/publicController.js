@@ -371,13 +371,24 @@ export const getSlotsByDoctor = async (req, res) => {
       where.date = { gte: start, lte: end };
     }
 
-    // 1) All slots for the day
+    // 🔥 1) All slots WITH isBlocked filter
     const slots = await prisma.slot.findMany({
-      where,
+      where: {
+        ...where,
+        isBlocked: false  // 🔥 ONLY return NON-BLOCKED slots
+      },
+      select: { // 🔥 Add select for performance
+        id: true,
+        date: true,
+        time: true,
+        paymentMode: true,
+        kind: true,
+        price: true
+      },
       orderBy: [{ date: "asc" }, { time: "asc" }],
     });
 
-    // 2) Blocked slots (confirmed + recent pending)
+    // 2) Booked slots (confirmed + recent pending)
     const blockedAppointments = await prisma.appointment.findMany({
       where: {
         slotId: { in: slots.map((slot) => slot.id) },
@@ -397,7 +408,7 @@ export const getSlotsByDoctor = async (req, res) => {
 
     const blockedSlotIds = new Set(blockedAppointments.map((a) => a.slotId));
 
-    // If no date query, still compute date string per-slot from DB date
+    // Build result slots
     const resultSlots = slots
       .map((slot) => {
         const slotDateStr =
@@ -414,6 +425,7 @@ export const getSlotsByDoctor = async (req, res) => {
           paymentMode: slot.paymentMode || "FREE",
           kind: slot.kind,
           price: Number(slot.price || 0),
+          isBlocked: false,  // 🔥 Always false (already filtered)
           isBooked,
           isPassed,
         };
@@ -425,8 +437,7 @@ export const getSlotsByDoctor = async (req, res) => {
       doctorId,
       date,
       slots: resultSlots,
-      totalAvailable: resultSlots.filter((s) => !s.isBooked && !s.isPassed)
-        .length,
+      totalAvailable: resultSlots.filter((s) => !s.isBooked && !s.isPassed).length,
       totalBlocked: resultSlots.filter((s) => s.isBooked).length,
       stats: {
         free: resultSlots.filter(
@@ -441,5 +452,6 @@ export const getSlotsByDoctor = async (req, res) => {
     console.error("Slot Fetch Error:", error);
     return res.status(500).json({ error: "Failed to load slots." });
   }
-}
+};
+
 

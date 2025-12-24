@@ -28,7 +28,7 @@ import {
   deleteSlot,
   createBulkSlots,
   getDoctorSlotsForReschedule,
-  getDoctorSlotsWindow,
+  getDoctorSlotsWindow,getManageableSlots, blockSlot, unblockSlot
 } from '../controllers/adminSlotController.js';
 
 import {
@@ -297,6 +297,10 @@ router.patch(
 router.patch('/notifications/mark-read-by-entity',  authMiddleware,
   requireAdmin, markReadByEntity);
 
+
+router.get('/slots/manage', authMiddleware, requireAdmin,getManageableSlots );
+router.post('/slots/:slotId/block',authMiddleware, requireAdmin, blockSlot);
+router.post('/slots/:slotId/unblock', authMiddleware, requireAdmin,unblockSlot);
 
 
 export default router;

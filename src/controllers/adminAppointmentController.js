@@ -53,16 +53,34 @@ export const getAppointments = async (req, res) => {
     const limitNum = parseInt(limit, 10);
     const skip = (pageNum - 1) * limitNum;
 
+    // helper: build UTC day range from YYYY-MM-DD
+    const parseYmdToRange = (ymd) => {
+      const [y, m, d] = String(ymd).split("-").map(Number);
+      if (!y || !m || !d) return null;
+      const start = new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
+      const end = new Date(Date.UTC(y, m - 1, d + 1, 0, 0, 0, 0)); // exclusive
+      return { start, end };
+    };
+
     const where = { clinicId, deletedAt: null };
 
     if (status) where.status = status;
 
     if (date) {
-      where.slot = { date: new Date(date) };
+      const range = parseYmdToRange(date);
+      if (range) {
+        where.slot = { date: { gte: range.start, lt: range.end } };
+      }
     } else if (dateFrom || dateTo) {
       where.slot = { date: {} };
-      if (dateFrom) where.slot.date.gte = new Date(dateFrom);
-      if (dateTo) where.slot.date.lte = new Date(dateTo);
+      if (dateFrom) {
+        const rangeFrom = parseYmdToRange(dateFrom);
+        if (rangeFrom) where.slot.date.gte = rangeFrom.start;
+      }
+      if (dateTo) {
+        const rangeTo = parseYmdToRange(dateTo);
+        if (rangeTo) where.slot.date.lte = rangeTo.end;
+      }
     }
 
     if (doctor) where.doctorId = doctor;
@@ -93,6 +111,8 @@ export const getAppointments = async (req, res) => {
               paymentMode: true,
               type: true,
               price: true,
+              isBlocked: true,
+              blockedReason: true,
             },
           },
           logs: { orderBy: { createdAt: "desc" } },
@@ -102,7 +122,6 @@ export const getAppointments = async (req, res) => {
 
     const appointmentIds = appointments.map((a) => a.id);
 
-    // ✅ unread notifications for these appointments (CANCELLATION + RESCHEDULE)
     const unreadNotifs = appointmentIds.length
       ? await prisma.notification.findMany({
           where: {
@@ -122,7 +141,9 @@ export const getAppointments = async (req, res) => {
     );
 
     const unreadRescheduleSet = new Set(
-      unreadNotifs.filter((n) => n.type === "RESCHEDULE").map((n) => n.entityId)
+      unreadNotifs
+        .filter((n) => n.type === "RESCHEDULE")
+        .map((n) => n.entityId)
     );
 
     const formatted = appointments.map((app) => ({
@@ -149,7 +170,9 @@ export const getAppointments = async (req, res) => {
       slotType: app.slot?.type || null,
       price: app.slot?.price ?? null,
 
-      // ✅ per-appointment unread flags for UI
+      isSlotBlocked: app.slot?.isBlocked || false,
+      blockedReason: app.slot?.blockedReason || null,
+
       hasUnreadCancellation: unreadCancellationSet.has(app.id),
       hasUnreadReschedule: unreadRescheduleSet.has(app.id),
 
@@ -158,8 +181,12 @@ export const getAppointments = async (req, res) => {
         action: "RESCHEDULE_APPOINTMENT",
         changedBy: log.changedBy,
         timestamp: new Date(log.createdAt).toLocaleString(),
-        oldDate: log.oldDate ? new Date(log.oldDate).toLocaleDateString() : null,
-        newDate: log.newDate ? new Date(log.newDate).toLocaleDateString() : null,
+        oldDate: log.oldDate
+          ? new Date(log.oldDate).toLocaleDateString()
+          : null,
+        newDate: log.newDate
+          ? new Date(log.newDate).toLocaleDateString()
+          : null,
         oldTime: log.oldTime || null,
         newTime: log.newTime || null,
         reason: log.reason || null,
@@ -180,6 +207,7 @@ export const getAppointments = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
 
 // ----------------------------------------------------------------
 // UPDATE STATUS (Admin quick actions)

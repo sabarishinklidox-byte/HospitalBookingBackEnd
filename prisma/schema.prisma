@@ -167,6 +167,10 @@ model Slot {
   clinicId     String
   date         DateTime
   time         String
+  isBlocked     Boolean  @default(false)
+  blockedReason String?
+  blockedBy     String?
+  blockedAt     DateTime?
   duration     Int               @default(30)
   type         SlotType          @default(FREE)
   price        Decimal           @default(0)

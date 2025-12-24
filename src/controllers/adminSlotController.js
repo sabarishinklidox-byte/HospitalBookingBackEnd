@@ -147,43 +147,78 @@ export const createSlot = async (req, res) => {
 // ----------------------------------------------------------------
 // LIST SLOTS (unchanged logic)
 // ----------------------------------------------------------------
+// controllers/slotController.js
+
 export const getSlots = async (req, res) => {
   try {
     const { clinicId } = req.user;
-    const { doctorId, date } = req.query;
+    const { doctorId, date, page = 1, limit = 20 } = req.query;
 
     if (!doctorId) {
-      return res.status(400).json({ error: 'doctorId is required' });
+      return res.status(400).json({ error: "doctorId is required" });
     }
+
+    const pageNum = Number(page) || 1;
+    const limitNum = Number(limit) || 20;
+    const skip = (pageNum - 1) * limitNum;
+
+    if (!date) {
+      return res.status(400).json({ error: "date is required" });
+    }
+
+    // SAME range as user API
+    const start = new Date(`${date}T00:00:00+05:30`);
+    const end   = new Date(`${date}T23:59:59+05:30`);
 
     const where = {
       clinicId,
       doctorId,
       deletedAt: null,
+      date: { gte: start, lte: end },
     };
 
-    if (date) {
-      const d = new Date(date);
-      const startOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-      const endOfDay = new Date(
-        d.getFullYear(),
-        d.getMonth(),
-        d.getDate() + 1
-      );
-      where.date = { gte: startOfDay, lt: endOfDay };
-    }
+    const [total, slots] = await prisma.$transaction([
+      prisma.slot.count({ where }),
+      prisma.slot.findMany({
+        where,
+        orderBy: [{ date: "asc" }, { time: "asc" }],
+        skip,
+        take: limitNum,
+        include: {
+          appointments: {
+            where: {
+              deletedAt: null,
+              status: { in: ["PENDING", "CONFIRMED", "COMPLETED"] },
+            },
+            select: { id: true },
+          },
+        },
+      }),
+    ]); 
 
-    const slots = await prisma.slot.findMany({
-      where,
-      orderBy: [{ date: 'asc' }, { time: 'asc' }],
+    const data = slots.map((s) => ({
+      ...s,
+      isBooked: !!s.appointments,
+    }));
+
+    return res.json({
+      data,
+      pagination: {
+        total,
+        page: pageNum,
+        limit: limitNum,
+        totalPages: Math.max(1, Math.ceil(total / limitNum)),
+      },
     });
-
-    return res.json(slots);
   } catch (error) {
-    console.error('Get Slots Error:', error);
+    console.error("Get Slots Error:", error);
     return res.status(500).json({ error: error.message });
   }
 };
+
+
+
+
 
 // ----------------------------------------------------------------
 // UPDATE SLOT
@@ -583,42 +618,44 @@ export const getDoctorSlotsForReschedule = async (req, res, next) => {
 
 
 
-// GET /api/admin/doctors/:doctorId/slots?from=YYYY-MM-DD&days=7&excludeAppointmentId=...
 export const getDoctorSlotsWindow = async (req, res) => {
   try {
     const clinicId = req.user?.clinicId;
     const { doctorId } = req.params;
-    const { from, days = 7, excludeAppointmentId } = req.query;
+    const { from, days = 30, excludeAppointmentId } = req.query;
 
     if (!clinicId) return res.status(401).json({ error: "Unauthorized" });
     if (!doctorId) return res.status(400).json({ error: "Doctor ID is required" });
 
     const daysNum = Number(days);
-    if (!Number.isFinite(daysNum) || daysNum <= 0 || daysNum > 60) {
-      return res.status(400).json({ error: "days must be a valid number (1-60)" });
+    if (!Number.isFinite(daysNum) || daysNum <= 0 || daysNum > 365) {
+      return res.status(400).json({ error: "days must be 1-365" });
     }
 
-    const baseDateStr = from || new Date().toISOString().slice(0, 10);
-    const fromDate = new Date(baseDateStr);
-    if (Number.isNaN(fromDate.getTime())) {
+    // 🔥 Base date: construct from YYYY-MM-DD at UTC midnight
+    const baseDateStr = from || new Date().toISOString().slice(0, 10); // '2025-12-24'
+    const [y, m, d] = baseDateStr.split("-").map(Number);
+    if (!y || !m || !d) {
       return res.status(400).json({ error: "Invalid from date" });
     }
 
-    const start = new Date(fromDate);
-    start.setHours(0, 0, 0, 0);
-
+    const start = new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0)); // EXACT day start
     const endExclusive = new Date(start);
     endExclusive.setDate(endExclusive.getDate() + daysNum);
-    endExclusive.setHours(0, 0, 0, 0);
 
-    // ✅ fetch only appointment slots (hide BREAK/LUNCH) and compute isBooked like your getSlotsForUser
+    // "Today" and "Tomorrow" relative to window start
+    const todayStr = start.toISOString().slice(0, 10);
+    const tomorrowDate = new Date(start);
+    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+    const tomorrowStr = tomorrowDate.toISOString().slice(0, 10);
+
     const slots = await prisma.slot.findMany({
       where: {
         clinicId,
         doctorId,
         deletedAt: null,
-        status: "PENDING",       // if PENDING = available
-        kind: "APPOINTMENT",     // ✅ FIX: this hides lunch/break
+        isBlocked: false,
+        kind: "APPOINTMENT",
         date: { gte: start, lt: endExclusive },
       },
       orderBy: [{ date: "asc" }, { time: "asc" }],
@@ -630,26 +667,39 @@ export const getDoctorSlotsWindow = async (req, res) => {
             ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {}),
           },
           select: { id: true },
-          take: 1,
         },
       },
     });
 
-    // Labels: Today / Tomorrow / else formatted
-    const todayStr = new Date().toISOString().slice(0, 10);
-    const tomorrowDate = new Date();
-    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
-    const tomorrowStr = tomorrowDate.toISOString().slice(0, 10);
+    const isSlotPassedIst = (slotDateStr, slotTimeStr) => {
+      if (!slotDateStr || !slotTimeStr) return false;
+
+      const now = new Date();
+      const nowStr = now.toISOString().split("T")[0];
+
+      if (slotDateStr < nowStr) return true;
+      if (slotDateStr > nowStr) return false;
+
+      const [hours, minutes] = slotTimeStr.split(":").map(Number);
+      const currentHours = now.getHours();
+      const currentMinutes = now.getMinutes();
+
+      if (hours < currentHours) return true;
+      if (hours === currentHours && minutes <= currentMinutes) return true;
+      return false;
+    };
 
     const byDate = {};
 
     for (const s of slots) {
-      const d = s.date.toISOString().slice(0, 10);
+      const slotDateStr = s.date.toISOString().split("T")[0];
 
-      if (!byDate[d]) {
+      if (isSlotPassedIst(slotDateStr, s.time)) continue;
+
+      if (!byDate[slotDateStr]) {
         let label;
-        if (d === todayStr) label = "Today";
-        else if (d === tomorrowStr) label = "Tomorrow";
+        if (slotDateStr === todayStr) label = "Today";
+        else if (slotDateStr === tomorrowStr) label = "Tomorrow";
         else {
           label = s.date.toLocaleDateString("en-GB", {
             weekday: "short",
@@ -657,13 +707,12 @@ export const getDoctorSlotsWindow = async (req, res) => {
             month: "short",
           });
         }
-        byDate[d] = { date: d, label, slots: [] };
+        byDate[slotDateStr] = { date: slotDateStr, label, slots: [] };
       }
 
       const hour = parseInt(String(s.time).split(":")[0], 10);
       const period = hour < 12 ? "Morning" : hour < 17 ? "Afternoon" : "Evening";
 
-      // "09:30 AM"
       const [, mm] = String(s.time).split(":");
       const hour12 = ((hour + 11) % 12) + 1;
       const ampm = hour < 12 ? "AM" : "PM";
@@ -678,31 +727,35 @@ export const getDoctorSlotsWindow = async (req, res) => {
         endTime = `${eh}:${em}`;
       }
 
-      byDate[d].slots.push({
+      byDate[slotDateStr].slots.push({
         slotId: s.id,
+        isBlocked: false,
+        isPassed: false,
         period,
         timeLabel,
         startTime: s.time,
         endTime,
-        isBooked: (s.appointments?.length || 0) > 0, // ✅ modal expects this
+        isBooked: (s.appointments?.length || 0) > 0,
       });
     }
 
-    // ensure days without slots appear
     const daysArray = [];
     for (let i = 0; i < daysNum; i++) {
-      const d = new Date(start);
-      d.setDate(d.getDate() + i);
-      const dateStr = d.toISOString().slice(0, 10);
+      const dDate = new Date(start);
+      dDate.setDate(dDate.getDate() + i);
+      const dateStr = dDate.toISOString().slice(0, 10);
 
       if (byDate[dateStr]) {
-        daysArray.push(byDate[dateStr]);
+        const entry = byDate[dateStr];
+        if (dateStr === todayStr) entry.label = "Today";
+        else if (dateStr === tomorrowStr) entry.label = "Tomorrow";
+        daysArray.push(entry);
       } else {
         let label;
         if (dateStr === todayStr) label = "Today";
         else if (dateStr === tomorrowStr) label = "Tomorrow";
         else {
-          label = d.toLocaleDateString("en-GB", {
+          label = dDate.toLocaleDateString("en-GB", {
             weekday: "short",
             day: "2-digit",
             month: "short",
@@ -718,4 +771,225 @@ export const getDoctorSlotsWindow = async (req, res) => {
     return res.status(500).json({ error: "Failed to load slots" });
   }
 };
+;
 
+
+
+
+export const getManageableSlots = async (req, res) => {
+  try {
+    const { clinicId } = req.user;
+    const { doctorId, date } = req.query;
+
+    console.log('🔥 Slot Manager:', { clinicId, doctorId, date });
+
+    const where = {
+      clinicId,
+      deletedAt: null,
+    };
+
+    // 🔥 DATE FILTER (Today only by default)
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    if (date) {
+      const [year, month, day] = date.split('-').map(Number);
+      const start = new Date(year, month - 1, day, 0, 0, 0);
+      const end = new Date(year, month - 1, day, 23, 59, 59);
+      where.date = { gte: start, lte: end };
+    } else {
+      // Default: TODAY only
+      where.date = { gte: today, lte: new Date(today.getTime() + 24*60*60*1000 - 1) };
+    }
+
+    // 🔥 DOCTOR FILTER (optional)
+    if (doctorId) {
+      where.doctorId = doctorId;
+    }
+
+    const now = new Date(); // Current time for "passed" filter
+
+    const slots = await prisma.slot.findMany({
+      where,
+      include: {
+        doctor: { 
+          select: { 
+            id: true,
+            name: true 
+          } 
+        },
+        appointments: {
+          where: { 
+            deletedAt: null, 
+            status: { in: ['PENDING', 'CONFIRMED', 'PENDING_PAYMENT'] } 
+          },
+          select: { 
+            id: true,
+            // 🔥 FIXED: Use correct field (check your schema)
+            user: {
+              select: { name: true }
+            }
+          }
+        }
+      },
+      orderBy: [
+        { date: 'asc' },
+        { time: 'asc' }
+      ]
+    });
+
+    // 🔥 ENRICH WITH PASSED/NOT_PASSED STATUS
+    const formattedSlots = slots.map(slot => {
+      // Parse slot datetime
+      const slotDateTime = new Date(slot.date);
+      const [hours, minutes] = slot.time.split(':').map(Number);
+      slotDateTime.setHours(hours, minutes, 0, 0);
+
+      const isPassed = slotDateTime < now;
+      
+      return {
+        id: slot.id,
+        time: slot.time,
+        date: slot.date.toISOString().split('T')[0],
+        doctorName: slot.doctor?.name || 'Unknown Doctor',
+        doctorId: slot.doctor?.id,
+        price: slot.price || 0,
+        
+        // 🔥 BLOCK STATUS
+        isBlocked: Boolean(slot.isBlocked),
+        blockedReason: slot.blockedReason || null,
+        blockedBy: slot.blockedBy || null,
+        blockedAt: slot.blockedAt ? slot.blockedAt.toISOString() : null,
+        
+        // 🔥 APPOINTMENT STATUS
+        hasActiveAppointment: slot.appointments?.length > 0 || false,
+        patientName: slot.appointments?.[0]?.user?.name || null,
+        
+        // 🔥 🔥 NEW: TIME STATUS (CRUCIAL FOR MANAGER)
+        isPassed,  // true = PAST slot (grayed out)
+        slotDateTime: slotDateTime.toISOString(),  // Full datetime
+        
+        // 🔥 UTILIZATION STATUS
+        status: slot.isBlocked 
+          ? 'BLOCKED' 
+          : slot.hasActiveAppointment 
+          ? 'BOOKED' 
+          : isPassed 
+          ? 'PASSED' 
+          : 'AVAILABLE'  // Can be blocked!
+      };
+    });
+
+    // 🔥 FILTER: Only show AVAILABLE + BLOCKED slots (hide fully booked/passed)
+    const manageableSlots = formattedSlots.filter(slot => 
+      !slot.hasActiveAppointment &&  // Not booked
+      (slot.isBlocked || !slot.isPassed)  // Blocked OR still available
+    );
+
+    console.log(`✅ Found ${slots.length} total slots, ${manageableSlots.length} manageable`);
+
+    res.json({
+      success: true,
+      slots: manageableSlots,  // Only blockable slots
+      filters: { doctorId, date },
+      stats: {
+        totalSlots: slots.length,
+        manageableSlots: manageableSlots.length,
+        now: now.toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error('Slot Manager Error:', error);
+    res.status(500).json({ error: 'Failed to fetch slots' });
+  }
+};
+
+
+export const blockSlot = async (req, res) => {
+  try {
+    const { slotId } = req.params;
+    const { reason = 'Manual block' } = req.body;
+    const { clinicId, userId } = req.user;
+
+    console.log('🔴 BLOCKING SLOT:', { slotId, reason, clinicId });
+
+    const slot = await prisma.slot.update({
+      where: { 
+        id: slotId,
+        clinicId 
+      },
+      data: {
+        isBlocked: true,
+        blockedReason: reason,
+        blockedBy: userId,
+        blockedAt: new Date(),
+      },
+      include: {
+        doctor: { select: { name: true } }
+      }
+    });
+
+    res.json({
+      success: true,
+      message: `Slot blocked for ${slot.doctor.name} - ${slot.time}`,
+      slot: {
+        id: slot.id,
+        time: slot.time,
+        doctorName: slot.doctor.name,
+        isBlocked: true,
+        blockedReason: reason
+      }
+    });
+
+  } catch (error) {
+    console.error('Block Slot Error:', error);
+    if (error.code === 'P2025') {
+      return res.status(404).json({ error: 'Slot not found or not authorized' });
+    }
+    res.status(500).json({ error: 'Failed to block slot' });
+  }
+};
+
+export const unblockSlot = async (req, res) => {
+  try {
+    const { slotId } = req.params;
+    const { clinicId } = req.user;
+
+    console.log('🟢 UNBLOCKING SLOT:', { slotId, clinicId });
+
+    const slot = await prisma.slot.update({
+      where: { 
+        id: slotId,
+        clinicId 
+      },
+      data: {
+        isBlocked: false,
+        blockedReason: null,
+        blockedBy: null,
+        blockedAt: null,
+      },
+      include: {
+        doctor: { select: { name: true } }
+      }
+    });
+
+    res.json({
+      success: true,
+      message: `Slot unblocked for ${slot.doctor.name} - ${slot.time}`,
+      slot: {
+        id: slot.id,
+        time: slot.time,
+        doctorName: slot.doctor.name,
+        isBlocked: false
+      }
+    });
+
+  } catch (error) {
+    console.error('Unblock Slot Error:', error);
+    if (error.code === 'P2025') {
+      return res.status(404).json({ error: 'Slot not found or not authorized' });
+    }
+    res.status(500).json({ error: 'Failed to unblock slot' });
+  }
+};

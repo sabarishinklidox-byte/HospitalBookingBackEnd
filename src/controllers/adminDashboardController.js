@@ -2,7 +2,7 @@
 import prisma from '../prisma.js';
 
 export const getAdminDashboard = async (req, res) => {
-  console.log('>>> getAdminDashboard v2 running, with bookingUrl');
+  console.log('>>> getAdminDashboard v3 - TOTAL UNBOOKED + ENV ✅');
   try {
     const { clinicId } = req.user;
 
@@ -30,10 +30,10 @@ export const getAdminDashboard = async (req, res) => {
 
     const plan = clinicWithSub.subscription?.plan || null;
 
-    // 1.1 SaaS booking URL for this clinic - FIXED
+    // 1.1 SaaS booking URL - ENV with SAFE FALLBACK ✅
     const appBaseUrl = process.env.CLIENT_URL || 'http://localhost:5173';
-    console.log('DEBUG - CLIENT_URL:', process.env.CLIENT_URL); // Remove after testing
-    console.log('DEBUG - appBaseUrl:', appBaseUrl); // Remove after testing
+    console.log('DEBUG - CLIENT_URL:', process.env.CLIENT_URL || 'USING FALLBACK');
+    console.log('✅ Final appBaseUrl:', appBaseUrl);
     const publicBookingUrl = `${appBaseUrl}/visit/${clinicWithSub.id}`;
 
     // 2. Date ranges (server local time)
@@ -60,7 +60,7 @@ export const getAdminDashboard = async (req, res) => {
       },
     });
 
-    // 4. Today's Appointments (non‑cancelled)
+    // 4. Today's Appointments (non-cancelled)
     const todayAppointments = await prisma.appointment.count({
       where: {
         clinicId,
@@ -75,7 +75,7 @@ export const getAdminDashboard = async (req, res) => {
       },
     });
 
-    // 5. Yesterday's Appointments (non‑cancelled)
+    // 5. Yesterday's Appointments (non-cancelled)
     const yesterdayAppointments = await prisma.appointment.count({
       where: {
         clinicId,
@@ -113,7 +113,7 @@ export const getAdminDashboard = async (req, res) => {
         clinicId,
         deletedAt: null,
         slot: {
-          date: { gte: yesterdayStart, lte: yesterdayEnd },
+          date: { gte: yesterdayStart, lte: todayEnd },
         },
         status: 'COMPLETED',
       },
@@ -150,7 +150,7 @@ export const getAdminDashboard = async (req, res) => {
       },
     });
 
-    // 9.1 Status‑wise totals
+    // 9.1 Status-wise totals
     const [
       totalBookings,
       totalPending,
@@ -179,7 +179,7 @@ export const getAdminDashboard = async (req, res) => {
       }),
     ]);
 
-    // 10. Slot‑level metrics (today): open + expired‑unbooked
+    // 🔥 10. Slot-level metrics (today): TOTAL + breakdown
     const occupyingStatuses = [
       'PENDING',
       'PENDING_PAYMENT',
@@ -209,6 +209,7 @@ export const getAdminDashboard = async (req, res) => {
 
     let openSlotsToday = 0;
     let expiredUnbookedSlotsToday = 0;
+    let totalUnbookedSlotsToday = 0;  // 🔥 NEW - TOTAL unbooked today
 
     for (const slot of todaySlots) {
       const hasActiveAppointment =
@@ -220,13 +221,22 @@ export const getAdminDashboard = async (req, res) => {
 
       const isPassed = slotDate < now;
 
-      if (!hasActiveAppointment && !isPassed) {
-        openSlotsToday += 1;
-      }
-      if (!hasActiveAppointment && isPassed) {
-        expiredUnbookedSlotsToday += 1;
+      if (!hasActiveAppointment) {
+        totalUnbookedSlotsToday += 1;  // 🔥 COUNT ALL unbooked
+        if (!isPassed) {
+          openSlotsToday += 1;  // Future available
+        } else {
+          expiredUnbookedSlotsToday += 1;  // Past missed
+        }
       }
     }
+
+    console.log('🔥 SLOTS:', { 
+      openSlotsToday, 
+      expiredUnbookedSlotsToday, 
+      totalUnbookedSlotsToday,
+      totalSlotsToday: todaySlots.length 
+    });
 
     // 11. Response
     return res.json({
@@ -251,6 +261,7 @@ export const getAdminDashboard = async (req, res) => {
 
       openSlotsToday,
       expiredUnbookedSlotsToday,
+      totalUnbookedSlotsToday,  // 🔥 NEW
     });
   } catch (error) {
     console.error('Dashboard Error:', error);
