@@ -41,7 +41,7 @@ export const doctorLogin = async (req, res) => {
         doctorId: doctor.id 
       },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '6h' }
     );
 
     // ✅ LOG AUDIT

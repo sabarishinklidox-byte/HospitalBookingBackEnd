@@ -10,7 +10,11 @@ export const getClinics = async (req, res) => {
 
     const clinics = await prisma.clinic.findMany({
       where: {
-        isActive: true,
+        // ✅ 1. LANDING PAGE RULE:
+        // Must be Active (Open) AND Public (Visible)
+        isActive: true, 
+        isPublic: true, // 👈 ADD THIS (Assumes you added isPublic to Schema)
+        
         deletedAt: null,
         ...(city
           ? { city: { equals: city, mode: 'insensitive' } }
@@ -29,7 +33,7 @@ export const getClinics = async (req, res) => {
       select: {
         id: true,
         name: true,
-        phone: true, // ✅ ADDED
+        phone: true,
         city: true,
         timings: true,
         address: true,
@@ -52,6 +56,9 @@ export const getClinics = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
+
+
 
 
 

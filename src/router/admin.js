@@ -75,30 +75,32 @@ import {
 
 
 import { upload } from '../middleware/upload.js';
-
+import { requireActiveSubscription } from '../middleware/subscription.js';
 const router = express.Router();
 
 // ---------------- Auth ----------------
 router.post('/login', adminLogin);
 
-// ---------------- Dashboard ----------------
+// ---------------- Dashboard (OPEN - View Only) ----------------
 router.get('/dashboard', authMiddleware, requireAdmin, getAdminDashboard);
 
-// ---------------- Doctors ----------------
+// ---------------- Doctors (RESTRICTED WRITE) ----------------
 router.post(
   '/doctors',
   authMiddleware,
   requireAdmin,
+  requireActiveSubscription, // 🔒 BLOCKED
   upload.single('avatar'),
   createDoctor
 );
 
-router.get('/doctors', authMiddleware, requireAdmin, getDoctors);
+router.get('/doctors', authMiddleware, requireAdmin, getDoctors); // ✅ Open (View only)
 
 router.put(
   '/doctors/:id',
   authMiddleware,
   requireAdmin,
+  requireActiveSubscription, // 🔒 BLOCKED
   upload.single('avatar'),
   updateDoctor
 );
@@ -107,38 +109,44 @@ router.patch(
   '/doctors/:id/toggle',
   authMiddleware,
   requireAdmin,
+  requireActiveSubscription, // 🔒 BLOCKED
   toggleDoctorActive
 );
 
-// ---------------- Slots ----------------
-router.post('/slots', authMiddleware, requireAdmin, createSlot);
-router.post('/slots/bulk', authMiddleware, requireAdmin, createBulkSlots);
-router.get('/slots', authMiddleware, requireAdmin, getSlots);
-router.put('/slots/:id', authMiddleware, requireAdmin, updateSlot);
-router.delete('/slots/:id', authMiddleware, requireAdmin, deleteSlot);
+// ---------------- Slots (RESTRICTED WRITE) ----------------
+router.post('/slots', authMiddleware, requireAdmin, requireActiveSubscription, createSlot); // 🔒
+router.post('/slots/bulk', authMiddleware, requireAdmin, requireActiveSubscription, createBulkSlots); // 🔒
+router.get('/slots', authMiddleware, requireAdmin, getSlots); // ✅ Open
+router.put('/slots/:id', authMiddleware, requireAdmin, requireActiveSubscription, updateSlot); // 🔒
+router.delete('/slots/:id', authMiddleware, requireAdmin, requireActiveSubscription, deleteSlot); // 🔒
 
-// doctor slots window for reschedule UI (Today/Tomorrow/next days)
+// Slot Management
+router.get('/slots/manage', authMiddleware, requireAdmin, getManageableSlots); // ✅ Open
+router.post('/slots/:slotId/block', authMiddleware, requireAdmin, requireActiveSubscription, blockSlot); // 🔒
+router.post('/slots/:slotId/unblock', authMiddleware, requireAdmin, requireActiveSubscription, unblockSlot); // 🔒
+
 router.get(
   '/doctors/:doctorId/slots',
   authMiddleware,
   requireAdmin,
-  getDoctorSlotsWindow   // or getDoctorSlotsForReschedule if you prefer that logic
+  getDoctorSlotsWindow
 );
 
-// ---------------- Appointments ----------------
-router.get('/appointments', authMiddleware, requireAdmin, getAppointments);
+// ---------------- Appointments (PARTIALLY RESTRICTED) ----------------
+router.get('/appointments', authMiddleware, requireAdmin, getAppointments); // ✅ Open
 
 router.patch(
   '/appointments/:id/cancel',
   authMiddleware,
   requireAdmin,
-  cancelAppointment
+  cancelAppointment // ✅ Open (Allow cleanup)
 );
 
 router.patch(
   '/appointments/:id/status',
   authMiddleware,
   requireAdmin,
+  requireActiveSubscription, // 🔒 BLOCKED (Cannot complete visits)
   updateAppointmentStatus
 );
 
@@ -149,25 +157,19 @@ router.get(
   getAppointmentDetails
 );
 
-// ✅ Reschedule (no extra /admin segment)
 router.patch(
   '/appointments/:id/reschedule',
   authMiddleware,
   requireAdmin,
+  requireActiveSubscription, // 🔒 BLOCKED (Cannot rebook)
   rescheduleAppointmentByAdmin
 );
 
-// ---------------- Payments ----------------
+// ---------------- Payments (History - OPEN) ----------------
 router.get('/payments', authMiddleware, requireAdmin, getPayments);
+router.get('/payments/summary', authMiddleware, requireAdmin, getPaymentsSummary);
 
-router.get(
-  '/payments/summary',
-  authMiddleware,
-  requireAdmin,
-  getPaymentsSummary
-);
-
-// ---------------- Patients ----------------
+// ---------------- Patients (History - OPEN) ----------------
 router.get(
   '/patients/:userId/history',
   authMiddleware,
@@ -175,7 +177,8 @@ router.get(
   getPatientHistory
 );
 
-// ---------------- Profile & Settings ----------------
+// ---------------- Profile & Settings (OPEN) ----------------
+// Keep these open so they can update contact info or fix payment gateways
 router.get('/profile', authMiddleware, requireAdmin, getAdminProfile);
 router.patch('/profile', authMiddleware, requireAdmin, updateAdminProfile);
 
@@ -190,43 +193,27 @@ router.patch(
   updateClinicSettings
 );
 
-router.get(
-  '/payment-settings',
-  authMiddleware,
-  requireAdmin,
-  getGatewayConfig
-);
+router.get('/payment-settings', authMiddleware, requireAdmin, getGatewayConfig);
+router.get('/payment-settings/active', authMiddleware, requireAdmin, getActiveGatewayForClinic);
+router.post('/payment-settings', authMiddleware, requireAdmin, updateGatewayConfig);
 
-router.get(
-  '/payment-settings/active',
-  authMiddleware,
-  requireAdmin,
-  getActiveGatewayForClinic
-);
-
-router.post(
-  '/payment-settings',
-  authMiddleware,
-  requireAdmin,
-  updateGatewayConfig
-);
-
-// ---------------- Reviews ----------------
+// ---------------- Reviews (OPEN) ----------------
 router.get('/reviews', authMiddleware, requireAdmin, getClinicReviews);
 
-// ---------------- Audit logs ----------------
-  router.get(
-    '/audit-logs',
-    authMiddleware,
-    requireAdminOrSuperAdmin,
-    getAuditLogs
-  );
+// ---------------- Audit logs (OPEN) ----------------
+router.get(
+  '/audit-logs',
+  authMiddleware,
+  requireAdminOrSuperAdmin,
+  getAuditLogs
+);
 
-// ---------------- Analytics ----------------
+// ---------------- Analytics (RESTRICTED - Premium) ----------------
 router.get(
   '/analytics/bookings',
   authMiddleware,
   requireAdmin,
+  requireActiveSubscription, // 🔒 BLOCKED
   getClinicBookingsStats
 );
 
@@ -234,14 +221,16 @@ router.get(
   '/analytics/slots-usage',
   authMiddleware,
   requireAdmin,
+  requireActiveSubscription, // 🔒 BLOCKED
   getClinicSlotsUsageStats
 );
 
-// ---------------- Exports ----------------
+// ---------------- Exports (RESTRICTED - Premium) ----------------
 router.get(
   '/appointments/export/excel',
   authMiddleware,
   requireAdmin,
+  requireActiveSubscription, // 🔒 BLOCKED
   exportAppointmentsExcel
 );
 
@@ -249,10 +238,12 @@ router.get(
   '/appointments/export/pdf',
   authMiddleware,
   requireAdmin,
+  requireActiveSubscription, // 🔒 BLOCKED
   exportAppointmentsPdf
 );
 
-// ---------------- Subscription & misc ----------------
+// ---------------- Subscription (OPEN - Critical) ----------------
+// Must be open so they can pay to unlock account
 router.post(
   '/subscription/upgrade',
   authMiddleware,
@@ -260,47 +251,22 @@ router.post(
   upgradeClinicPlan
 );
 
+// Google Rating Refresh (Restrict to prevent spam if expired)
 router.post(
   '/clinic/google-rating/refresh',
   authMiddleware,
   requireAdmin,
+  requireActiveSubscription, // 🔒 BLOCKED
   refreshClinicGoogleRating
 );
-// ---------------- Notifications ----------------
-router.get(
-  '/notifications',
-  authMiddleware,
-  requireAdmin,
-  getNotifications
-);
 
-router.get(
-  '/notifications/unread-count',
-  authMiddleware,
-  requireAdmin,
-  getUnreadCount
-);
-
-router.patch(
-  '/notifications/mark-all-read',
-  authMiddleware,
-  requireAdmin,
-  markAllRead
-);
-
-router.patch(
-  '/notifications/mark-read',
-  authMiddleware,
-  requireAdmin,
-  markReadByIds
-);
-router.patch('/notifications/mark-read-by-entity',  authMiddleware,
-  requireAdmin, markReadByEntity);
-
-
-router.get('/slots/manage', authMiddleware, requireAdmin,getManageableSlots );
-router.post('/slots/:slotId/block',authMiddleware, requireAdmin, blockSlot);
-router.post('/slots/:slotId/unblock', authMiddleware, requireAdmin,unblockSlot);
-
+// ---------------- Notifications (OPEN) ----------------
+router.get('/notifications', authMiddleware, requireAdmin, getNotifications);
+router.get('/notifications/unread-count', authMiddleware, requireAdmin, getUnreadCount);
+router.patch('/notifications/mark-all-read', authMiddleware, requireAdmin, markAllRead);
+router.patch('/notifications/mark-read', authMiddleware, requireAdmin, markReadByIds);
+router.patch('/notifications/mark-read-by-entity', authMiddleware, requireAdmin, markReadByEntity);
 
 export default router;
+
+

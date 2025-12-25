@@ -5,7 +5,7 @@ import { logAudit } from '../utils/audit.js';
 // ----------------------------------------------------------------
 // Helper: Get current plan for a clinic
 // ----------------------------------------------------------------
-async function getClinicPlan(clinicId) {
+async function getClinicSubscription(clinicId) { // <--- Renamed Function
   if (!clinicId) return null;
   const clinic = await prisma.clinic.findUnique({
     where: { id: clinicId },
@@ -15,7 +15,7 @@ async function getClinicPlan(clinicId) {
       },
     },
   });
-  return clinic?.subscription?.plan || null; 
+  return clinic?.subscription || null; // <--- Returns Subscription (with start date)
 }
 
 // ----------------------------------------------------------------
@@ -23,7 +23,7 @@ async function getClinicPlan(clinicId) {
 // ----------------------------------------------------------------
 export const getAdminProfile = async (req, res) => {
   try {
-    // 1. Get ID from token (Handle both 'id' and 'userId' formats)
+    // 1. Get ID from token
     const userId = req.user.id || req.user.userId;
 
     if (!userId) {
@@ -39,7 +39,7 @@ export const getAdminProfile = async (req, res) => {
         email: true,
         phone: true,
         role: true,
-        clinicId: true, // ✅ We get clinicId directly from User
+        clinicId: true,
         deletedAt: true,
       },
     });
@@ -48,12 +48,9 @@ export const getAdminProfile = async (req, res) => {
       return res.status(404).json({ error: 'User account not found.' });
     }
 
-    // 3. Resolve Clinic ID
-    // ❌ REMOVED: The fallback to prisma.admin because that table doesn't exist
     const resolvedClinicId = user.clinicId;
 
     if (!resolvedClinicId) {
-       // Valid user, but no clinic linked
        return res.json({ admin: user, clinic: null, plan: null });
     }
 
@@ -74,7 +71,6 @@ export const getAdminProfile = async (req, res) => {
         googleMapsUrl: true,
         googleReviewsEmbedCode: true,
         googleRating: true,
-        // Bank Details
         bankName: true,
         accountNumber: true,
         ifscCode: true,
@@ -86,18 +82,26 @@ export const getAdminProfile = async (req, res) => {
       return res.status(404).json({ error: 'Clinic not found or inactive.' });
     }
 
-    // 5. Fetch Plan
-    const plan = await getClinicPlan(resolvedClinicId);
+    // 5. Fetch Subscription using the NEW function name
+    const subscription = await getClinicSubscription(resolvedClinicId); // <--- FIXED HERE
 
     delete user.deletedAt;
     delete clinic.deletedAt;
 
+    // Attach subscription to clinic object so frontend finds it
+    if (subscription) {
+        clinic.subscription = subscription;
+    }
+
     // Return merged data
-    return res.json({ admin: user, clinic, plan });
+    return res.json({ 
+        admin: user, 
+        clinic, 
+        plan: subscription?.plan || null // Backward compatibility
+    });
 
   } catch (error) {
     console.error('Get Admin Profile Error:', error);
-    // Return actual error message for debugging instead of generic 500
     return res.status(500).json({ error: error.message });
   }
 };
@@ -241,9 +245,8 @@ export const updateClinicSettings = async (req, res) => {
     const bannerFile = req.files?.banner?.[0];
 
     const baseUrl = process.env.APP_BASE_URL || `http://localhost:${process.env.PORT || 5000}`;
-
-    if (logoFile) data.logo = `${baseUrl}/uploads/${logoFile.filename}`;
-    if (bannerFile) data.banner = `${baseUrl}/uploads/${bannerFile.filename}`;
+if (logoFile) data.logo = `/uploads/${logoFile.filename}`;
+if (bannerFile) data.banner = `/uploads/${bannerFile.filename}`;
 
     // 4. Update Clinic
     const clinic = await prisma.clinic.update({

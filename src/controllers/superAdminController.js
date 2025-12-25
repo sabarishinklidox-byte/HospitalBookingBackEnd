@@ -752,6 +752,54 @@ export const listClinicsForAdmin = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+// PATCH /api/super-admin/clinics/:id/toggle-public
+export const toggleClinicVisibility = async (req, res) => {
+  const { id } = req.params; // Note: if route uses :id, this is correct. If :clinicId, use clinicId.
+  const { isPublic } = req.body; 
+
+  try {
+    // 1. Update the Clinic
+    const updatedClinic = await prisma.clinic.update({
+      where: { id }, // Make sure this ID is valid
+      data: { isPublic },
+    });
+
+    // 2. Log Audit (Using your helper function pattern)
+    try {
+      await logAudit({
+        userId: req.user.userId || req.user.id, // Get ID safely
+        clinicId: id,
+        action: isPublic ? "MAKE_PUBLIC" : "MAKE_PRIVATE", // or ACTIONS.UPDATE_VISIBILITY
+        entity: "Clinic",
+        entityId: id,
+        req: req, // Pass request object if your helper uses it for IP
+        details: { // Optional extra details if your helper supports it
+          previousState: !isPublic,
+          newState: isPublic,
+          clinicName: updatedClinic.name
+        }
+      });
+    } catch (e) {
+      // Don't fail the request if logging fails, just log to console
+      console.error("Audit Logging Error:", e.message); 
+    }
+
+    res.json({
+      success: true,
+      message: `Clinic visibility updated to: ${isPublic ? 'Public' : 'Private'}`,
+      data: updatedClinic
+    });
+
+  } catch (error) {
+    console.error("Super Admin Toggle Error:", error);
+    // Return 404 if ID is wrong (common Prisma error code P2025)
+    if (error.code === 'P2025') {
+        return res.status(404).json({ error: "Clinic not found" });
+    }
+    res.status(500).json({ error: "Failed to update status." });
+  }
+};
+
  // or prisma.$queryRaw`...` style
 export const getGlobalBookingsStats = async (req, res) => {
   try {

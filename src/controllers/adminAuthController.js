@@ -40,7 +40,7 @@ export const adminLogin = async (req, res) => {
     const token = jwt.sign(
       { userId: user.id, role: user.role, clinicId: user.clinicId },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '6h' }
     );
 
     // Optional: Log Audit

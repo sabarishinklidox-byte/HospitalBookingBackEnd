@@ -17,7 +17,7 @@ import {
   incrementClinicLinkClicks,
   toggleClinicStatus,
   toggleAuditPermission,
-  getClinicAdminById,
+  getClinicAdminById,toggleClinicVisibility 
 } from '../controllers/superAdminController.js';
 import {
   listPlans,
@@ -52,6 +52,12 @@ router.patch(
   authMiddleware,
   requireSuperAdmin,
   toggleAuditPermission
+);
+router.patch(
+  '/clinics/:id/toggle-public', // :id refers to the Clinic ID
+  authMiddleware,               // 1. Verify Token (sets req.user)
+  requireSuperAdmin,            // 2. Verify Role (checks SUPER_ADMIN)
+  toggleClinicVisibility        // 3. Execute Controller
 );
 
 router.post(

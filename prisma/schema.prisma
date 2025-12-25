@@ -109,13 +109,14 @@ model Clinic {
   pincode                String
   timings                Json
   details                String?
-  accountNumber          String
-  ifscCode               String
-  bankName               String
+  accountNumber          String?
+ifscCode               String?
+bankName               String?
   createdAt              DateTime         @default(now())
   updatedAt              DateTime         @updatedAt
   allowAuditView         Boolean          @default(false)
   isActive               Boolean          @default(true)
+    isPublic    Boolean  @default(true) 
   deletedAt              DateTime?
   linkClicks             Int              @default(0)
   googleMapsUrl          String?
