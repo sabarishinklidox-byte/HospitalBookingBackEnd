@@ -140,24 +140,33 @@ bankName               String?
 }
 
 model Doctor {
-  id           String           @id @default(uuid())
-  slug         String           @unique
+  id           String   @id @default(uuid())
+  slug         String   @unique
   name         String
   avatar       String?
-  speciality   DoctorSpeciality
+  
+  // 2. ❌ Remove this line:
+  // speciality DoctorSpeciality
+
+  // 3. ✅ Add these lines to link to the new table:
+  specialityId String?
+  speciality   Speciality? @relation(fields: [specialityId], references: [id])
+
   phone        String
   experience   Int
   clinicId     String
-  isActive     Boolean          @default(true)
-  createdAt    DateTime         @default(now())
-  updatedAt    DateTime         @updatedAt
+  isActive     Boolean  @default(true)
+  
+  // ... rest of your fields (appointments, clinic, etc.) remain the same
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
   deletedAt    DateTime?
   appointments Appointment[]
-  clinic       Clinic           @relation(fields: [clinicId], references: [id])
+  clinic       Clinic   @relation(fields: [clinicId], references: [id])
   payments     Payment[]
   reviews      Review[]
   slots        Slot[]
-  user         User?            @relation("DoctorUser")
+  user         User?    @relation("DoctorUser")
 
   @@map("doctors")
 }
@@ -260,6 +269,7 @@ model AppointmentLog {
   oldTime       String
   newDate       DateTime
   newTime       String
+    metadata      Json?  
   reason        String?
   changedBy     String
   createdAt     DateTime    @default(now())
@@ -366,17 +376,18 @@ enum SubscriptionStatus {
   TRIAL
 }
 
-enum DoctorSpeciality {
-  DENTIST
-  CARDIOLOGIST
-  NEUROLOGIST
-  ORTHOPEDIC
-  GYNECOLOGIST
-  PEDIATRICIAN
-  DERMATOLOGIST
-  OPHTHALMOLOGIST
-  GENERAL_PHYSICIAN
-  OTHER
+model Speciality {
+  id          String   @id @default(uuid())
+  name        String   @unique  // e.g. "Dentist", "Cardiologist"
+  description String?
+  isActive    Boolean  @default(true)
+  
+  doctors     Doctor[] // Relation to doctors
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("specialities")
 }
 
 enum BookingSection {

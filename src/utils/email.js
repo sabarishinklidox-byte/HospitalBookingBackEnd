@@ -1,8 +1,7 @@
-// utils/email.js
 import nodemailer from 'nodemailer';
 import prisma from '../prisma.js';
 
-// ✅ robust enum import (works in ESM even if @prisma/client is CommonJS)
+// ✅ Robust enum import
 import prismaPkg from '@prisma/client';
 const { Role } = prismaPkg;
 
@@ -18,19 +17,28 @@ const transporter = nodemailer.createTransport({
 
 export const sendBookingEmails = async (appointmentData) => {
   try {
-    const { clinic, doctor, slot, user, type = 'BOOKING', oldSlot } = appointmentData;
+    const { 
+      clinic, 
+      doctor, 
+      slot, 
+      user, 
+      type = 'BOOKING', 
+      oldSlot,
+      customMessage, // 💰 Financial Message passed from Controller
+      clinicPhone    // 📞 Clinic Phone passed from Controller
+    } = appointmentData;
 
-    // ✅ Clinic admin (Role enum)
+    // 1. Fetch Clinic Admin
     const clinicAdmin = await prisma.user.findFirst({
       where: {
         clinicId: clinic.id,
-        role: Role.CLINIC_ADMIN, // ✅ FIX: enum, not "CLINIC_ADMIN"
+        role: Role.CLINIC_ADMIN,
         deletedAt: null,
       },
       select: { email: true, name: true },
     });
 
-    // ✅ Doctor user (use findFirst so we can filter deletedAt)
+    // 2. Fetch Doctor User
     const doctorUser = await prisma.user.findFirst({
       where: {
         doctorId: doctor.id,
@@ -52,6 +60,10 @@ export const sendBookingEmails = async (appointmentData) => {
     const subjectDoctor = isReschedule
       ? `🔄 Rescheduled Appointment - ${user?.name || 'Patient'}`
       : `📅 Appointment Request - ${user?.name || 'Patient'}`;
+
+    const subjectPatient = isReschedule
+      ? `📅 Appointment Rescheduled - Dr. ${doctor?.name}`
+      : `📅 Appointment Confirmation - Dr. ${doctor?.name}`;
 
     const fmtDate = (d) => (d ? new Date(d).toLocaleDateString('en-IN') : 'N/A');
 
@@ -95,7 +107,7 @@ export const sendBookingEmails = async (appointmentData) => {
       </table>
     `;
 
-    // --- BOOKING DETAILS ---
+    // --- 1. BOOKING DETAILS HTML ---
     const bookingRows = `
       <div style="font-size:14px;color:#111827;line-height:1.6;">
         <div><strong>Patient:</strong> ${user?.name || 'Patient'} <span style="color:#667085;">(${user?.phone || 'N/A'})</span></div>
@@ -107,7 +119,7 @@ export const sendBookingEmails = async (appointmentData) => {
       </div>
     `;
 
-    // --- RESCHEDULE DETAILS ---
+    // --- 2. RESCHEDULE DETAILS HTML ---
     const rescheduleRows = `
       <div style="font-size:14px;color:#111827;line-height:1.6;">
         <div><strong>Patient:</strong> ${user?.name || 'Patient'} <span style="color:#667085;">(${user?.phone || 'N/A'})</span></div>
@@ -123,13 +135,30 @@ export const sendBookingEmails = async (appointmentData) => {
           <div>${fmtDate(slot?.date)} at ${slot?.time || 'N/A'}</div>
         </div>
 
-        <div style="margin-top:12px;font-weight:bold;color:#d97706;">Status: PENDING</div>
+        ${/* 💰 Financial Logic Display */ ''}
+        ${customMessage ? `
+          <div style="margin-top:12px;padding:12px;border-radius:8px;background:#f0f9ff;border-left:4px solid #0284c7;color:#0c4a6e;">
+            <strong>💰 Payment Update:</strong><br/>
+            ${customMessage}
+          </div>
+        ` : ''}
+
+        ${/* 📞 Contact Display */ ''}
+        ${clinicPhone ? `
+          <div style="margin-top:12px;font-size:12px;color:#64748b;">
+            Questions? Contact Clinic: <strong>${clinicPhone}</strong>
+          </div>
+        ` : ''}
+
+        <div style="margin-top:12px;font-weight:bold;color:#d97706;">Status: RESCHEDULED</div>
       </div>
     `;
 
     const htmlContent = commonCard(isReschedule ? rescheduleRows : bookingRows);
 
     // --- SEND EMAILS ---
+    
+    // 1. To Admin
     if (clinicAdmin?.email) {
       emails.push(
         transporter.sendMail({
@@ -140,11 +169,23 @@ export const sendBookingEmails = async (appointmentData) => {
       );
     }
 
+    // 2. To Doctor
     if (doctorUser?.email) {
       emails.push(
         transporter.sendMail({
           to: doctorUser.email,
           subject: subjectDoctor,
+          html: htmlContent,
+        })
+      );
+    }
+
+    // 3. ✅ To Patient (Crucial for Financial Updates)
+    if (user?.email) {
+      emails.push(
+        transporter.sendMail({
+          to: user.email,
+          subject: subjectPatient,
           html: htmlContent,
         })
       );

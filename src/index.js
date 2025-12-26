@@ -54,11 +54,14 @@ app.use(cors({
       env: process.env.NODE_ENV || 'development'
     });
   });
-  cron.schedule('0 0 * * *', () => {
-  console.log('Running daily subscription check...');
-  runExpirationCheck(); // Calls the function automatically
-});
-
+cron.schedule(
+  '0 * * * *',                // at minute 0 of every hour
+  () => {
+    console.log('Running hourly subscription check...');
+    runExpirationCheck();
+  },
+  { timezone: 'Asia/Kolkata' } // your production timezone
+);
   // ✅ 404 handler
   app.use('*', (req, res) => {
     res.status(404).json({ error: 'Route not found' });

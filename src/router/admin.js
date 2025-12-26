@@ -56,6 +56,13 @@ import {
   updateClinicSettings,
  
 } from '../controllers/adminProfileController.js';
+import { 
+  createSpeciality, 
+  getAllSpecialities, 
+  getSpecialityById, 
+  updateSpeciality, 
+  deleteSpeciality 
+} from '../controllers/specialitycontroller.js';
 
 import { getClinicReviews } from '../controllers/adminReviewController.js';
 import { getAuditLogs } from '../controllers/auditController.js';
@@ -112,7 +119,33 @@ router.patch(
   requireActiveSubscription, // 🔒 BLOCKED
   toggleDoctorActive
 );
+router.get('/specialities', authMiddleware, requireAdmin, getAllSpecialities);
+router.get('/specialities/:id', authMiddleware, requireAdmin, getSpecialityById);
 
+// WRITE is restricted to active subscriptions
+router.post(
+  '/specialities', 
+  authMiddleware, 
+  requireAdmin, 
+  requireActiveSubscription, 
+  createSpeciality
+);
+
+router.put(
+  '/specialities/:id', 
+  authMiddleware, 
+  requireAdmin, 
+  requireActiveSubscription, 
+  updateSpeciality
+);
+
+router.delete(
+  '/specialities/:id', 
+  authMiddleware, 
+  requireAdmin, 
+  requireActiveSubscription, 
+  deleteSpeciality
+);
 // ---------------- Slots (RESTRICTED WRITE) ----------------
 router.post('/slots', authMiddleware, requireAdmin, requireActiveSubscription, createSlot); // 🔒
 router.post('/slots/bulk', authMiddleware, requireAdmin, requireActiveSubscription, createBulkSlots); // 🔒

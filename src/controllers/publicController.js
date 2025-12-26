@@ -6,47 +6,44 @@ import prisma from '../prisma.js';
 // ----------------------------------------------------------------
 export const getClinics = async (req, res) => {
   try {
-    const { q, city } = req.query; // q = search text
+    const { q, city } = req.query;
 
     const clinics = await prisma.clinic.findMany({
       where: {
-        // ✅ 1. LANDING PAGE RULE:
-        // Must be Active (Open) AND Public (Visible)
         isActive: true, 
-        isPublic: true, // 👈 ADD THIS (Assumes you added isPublic to Schema)
-        
+        isPublic: true,
         deletedAt: null,
-        ...(city
-          ? { city: { equals: city, mode: 'insensitive' } }
-          : {}),
-        ...(q
-          ? {
-              OR: [
-                { name: { contains: q, mode: 'insensitive' } },
-                { address: { contains: q, mode: 'insensitive' } },
-                { city: { contains: q, mode: 'insensitive' } },
-                { pincode: { contains: q, mode: 'insensitive' } },
-              ],
-            }
-          : {}),
+        ...(city ? { city: { equals: city, mode: 'insensitive' } } : {}),
+        ...(q ? {
+          OR: [
+            { name: { contains: q, mode: 'insensitive' } },
+            { address: { contains: q, mode: 'insensitive' } },
+            { city: { contains: q, mode: 'insensitive' } },
+            { pincode: { contains: q, mode: 'insensitive' } },
+          ],
+        } : {}),
       },
-      select: {
-        id: true,
-        name: true,
-        phone: true,
-        city: true,
-        timings: true,
-        address: true,
-        pincode: true,
-        details: true,
-        logo: true,
-        banner: true,
-        googlePlaceId: true,
-        googleMapsUrl: true,
-        googleReviewsEmbedCode: true,
-        googleRating: true,
-        googleTotalReviews: true,
-      },
+    select: {
+  id: true,
+  name: true,
+  phone: true,
+  city: true,
+  timings: true,
+  address: true,
+  pincode: true,
+  details: true,
+  logo: true,
+  banner: true,
+  googlePlaceId: true,
+  googleMapsUrl: true,           // ✅ EXISTS
+  googleReviewsEmbedCode: true,
+  googleRating: true,
+  googleTotalReviews: true,
+  // ✅ REMOVE THESE:
+  // googleRatingUrl: true,     ❌ DOESN'T EXIST
+  // googleRatingLink: true,    ❌ DOESN'T EXIST
+},
+
       orderBy: { name: 'asc' },
     });
 

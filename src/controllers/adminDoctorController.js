@@ -53,17 +53,17 @@ export const createDoctor = async (req, res) => {
       });
     }
 
-    const { name, email, phone, speciality, experience, password } = req.body;
+    const { name, email, phone, specialityId, experience, password } = req.body;
 
-    if (!name || !email || !speciality || !experience || !password) {
+    if (!name || !email || !specialityId || !experience || !password) {
       return res.status(400).json({
-        error: 'name, email, speciality, experience and password are required',
+        error: 'name, email, specialityId, experience and password are required',
       });
     }
 
     let avatar = null;
     if (req.file) {
-      avatar = `/uploads/${req.file.filename}`; // relative URL
+      avatar = `/uploads/${req.file.filename}`;
     } else if (req.body.avatar) {
       avatar = req.body.avatar;
     }
@@ -99,7 +99,7 @@ export const createDoctor = async (req, res) => {
         slug,
         name,
         avatar,
-        speciality,
+        specialityId,                        // ✅ use relation id
         phone: phone || '',
         experience: Number(experience),
         clinicId,
@@ -129,7 +129,7 @@ export const createDoctor = async (req, res) => {
       entityId: doctor.id,
       details: {
         name: doctor.name,
-        speciality: doctor.speciality,
+        specialityId: doctor.specialityId,
         email: user.email,
       },
       req,
@@ -142,7 +142,6 @@ export const createDoctor = async (req, res) => {
   }
 };
 
-
 // ----------------------------------------------------------------
 // GET DOCTORS (Active Only)
 // ----------------------------------------------------------------
@@ -151,11 +150,14 @@ export const getDoctors = async (req, res) => {
     const { clinicId } = req.user;
 
     const doctors = await prisma.doctor.findMany({
-      where: { 
+      where: {
         clinicId,
-        deletedAt: null // ✅ Filter deleted doctors
+        deletedAt: null,
       },
-      orderBy: { name: 'asc' }
+      orderBy: { name: 'asc' },
+      include: {
+        speciality: true, // ✅ load related speciality
+      },
     });
 
     return res.json(doctors);
@@ -172,7 +174,7 @@ export const updateDoctor = async (req, res) => {
   try {
     const { clinicId, userId } = req.user;
     const { id } = req.params;
-    const { name, email, phone, speciality, experience, password } = req.body;
+    const { name, email, phone, specialityId, experience, password } = req.body;
 
     const file = req.file;
 
@@ -200,7 +202,7 @@ export const updateDoctor = async (req, res) => {
       data: {
         name: name ?? existingDoctor.name,
         avatar,
-        speciality: speciality ?? existingDoctor.speciality,
+        specialityId: specialityId ?? existingDoctor.specialityId, // ✅ relation id
         phone: phone ?? existingDoctor.phone,
         experience:
           experience !== undefined
@@ -243,8 +245,8 @@ export const updateDoctor = async (req, res) => {
 
     const changes = {};
     if (name && name !== existingDoctor.name) changes.name = name;
-    if (speciality && speciality !== existingDoctor.speciality)
-      changes.speciality = speciality;
+    if (specialityId && specialityId !== existingDoctor.specialityId)
+      changes.specialityId = specialityId;
     if (email && email !== user.email) changes.email = email;
     if (password) changes.password = 'Password Changed';
     if (avatar !== existingDoctor.avatar) changes.avatar = avatar;
@@ -265,6 +267,7 @@ export const updateDoctor = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
 
 // ----------------------------------------------------------------
 // TOGGLE DOCTOR ACTIVE

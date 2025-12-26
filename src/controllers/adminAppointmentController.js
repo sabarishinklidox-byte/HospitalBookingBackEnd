@@ -27,7 +27,7 @@ import prisma from "../prisma.js";
 import { logAudit } from "../utils/audit.js";
 import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
-
+import { sendBookingEmails } from '../utils/email.js';
 // ----------------------------------------------------------------
 // GET APPOINTMENTS (List)
 // ----------------------------------------------------------------
@@ -287,29 +287,40 @@ export const updateAppointmentStatus = async (req, res) => {
 // ----------------------------------------------------------------
 // RESCHEDULE APPOINTMENT BY ADMIN
 // ----------------------------------------------------------------
+ // Ensure this handles the RESCHEDULE type logic we discussed
+
 export const rescheduleAppointmentByAdmin = async (req, res) => {
   try {
-    const { clinicId, userId } = req.user;
-    const { id } = req.params;
+    const { clinicId, userId } = req.user; // Admin ID
+    const { id } = req.params; // Appointment ID
     const { newDate, newTime, note, deleteOldSlot } = req.body;
 
     if (!newDate || !newTime) {
-      return res.status(400).json({ error: "New date and time are required." });
+      return res.status(400).json({ error: 'New date and time are required.' });
     }
 
+    // 1. Fetch Appointment with Payment & Clinic Details
     const appt = await prisma.appointment.findFirst({
       where: { id, clinicId, deletedAt: null },
-      include: { slot: true, doctor: true, user: true },
+      include: {
+        slot: true,
+        doctor: true,
+        user: true,
+        payment: true,
+        clinic: true,
+      },
     });
 
-    if (!appt) return res.status(404).json({ error: "Appointment not found" });
+    if (!appt) {
+      return res.status(404).json({ error: 'Appointment not found' });
+    }
 
     const oldSlot = appt.slot;
     const oldDate = oldSlot.date;
     const oldTime = oldSlot.time;
     const targetDate = new Date(newDate);
 
-    // 1) find/create target slot
+    // 2. Find/Create New Slot
     let newSlot = await prisma.slot.findFirst({
       where: {
         clinicId,
@@ -321,6 +332,10 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
     });
 
     if (!newSlot) {
+      const currentDoctor = await prisma.doctor.findUnique({
+        where: { id: appt.doctorId },
+      });
+
       newSlot = await prisma.slot.create({
         data: {
           clinicId,
@@ -329,14 +344,15 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
           time: newTime,
           duration: oldSlot.duration,
           type: oldSlot.type,
-          price: oldSlot.price,
+          price: currentDoctor?.consultationFee || oldSlot.price,
           paymentMode: oldSlot.paymentMode,
-          status: "PENDING",
+          // Slot.status uses AppointmentStatus enum
+          status: 'PENDING_PAYMENT', // ✅ valid enum value
         },
       });
     }
 
-    // ✅ IMPORTANT: because slotId is @unique, block if ANY other appt uses it
+    // 3. Block Collision
     const anyApptOnSlot = await prisma.appointment.findFirst({
       where: {
         slotId: newSlot.id,
@@ -348,11 +364,33 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
 
     if (anyApptOnSlot) {
       return res.status(409).json({
-        error: `Slot already booked (existing appointment status: ${anyApptOnSlot.status}).`,
+        error: `Slot already booked (Status: ${anyApptOnSlot.status}).`,
       });
     }
 
+    // 4. FINANCIAL LOGIC 💰
+    const amountPaid =
+      appt.payment?.status === 'COMPLETED' ? appt.payment.amount : 0;
+    const newFee = newSlot.price;
+    let financialStatus = 'NO_CHANGE';
+    let financialMessage = '';
+
+    if (amountPaid === 0) {
+      financialStatus = 'PAY_AT_CLINIC';
+      financialMessage = `Please pay ₹${newFee} at the clinic.`;
+    } else if (newFee > amountPaid) {
+      financialStatus = 'PAY_DIFFERENCE';
+      const diff = newFee - amountPaid;
+      financialMessage = `Price increased. Please pay the difference of ₹${diff} at the clinic.`;
+    } else if (newFee < amountPaid) {
+      financialStatus = 'REFUND_AT_CLINIC';
+      const diff = amountPaid - newFee;
+      financialMessage = `Price dropped. Collect refund of ₹${diff} at the clinic.`;
+    }
+
+    // 5. Transaction: Update DB
     const updated = await prisma.$transaction(async (tx) => {
+      // Handle Old Slot
       if (deleteOldSlot) {
         await tx.slot.update({
           where: { id: oldSlot.id },
@@ -361,20 +399,23 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
       } else {
         await tx.slot.update({
           where: { id: oldSlot.id },
-          data: { status: "PENDING" },
+          data: { status: 'PENDING_PAYMENT' }, // ✅ valid enum value
         });
       }
 
+      // Update Appointment
       const updatedAppt = await tx.appointment.update({
         where: { id: appt.id },
         data: {
           slotId: newSlot.id,
-          status: "CONFIRMED",
+          // AppointmentStatus enum: choose one existing value
+          status: 'CONFIRMED', // ✅ use CONFIRMED instead of invalid "RESCHEDULED"
           updatedAt: new Date(),
         },
-        include: { slot: true, doctor: true, user: true },
+        include: { slot: true, doctor: true, user: true, clinic: true },
       });
 
+      // Log History
       await tx.appointmentLog.create({
         data: {
           appointmentId: appt.id,
@@ -382,55 +423,57 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
           oldTime,
           newDate: targetDate,
           newTime,
-          reason: note || "Rescheduled by clinic admin",
+          reason: note || 'Rescheduled by Admin',
           changedBy: userId,
-        },
-      });
-
-      await tx.notification.create({
-        data: {
-          clinicId,
-          type: "RESCHEDULE",
-          entityId: appt.id,
-          message: `Rescheduled — ${new Date(oldDate).toLocaleDateString()} ${oldTime} → ${targetDate.toLocaleDateString()} ${newTime}`,
-          readAt: new Date(),
+          metadata: { financialStatus, financialMessage },
         },
       });
 
       return updatedAppt;
     });
 
+    // 6. Send Email (Async)
+    sendBookingEmails({
+      ...updated,
+      type: 'RESCHEDULE',
+      oldSlot,
+      customMessage: financialMessage,
+      clinicPhone: appt.clinic.phone,
+    }).catch(console.error);
+
+    // 7. Audit Log
     await logAudit({
       userId,
       clinicId,
-      action: "RESCHEDULE_APPOINTMENT",
-      entity: "Appointment",
+      action: 'RESCHEDULE_APPOINTMENT',
+      entity: 'Appointment',
       entityId: id,
       details: {
-        previousStatus: appt.status,
-        newStatus: updated.status,
+        financialAction: financialStatus,
+        financialMessage,
         oldDate,
         newDate: targetDate,
-        oldTime,
-        newTime,
-        deleteOldSlot: !!deleteOldSlot,
-        reason: note || "Rescheduled by clinic admin",
       },
       req,
     });
 
-    return res.json({ message: "Appointment rescheduled successfully", appointment: updated });
+    // 8. RESPONSE with Admin Warning
+    return res.json({
+      message: 'Rescheduled successfully',
+      appointment: updated,
+      financialStatus,
+      adminAlert: `IMPORTANT: Please contact the patient at ${appt.user.phone} about this change. ${financialMessage}`,
+    });
   } catch (error) {
-    // ✅ Friendly P2002 (race condition safe)
-    if (error?.code === "P2002" && error?.meta?.target?.includes("slotId")) {
-      return res.status(409).json({ error: "Slot already booked. Please choose another slot." });
+    if (error?.code === 'P2002' && error?.meta?.target?.includes('slotId')) {
+      return res
+        .status(409)
+        .json({ error: 'Slot collision. Please refresh and try again.' });
     }
-
-    console.error("Reschedule Error:", error);
-    return res.status(500).json({ error: "Failed to reschedule appointment" });
+    console.error('Reschedule Error:', error);
+    return res.status(500).json({ error: 'Failed to reschedule' });
   }
 };
-
 // ----------------------------------------------------------------
 // CANCEL APPOINTMENT (Admin) – direct admin cancel OR approve pending request
 // ----------------------------------------------------------------

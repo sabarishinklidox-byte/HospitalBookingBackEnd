@@ -2,35 +2,37 @@ import prisma from '../prisma.js';
 import bcrypt from 'bcryptjs';
 import { logAudit } from '../utils/audit.js';
 
+
 // ----------------------------------------------------------------
 // Helper: Get current plan for a clinic
 // ----------------------------------------------------------------
-async function getClinicSubscription(clinicId) { // <--- Renamed Function
-  if (!clinicId) return null;
-  const clinic = await prisma.clinic.findUnique({
-    where: { id: clinicId },
+const getClinicSubscription = async (clinicId) => {
+  // Always return the latest subscription for this clinic (any status)
+  const sub = await prisma.subscription.findFirst({
+    where: { clinicId },
+    orderBy: { createdAt: 'desc' },   // newest record (EXPIRED will win)
     include: {
-      subscription: {
-        include: { plan: true },
-      },
+      plan: true,
     },
   });
-  return clinic?.subscription || null; // <--- Returns Subscription (with start date)
-}
+
+  return sub;
+};
+
 
 // ----------------------------------------------------------------
 // GET /api/admin/profile (User + Clinic Info)
-// ----------------------------------------------------------------
+// src/controllers/adminController.js (or wherever)
+;
+
 export const getAdminProfile = async (req, res) => {
   try {
-    // 1. Get ID from token
     const userId = req.user.id || req.user.userId;
 
     if (!userId) {
-        return res.status(401).json({ error: "Invalid token payload" });
+      return res.status(401).json({ error: 'Invalid token payload' });
     }
 
-    // 2. Fetch User directly
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
@@ -51,10 +53,9 @@ export const getAdminProfile = async (req, res) => {
     const resolvedClinicId = user.clinicId;
 
     if (!resolvedClinicId) {
-       return res.json({ admin: user, clinic: null, plan: null });
+      return res.json({ admin: user, clinic: null, plan: null });
     }
 
-    // 4. Fetch Clinic
     const clinic = await prisma.clinic.findUnique({
       where: { id: resolvedClinicId },
       select: {
@@ -82,29 +83,26 @@ export const getAdminProfile = async (req, res) => {
       return res.status(404).json({ error: 'Clinic not found or inactive.' });
     }
 
-    // 5. Fetch Subscription using the NEW function name
-    const subscription = await getClinicSubscription(resolvedClinicId); // <--- FIXED HERE
+    const subscription = await getClinicSubscription(resolvedClinicId);
 
     delete user.deletedAt;
     delete clinic.deletedAt;
 
-    // Attach subscription to clinic object so frontend finds it
     if (subscription) {
-        clinic.subscription = subscription;
+      clinic.subscription = subscription; // single latest subscription object
     }
 
-    // Return merged data
-    return res.json({ 
-        admin: user, 
-        clinic, 
-        plan: subscription?.plan || null // Backward compatibility
+    return res.json({
+      admin: user,
+      clinic,
+      plan: subscription?.plan || null,
     });
-
   } catch (error) {
     console.error('Get Admin Profile Error:', error);
     return res.status(500).json({ error: error.message });
   }
 };
+
 
 // ----------------------------------------------------------------
 // PATCH /api/admin/profile
