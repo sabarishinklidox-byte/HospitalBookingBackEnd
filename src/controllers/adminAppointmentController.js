@@ -27,7 +27,9 @@ import prisma from "../prisma.js";
 import { logAudit } from "../utils/audit.js";
 import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
-import { sendBookingEmails } from '../utils/email.js';
+import { sendBookingEmails,sendAppointmentStatusEmail, 
+  sendCancellationEmail 
+    } from '../utils/email.js';
 // ----------------------------------------------------------------
 // GET APPOINTMENTS (List)
 // ----------------------------------------------------------------
@@ -300,15 +302,24 @@ export const updateAppointmentStatus = async (req, res) => {
     const { id } = req.params;
     const { status, reason, adminNote } = req.body;
 
-    const validStatuses = ["CONFIRMED", "COMPLETED", "NO_SHOW", "CANCELLED"];
+    const validStatuses = ["CONFIRMED", "COMPLETED", "NO_SHOW", "CANCELLED", "REJECTED"];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: "Invalid status value" });
     }
 
     const existing = await prisma.appointment.findFirst({
       where: { id, clinicId, deletedAt: null },
-      include: { slot: true, user: true },
+      include: { 
+        slot: { 
+          include: { 
+            doctor: true,
+            clinic: true 
+          } 
+        }, 
+        user: true 
+      },
     });
+    
     if (!existing) {
       return res.status(404).json({ error: "Appointment not found" });
     }
@@ -319,12 +330,16 @@ export const updateAppointmentStatus = async (req, res) => {
       data.cancelReason = reason || "Cancelled by clinic";
     }
 
-    // ✅ When clinic marks COMPLETED, assume settlement is done at front desk
+    if (status === "REJECTED") {
+      data.cancelReason = reason || "Rejected by clinic"; // ✅ REJECT reason
+    }
+
+    // ✅ When clinic marks COMPLETED, assume settlement is done
     if (status === "COMPLETED") {
-      data.paymentStatus = "PAID";       // final state
-      data.financialStatus = null;       // no more diff pending
+      data.paymentStatus = "PAID";
+      data.financialStatus = null;
       data.diffAmount = 0;
-      if (adminNote) data.adminNote = adminNote; // e.g. "Collected extra ₹100 cash"
+      if (adminNote) data.adminNote = adminNote;
     }
 
     const updated = await prisma.$transaction(async (tx) => {
@@ -333,13 +348,13 @@ export const updateAppointmentStatus = async (req, res) => {
         data,
       });
 
-      if (status === "CANCELLED") {
+      if (status === "CANCELLED" || status === "REJECTED") {
         await tx.notification.create({
           data: {
             clinicId,
-            type: "CANCELLATION",
+            type: status === "REJECTED" ? "REJECTION" : "CANCELLATION",
             entityId: id,
-            message: `Cancelled by admin — ${reason || "Cancelled by clinic"}`,
+            message: `${status} by admin — ${reason || `${status.toLowerCase()} by clinic`}`,
             readAt: new Date(),
           },
         });
@@ -347,6 +362,11 @@ export const updateAppointmentStatus = async (req, res) => {
 
       return appt;
     });
+
+    // 🔥 SEND EMAIL FOR CONFIRMED/REJECTED/CANCELLED
+    if (["CONFIRMED", "REJECTED", "CANCELLED"].includes(status)) {
+      await sendAppointmentStatusEmail(existing, status, reason, req.user);
+    }
 
     await logAudit({
       userId: userId || req.user.userId,
@@ -357,21 +377,20 @@ export const updateAppointmentStatus = async (req, res) => {
       details: {
         previousStatus: existing.status,
         newStatus: status,
-        reason: status === "CANCELLED" ? (reason || "Cancelled by clinic") : null,
+        reason: status === "CANCELLED" || status === "REJECTED" ? (reason || `${status.toLowerCase()} by clinic`) : null,
         financialBefore: {
           paymentStatus: existing.paymentStatus,
           financialStatus: existing.financialStatus,
           diffAmount: existing.diffAmount,
         },
-        financialAfter:
-          status === "COMPLETED"
-            ? {
-                paymentStatus: "PAID",
-                financialStatus: null,
-                diffAmount: 0,
-                adminNote: adminNote || null,
-              }
-            : null,
+        financialAfter: status === "COMPLETED"
+          ? {
+              paymentStatus: "PAID",
+              financialStatus: null,
+              diffAmount: 0,
+              adminNote: adminNote || null,
+            }
+          : null,
       },
       req,
     });
@@ -385,6 +404,7 @@ export const updateAppointmentStatus = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
 
 
 // ----------------------------------------------------------------
@@ -530,7 +550,16 @@ export const cancelAppointment = async (req, res) => {
 
     const existing = await prisma.appointment.findFirst({
       where: { id, clinicId, deletedAt: null },
-      include: { cancellationRequest: true, slot: true },
+      include: { 
+        cancellationRequest: true, 
+        slot: { 
+          include: { 
+            doctor: true,
+            clinic: true  // 🔥 ADD clinic details for email
+          } 
+        },
+        user: true  // 🔥 ADD user for email
+      },
     });
 
     if (!existing) {
@@ -544,13 +573,10 @@ export const cancelAppointment = async (req, res) => {
     }
 
     const finalReason = reason || existing.cancelReason || "Cancelled by clinic";
-
     const hasPendingRequest =
       !!existing.cancellationRequest &&
       existing.cancellationRequest.status === "PENDING";
 
-    // ✅ patient requested cancel => unread
-    // ✅ admin cancelled directly => read (no blink)
     const readAtForNotification = hasPendingRequest ? null : new Date();
 
     const [updatedAppt, updatedReq] = await prisma.$transaction([
@@ -559,8 +585,6 @@ export const cancelAppointment = async (req, res) => {
         data: {
           status: "CANCELLED",
           cancelReason: finalReason,
-          // if you have cancelledBy in schema:
-          // cancelledBy: hasPendingRequest ? "USER" : "ADMIN",
         },
       }),
 
@@ -589,6 +613,9 @@ export const cancelAppointment = async (req, res) => {
       }),
     ]);
 
+    // 🔥 SEND CANCELLATION EMAIL TO PATIENT
+    await sendCancellationEmail(existing, finalReason, hasPendingRequest, req.user);
+
     await logAudit({
       userId: userId || req.user.userId,
       clinicId,
@@ -615,6 +642,7 @@ export const cancelAppointment = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
 
 
 

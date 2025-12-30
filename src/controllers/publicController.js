@@ -365,7 +365,7 @@ export const getSlotsForUser = async (req, res, next) => {
 export const getSlotsByDoctor = async (req, res) => {
   try {
     const { doctorId } = req.params;
-    const { date, clinicId, showHolds = 'false' } = req.query; // ✅ Added clinicId & showHolds
+    const { date, clinicId, showHolds = 'false' } = req.query;
 
     // 0. Validate doctor exists and is active
     const doctor = await prisma.doctor.findUnique({
@@ -390,23 +390,21 @@ export const getSlotsByDoctor = async (req, res) => {
 
     const where = {
       doctorId,
-      clinicId: targetClinicId, // ✅ CRITICAL: Clinic-specific slots
+      clinicId: targetClinicId,
       deletedAt: null,
-      kind: "APPOINTMENT", // hide BREAK / lunch slots
+      kind: "APPOINTMENT",
     };
 
     let dateStrForPassed = null;
 
     if (date) {
-      // date is already 'YYYY-MM-DD' from query
       dateStrForPassed = date;
-
       const start = new Date(`${date}T00:00:00+05:30`);
       const end = new Date(`${date}T23:59:59+05:30`);
       where.date = { gte: start, lte: end };
     }
 
-    // 🔥 1) All NON-BLOCKED slots for this DOCTOR + CLINIC
+    // 🔥 1) All NON-BLOCKED slots
     const slots = await prisma.slot.findMany({
       where: {
         ...where,
@@ -423,22 +421,22 @@ export const getSlotsByDoctor = async (req, res) => {
       orderBy: [{ date: "asc" }, { time: "asc" }],
     });
 
-    // 🔥 2) Booked slots (including ACTIVE holds)
+    // 🔥 2) Booked slots (including ACTIVE holds) - FIXED SELECT!
     const blockedAppointments = await prisma.appointment.findMany({
       where: {
         slotId: { in: slots.map((slot) => slot.id) },
         deletedAt: null,
         OR: [
-          { status: "CONFIRMED" },     // ✅ Permanently booked
-          { status: "PENDING" },        // ✅ Clinic pending approval
+          { status: "CONFIRMED" },
+          { status: "PENDING" },
           {
-            status: "PENDING_PAYMENT",  // 🔥 ACTIVE payment holds
-            AND: showHolds === 'true' ? [] : [  // ✅ Show holds only if requested
+            status: "PENDING_PAYMENT",
+            AND: showHolds === 'true' ? [] : [
               {
                 OR: [
-                  { paymentExpiry: null },                    // No expiry set
-                  { paymentExpiry: { gt: new Date() } },     // Still valid
-                  { createdAt: { gt: new Date(Date.now() - 15 * 60 * 1000) } } // Last 15min
+                  { paymentExpiry: null },
+                  { paymentExpiry: { gt: new Date() } },
+                  { createdAt: { gt: new Date(Date.now() - 15 * 60 * 1000) } }
                 ]
               }
             ]
@@ -446,17 +444,24 @@ export const getSlotsByDoctor = async (req, res) => {
         ],
       },
       select: { 
+        id: true,                    // 🔥 #1 MISSING: appointment ID
         slotId: true,
         status: true,
         paymentExpiry: true,
         createdAt: true,
-        userId: true, // ✅ For debugging
+        userId: true,
+        user: {                     // 🔥 #2 MISSING: user details
+          select: {
+            id: true,
+            name: true
+          }
+        }
       },
     });
 
     const blockedSlotIds = new Set(blockedAppointments.map((a) => a.slotId));
 
-    // 🔥 3) Hold info map (detailed)
+    // 🔥 3) Hold info map - FIXED WITH USER DATA!
     const holdInfoMap = new Map();
     blockedAppointments.forEach(appt => {
       if (appt.status === 'PENDING_PAYMENT') {
@@ -464,18 +469,20 @@ export const getSlotsByDoctor = async (req, res) => {
           status: appt.status,
           paymentExpiry: appt.paymentExpiry,
           createdAt: appt.createdAt,
-          userId: appt.userId, // ✅ Helpful for debugging
+          appointmentId: appt.id,        // 🔥 #3 MISSING!
+          userId: appt.userId,
+          userName: appt.user?.name || 'Unknown',  // 🔥 #4 MISSING!**
           expiresInMinutes: appt.paymentExpiry ? 
             Math.ceil((new Date(appt.paymentExpiry) - new Date()) / (1000 * 60)) : null
         });
       }
     });
 
-    // 4) Build result slots
+    // 4) Build result slots - FIXED WITH CRITICAL FIELDS!
     const resultSlots = slots
       .map((slot) => {
         const slotDateStr = dateStrForPassed || new Date(slot.date).toISOString().split("T")[0];
-        const isPassed = isSlotPassedIst(slotDateStr, slot.time); // ✅ Ensure this function exists
+        const isPassed = isSlotPassedIst(slotDateStr, slot.time);
         const isBooked = blockedSlotIds.has(slot.id);
         const holdInfo = holdInfoMap.get(slot.id);
 
@@ -489,12 +496,14 @@ export const getSlotsByDoctor = async (req, res) => {
           isBlocked: false,
           isBooked,
           isPassed,
-          // 🔥 Enhanced hold information
+          // 🔥 THESE 3 FIELDS WERE MISSING!
+          holdAppointmentId: holdInfo?.appointmentId || null,  // 🔥 CRITICAL #1**
+          holdUserId: holdInfo?.userId || null,                // 🔥 CRITICAL #2**
+          holdUserName: holdInfo?.userName || null,            // 🔥 CRITICAL #3**
           holdStatus: holdInfo?.status || null,
           holdExpiry: holdInfo?.paymentExpiry || null,
           holdCreatedAt: holdInfo?.createdAt || null,
           holdExpiresInMinutes: holdInfo?.expiresInMinutes || null,
-          // ✅ Frontend-friendly computed fields
           isHoldActive: Boolean(holdInfo),
           displayStatus: isPassed ? 'PASSED' : 
                         isBooked ? (holdInfo ? 'HOLD' : 'BOOKED') : 'AVAILABLE',

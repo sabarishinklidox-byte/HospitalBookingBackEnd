@@ -5,7 +5,8 @@ import prisma from '../prisma.js';
 import prismaPkg from '@prisma/client';
 const { Role } = prismaPkg;
 
-const transporter = nodemailer.createTransport({
+// 🔥 EMAIL TRANSPORTER SETUP (EXPORTED)
+export const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
   port: Number(process.env.SMTP_PORT || 587),
   secure: false,
@@ -15,6 +16,137 @@ const transporter = nodemailer.createTransport({
   },
 });
 
+// 🔥 1. CANCELLATION EMAIL (Your existing function - PERFECT!)
+export const sendCancellationEmail = async (appointment, reason, patientRequested, adminUser) => {
+  const { user, slot } = appointment;
+  const clinicName = slot.clinic.name;
+  const doctorName = slot.doctor.name;
+  const slotTime = new Date(`${slot.date}T${slot.time}:00+05:30`).toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata'
+  });
+  const adminName = adminUser.name || 'Clinic Admin';
+
+  const subject = `⚠️ Appointment CANCELLED - ${doctorName}`;
+  const actionBy = patientRequested ? 'You requested' : `Cancelled by ${clinicName}`;
+  
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+      <h2 style="color: #f59e0b;">📅 Appointment Cancelled</h2>
+      <p>Hi <strong>${user.name}</strong>,</p>
+      <p>Your appointment with <strong>${doctorName}</strong> has been <strong>CANCELLED</strong>.</p>
+      
+      <div style="background: #fef3c7; padding: 20px; border-radius: 8px; margin: 20px 0;">
+        <h3>📋 Cancellation Details:</h3>
+        <p><strong>Doctor:</strong> ${doctorName}</p>
+        <p><strong>Clinic:</strong> ${clinicName}</p>
+        <p><strong>Date & Time:</strong> ${slotTime}</p>
+        <p><strong>Reason:</strong> ${reason}</p>
+        <p><strong>Action:</strong> ${actionBy}</p>
+        ${!patientRequested && `<p><strong>By:</strong> ${adminName}</p>`}
+      </div>
+      
+      <p>Book a new appointment from <a href="https://yourapp.com">your dashboard</a>.</p>
+      <p>Best regards,<br><strong>${clinicName} Team</strong></p>
+    </div>
+  `;
+
+  await transporter.sendMail({
+    from: `"${clinicName}" <no-reply@yourapp.com>`,
+    to: user.email,
+    subject,
+    html
+  });
+
+  console.log(`✅ Cancellation Email sent to ${user.email} for appt ${appointment.id}`);
+};
+
+// 🔥 2. STATUS UPDATE EMAIL (CONFIRMED/REJECTED/CANCELLED)
+export const sendAppointmentStatusEmail = async (appointment, status, reason, adminUser) => {
+  const { user, slot } = appointment;
+  const clinicName = slot.clinic.name;
+  const doctorName = slot.doctor.name;
+  const slotTime = new Date(`${slot.date}T${slot.time}:00+05:30`).toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata'
+  });
+  const adminName = adminUser?.name || 'Clinic Admin';
+  const appUrl = process.env.APP_URL || 'https://yourapp.com';
+
+  let subject, html;
+
+  if (status === 'CONFIRMED') {
+    subject = `✅ Appointment CONFIRMED - ${doctorName}`;
+    html = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <h2 style="color: #10b981;">🎉 Appointment CONFIRMED!</h2>
+        <p>Hi <strong>${user.name}</strong>,</p>
+        <p>Your appointment with <strong>${doctorName}</strong> has been <strong>CONFIRMED</strong> by ${clinicName}!</p>
+        
+        <div style="background: #d1fae5; padding: 20px; border-radius: 8px; margin: 20px 0;">
+          <h3>📅 Appointment Details:</h3>
+          <p><strong>Doctor:</strong> ${doctorName}</p>
+          <p><strong>Clinic:</strong> ${clinicName}</p>
+          <p><strong>Date & Time:</strong> ${slotTime}</p>
+        </div>
+        
+        <p>We'll send you a reminder 1 hour before your appointment.</p>
+        <p>Best regards,<br><strong>${adminName}</strong><br>${clinicName} Team</p>
+      </div>
+    `;
+  } 
+  else if (status === 'REJECTED') {
+    subject = `❌ Appointment REJECTED - ${doctorName}`;
+    html = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <h2 style="color: #ef4444;">😔 Appointment Rejected</h2>
+        <p>Hi <strong>${user.name}</strong>,</p>
+        <p>Your appointment request with <strong>${doctorName}</strong> has been <strong>REJECTED</strong> by ${clinicName}.</p>
+        
+        <div style="background: #fee2e2; padding: 20px; border-radius: 8px; margin: 20px 0;">
+          <h3>📅 Requested Slot:</h3>
+          <p><strong>Doctor:</strong> ${doctorName}</p>
+          <p><strong>Date & Time:</strong> ${slotTime}</p>
+          <p><strong>Reason:</strong> ${reason || 'Slot not available'}</p>
+        </div>
+        
+        <p><strong>Action by:</strong> ${adminName}</p>
+        <p>Please select another available slot from <a href="${appUrl}">your dashboard</a>.</p>
+        <p>Best regards,<br><strong>${clinicName} Team</strong></p>
+      </div>
+    `;
+  }
+  else if (status === 'CANCELLED') {
+    subject = `⚠️ Appointment CANCELLED - ${doctorName}`;
+    html = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+        <h2 style="color: #f59e0b;">📅 Appointment Cancelled</h2>
+        <p>Hi <strong>${user.name}</strong>,</p>
+        <p>Your appointment with <strong>${doctorName}</strong> has been <strong>CANCELLED</strong>.</p>
+        
+        <div style="background: #fef3c7; padding: 20px; border-radius: 8px; margin: 20px 0;">
+          <h3>📋 Cancellation Details:</h3>
+          <p><strong>Doctor:</strong> ${doctorName}</p>
+          <p><strong>Date & Time:</strong> ${slotTime}</p>
+          <p><strong>Reason:</strong> ${reason || 'Cancelled by clinic'}</p>
+        </div>
+        
+        <p><strong>Action by:</strong> ${adminName}</p>
+        <p>Book a new appointment from <a href="${appUrl}">your dashboard</a>.</p>
+        <p>Best regards,<br><strong>${clinicName} Team</strong></p>
+      </div>
+    `;
+  }
+
+  await transporter.sendMail({
+    from: `"${clinicName}" <no-reply@yourapp.com>`,
+    to: user.email,
+    subject,
+    html
+  });
+
+  console.log(`✅ ${status} Email sent to ${user.email} for appt ${appointment.id}`);
+};
+
+// 🔥 3. YOUR BOOKING EMAILS FUNCTION (Your existing - PERFECT!)
 export const sendBookingEmails = async (appointmentData) => {
   try {
     const { 
@@ -24,8 +156,8 @@ export const sendBookingEmails = async (appointmentData) => {
       user, 
       type = 'BOOKING', 
       oldSlot,
-      customMessage, // 💰 Financial Message passed from Controller
-      clinicPhone    // 📞 Clinic Phone passed from Controller
+      customMessage,
+      clinicPhone
     } = appointmentData;
 
     // 1. Fetch Clinic Admin
@@ -135,7 +267,6 @@ export const sendBookingEmails = async (appointmentData) => {
           <div>${fmtDate(slot?.date)} at ${slot?.time || 'N/A'}</div>
         </div>
 
-        ${/* 💰 Financial Logic Display */ ''}
         ${customMessage ? `
           <div style="margin-top:12px;padding:12px;border-radius:8px;background:#f0f9ff;border-left:4px solid #0284c7;color:#0c4a6e;">
             <strong>💰 Payment Update:</strong><br/>
@@ -143,7 +274,6 @@ export const sendBookingEmails = async (appointmentData) => {
           </div>
         ` : ''}
 
-        ${/* 📞 Contact Display */ ''}
         ${clinicPhone ? `
           <div style="margin-top:12px;font-size:12px;color:#64748b;">
             Questions? Contact Clinic: <strong>${clinicPhone}</strong>
@@ -157,11 +287,11 @@ export const sendBookingEmails = async (appointmentData) => {
     const htmlContent = commonCard(isReschedule ? rescheduleRows : bookingRows);
 
     // --- SEND EMAILS ---
-    
     // 1. To Admin
     if (clinicAdmin?.email) {
       emails.push(
         transporter.sendMail({
+          from: `"${clinic.name}" <no-reply@yourapp.com>`,
           to: clinicAdmin.email,
           subject: subjectAdmin,
           html: htmlContent,
@@ -173,6 +303,7 @@ export const sendBookingEmails = async (appointmentData) => {
     if (doctorUser?.email) {
       emails.push(
         transporter.sendMail({
+          from: `"${clinic.name}" <no-reply@yourapp.com>`,
           to: doctorUser.email,
           subject: subjectDoctor,
           html: htmlContent,
@@ -180,10 +311,11 @@ export const sendBookingEmails = async (appointmentData) => {
       );
     }
 
-    // 3. ✅ To Patient (Crucial for Financial Updates)
+    // 3. To Patient
     if (user?.email) {
       emails.push(
         transporter.sendMail({
+          from: `"${clinic.name}" <no-reply@yourapp.com>`,
           to: user.email,
           subject: subjectPatient,
           html: htmlContent,
@@ -192,8 +324,16 @@ export const sendBookingEmails = async (appointmentData) => {
     }
 
     await Promise.all(emails);
-    console.log('✅ Emails sent successfully');
+    console.log('✅ Booking emails sent successfully');
   } catch (err) {
     console.error('❌ Email send failed:', err);
   }
+};
+
+// 🔥 DEFAULT EXPORT
+export default {
+  transporter,
+  sendBookingEmails,
+  sendAppointmentStatusEmail,
+  sendCancellationEmail
 };
