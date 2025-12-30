@@ -209,7 +209,11 @@ model Appointment {
   paymentId           String?
   notes               String?
   symptoms            String?
+   financialStatus        String?             // "PAY_DIFFERENCE" | "REFUND_AT_CLINIC" | "NO_CHANGE"
+  diffAmount             Decimal?            // store positive difference
+  // relations
   prescription        String?
+  adminNote String?  @db.Text
   createdAt           DateTime             @default(now())
   updatedAt           DateTime             @updatedAt
   deletedAt           DateTime?

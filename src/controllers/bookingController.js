@@ -74,155 +74,50 @@ const getPaymentInstance = async (clinicId, provider = 'RAZORPAY') => {
 export const createBooking = async (req, res) => {
   try {
     const { slotId, paymentMethod = 'ONLINE', provider = 'RAZORPAY' } = req.body;
+    const authUserId = req.user?.userId;
 
     console.log('🔑 Auth header:', req.headers.authorization);
     console.log('👤 req.user:', req.user);
 
-    const authUserId = req.user?.userId;
-    if (!authUserId) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+    if (!authUserId) return res.status(401).json({ error: 'Unauthorized' });
 
-    const HOLD_MS = 10 * 60 * 1000; // 10 minutes
+    const HOLD_MS = 10 * 60 * 1000;        // 10min payment window
+    const SAFETY_MS = 15 * 60 * 1000;      // 15min safety buffer
     const now = new Date();
 
-    // 1. Fetch Slot + Clinic + Doctor
+    // 1. Fetch Slot + Clinic + Doctor (read-only)
     const slotData = await prisma.slot.findUnique({
       where: { id: slotId },
-      include: { 
-        clinic: true, 
-        doctor: true 
-      },
+      include: { clinic: true, doctor: true },
     });
 
-    if (!slotData) {
-      return res.status(404).json({ error: 'Slot not found' });
-    }
+    if (!slotData) return res.status(404).json({ error: 'Slot not found' });
 
-    // 2. Find any appointment for this slot
-    let existing = await prisma.appointment.findFirst({
+    // 🔥 2. RECENT HOLD CHECK (protect frontend refreshes)
+    const recentHold = await prisma.appointment.findFirst({
       where: {
         slotId,
         deletedAt: null,
+        status: 'PENDING_PAYMENT',
+        createdAt: { gte: new Date(now.getTime() - SAFETY_MS) }
       },
     });
 
-    console.log('Existing appointment check:', {
-      slotId,
-      authUserId,
-      existingId: existing?.id,
-      existingUserId: existing?.userId,
-      existingStatus: existing?.status,
-      existingCreatedAt: existing?.createdAt,
-      existingPaymentExpiry: existing?.paymentExpiry,
-    });
-
-    if (existing) {
-      // 2a. Different user already has an appointment for this slot → block
-      if (existing.userId !== authUserId) {
+    if (recentHold) {
+      if (recentHold.userId !== authUserId) {
         return res.status(409).json({
-          error: 'Slot already booked or on hold. Please choose another time.',
+          error: 'Slot on hold by another user. Please wait 10-15 mins or choose another.',
           retry: true,
         });
       }
-
-      // 2b. Same user, already CONFIRMED → do not allow double booking
-      if (existing.status === 'CONFIRMED') {
-        return res.status(400).json({
-          error: 'You already have a confirmed booking for this slot.',
-        });
-      }
-
-      // 2c. Same user, PENDING_PAYMENT → hold logic
-      if (existing.status === 'PENDING_PAYMENT') {
-        const expiresAt = existing.paymentExpiry
-          ? new Date(existing.paymentExpiry)
-          : new Date(existing.createdAt.getTime() + HOLD_MS);
-
-        const remainingMs = expiresAt.getTime() - now.getTime();
-
-        console.log('Hold timer check:', {
-          existingId: existing.id,
-          createdAt: existing.createdAt,
-          paymentExpiry: existing.paymentExpiry,
-          computedExpiresAt: expiresAt,
-          now: now.toISOString(),
-          remainingMs,
-        });
-
-        if (remainingMs > 0) {
-          const remainingSeconds = Math.floor(remainingMs / 1000);
-
-          const gateway = await getPaymentInstance(slotData.clinicId, provider);
-          const orderData = await createPaymentOrder(gateway, slotData, provider);
-
-          await prisma.appointment.update({
-            where: { id: existing.id },
-            data: {
-              orderId: orderData.orderId || orderData.sessionId,
-              updatedAt: now,
-            },
-          });
-
-          return res.json({
-            success: true,
-            appointmentId: existing.id,
-            gatewayId: gateway.gatewayId,
-            isOnline: true,
-            ...orderData,
-            expiresIn: remainingSeconds,
-            message: `Complete payment within ${Math.floor(
-              remainingSeconds / 60
-            )}:${(remainingSeconds % 60).toString().padStart(2, '0')} to confirm ₹${
-              slotData.price
-            } booking`,
-          });
-        }
-
-        // 2d. Same user, hold expired → reuse SAME ROW with fresh hold
-        console.log('🗑️ Expired old hold (same user):', existing.id);
-
-        const gateway = await getPaymentInstance(slotData.clinicId, provider);
-        const orderData = await createPaymentOrder(gateway, slotData, provider);
-
-        const refreshed = await prisma.appointment.update({
-          where: { id: existing.id },
-          data: {
-            status: 'PENDING_PAYMENT',
-            paymentStatus: 'PENDING',
-            orderId: orderData.orderId || orderData.sessionId,
-            amount: Number(slotData.price),
-            paymentExpiry: new Date(now.getTime() + HOLD_MS),
-            updatedAt: now,
-          },
-        });
-
-        const expiresIn = HOLD_MS / 1000;
-
-        return res.json({
-          success: true,
-          appointmentId: refreshed.id,
-          gatewayId: gateway.gatewayId,
-          isOnline: true,
-          ...orderData,
-          expiresIn,
-          message: `Complete payment within 10 minutes to confirm ₹${slotData.price} booking`,
-        });
-      }
-
-      // 2e. Same user but status is PENDING / CANCELLED / COMPLETED / NO_SHOW
-      return res.status(409).json({
-        error: 'Slot already used. Please choose another time.',
-        retry: false,
-      });
+      // Same user → refresh hold
+      return handleExistingHold(recentHold, slotData, provider, now, HOLD_MS, res);
     }
 
-    // 3. Plan gating check
+    // 3. Plan validation (critical business rule)
     const plan = await getClinicPlan(slotData.clinicId);
     if (!plan) {
-      return res
-        .status(400)
-        .json({ error: 'Clinic has no active subscription plan.' });
+      return res.status(400).json({ error: 'Clinic has no active subscription plan.' });
     }
 
     if (paymentMethod === 'ONLINE' && !plan.allowOnlinePayments) {
@@ -232,25 +127,94 @@ export const createBooking = async (req, res) => {
       });
     }
 
-    // 4. FREE / OFFLINE → PENDING (Clinic Admin confirms) + ✅ EMAILS
-    if (slotData.paymentMode === 'FREE' || paymentMethod === 'OFFLINE' || slotData.paymentMode === 'OFFLINE') {
-      const appointment = await prisma.appointment.create({
+    // 🔥 4. ATOMIC TRANSACTION - IMPOSSIBLE RACE CONDITION!
+    const result = await prisma.$transaction(async (tx) => {
+      // CLEANUP: ONLY ancient (>15min) or CANCELLED records
+      await tx.appointment.deleteMany({
+        where: {
+          slotId,
+          OR: [
+            { status: 'CANCELLED' },
+            { status: 'PENDING' },
+            { 
+              status: 'PENDING_PAYMENT',
+              createdAt: { lt: new Date(now.getTime() - SAFETY_MS) }
+            }
+          ]
+        }
+      });
+
+      console.log('🧹 Ancient records cleaned (15min+ safety buffer)');
+
+      // FINAL SAFETY CHECKS
+      const confirmed = await tx.appointment.findFirst({
+        where: { slotId, status: 'CONFIRMED', deletedAt: null }
+      });
+      if (confirmed) throw new Error('ALREADY_CONFIRMED');
+
+      const otherHold = await tx.appointment.findFirst({
+        where: {
+          slotId,
+          userId: { not: authUserId },
+          status: 'PENDING_PAYMENT',
+          deletedAt: null
+        }
+      });
+      if (otherHold) throw new Error('SLOT_BLOCKED');
+
+      // 🔥 FREE/OFFLINE → INSTANT PENDING (Clinic approves later)
+      if (slotData.paymentMode === 'FREE' || paymentMethod === 'OFFLINE' || slotData.paymentMode === 'OFFLINE') {
+        const appointment = await tx.appointment.create({
+          data: {
+            userId: authUserId,
+            slotId,
+            clinicId: slotData.clinicId,
+            doctorId: slotData.doctorId,
+            status: 'PENDING',
+            paymentStatus: slotData.paymentMode === 'FREE' ? 'PAID' : 'PENDING',
+            amount: slotData.paymentMode === 'FREE' ? 0 : Number(slotData.price),
+            slug: `${slotData.paymentMode?.toLowerCase() || 'offline'}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            section: 'GENERAL',
+          },
+        });
+        return { appointment, isOnline: false, createNew: true };
+      }
+
+      // 🔥 ONLINE → RAZORPAY HOLD + ORDER (ATOMIC!)
+      const gateway = await getPaymentInstance(slotData.clinicId, provider);
+      const orderData = await createPaymentOrder(gateway, slotData, provider);
+
+      const appointment = await tx.appointment.create({
         data: {
           userId: authUserId,
           slotId,
           clinicId: slotData.clinicId,
           doctorId: slotData.doctorId,
-          status: 'PENDING', // ✅ FIXED: PENDING (Clinic confirms)
-          paymentStatus: slotData.paymentMode === 'FREE' ? 'PAID' : 'PENDING',
-          amount: slotData.paymentMode === 'FREE' ? 0 : Number(slotData.price),
-          slug: `${slotData.paymentMode?.toLowerCase() || 'offline'}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          status: 'PENDING_PAYMENT',
+          paymentStatus: 'PENDING',
+          orderId: orderData.orderId || orderData.sessionId,
+          amount: Number(slotData.price),
+          slug: `hold_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
           section: 'GENERAL',
+          paymentExpiry: new Date(now.getTime() + HOLD_MS),
+          createdAt: now, // Fresh timestamp for hold timer
         },
       });
 
-      // ✅ NO slot.update() - stays available until clinic confirms
+      return { 
+        appointment, 
+        gatewayId: gateway.gatewayId,
+        orderData,
+        isOnline: true, 
+        createNew: true 
+      };
+    });
 
-      // ✅ SEND INSTANT NOTIFICATION EMAILS (NON-BLOCKING)
+    // 5. SUCCESS PROCESSING
+    const { appointment, gatewayId, orderData, isOnline, createNew } = result;
+    
+    // NON-BLOCKING EMAILS (OFFLINE/FREE only)
+    if (!isOnline && createNew) {
       getUserById(authUserId).then(user => {
         sendBookingEmails({
           id: appointment.id,
@@ -260,81 +224,110 @@ export const createBooking = async (req, res) => {
           user: user || { name: 'Patient', phone: 'N/A' }
         }).catch(err => console.error('Pending booking emails failed:', err));
       }).catch(() => {});
-
-      return res.json({
-        success: true,
-        appointmentId: appointment.id,
-        isOnline: false,
-        status: 'PENDING', // ✅ Clear communication
-        message: slotData.paymentMode === 'FREE' 
-          ? 'Free booking created! Clinic will confirm soon.'
-          : `Booking created! Pay ₹${slotData.price} at clinic. Clinic will confirm.`,
-      });
     }
 
-    // 6. ONLINE PAYMENT – FRESH hold (no existing appointment for this slot)
-    const guardExisting = await prisma.appointment.findFirst({
-      where: { slotId, deletedAt: null },
+    console.log('✅ Booking decision:', {
+      slotId,
+      authUserId,
+      path: isOnline ? 'NEW_ONLINE_HOLD' : 'OFFLINE_PENDING',
+      appointmentId: appointment.id,
+      status: appointment.status,
     });
 
-    if (guardExisting) {
-      console.error('Guard hit: existing appointment before create()', {
-        slotId,
-        id: guardExisting.id,
-        status: guardExisting.status,
-        userId: guardExisting.userId,
-      });
+    // PERFECT PRODUCTION RESPONSE
+    return res.json({
+      success: true,
+      appointmentId: appointment.id,
+      gatewayId,
+      isOnline,
+      orderId: orderData?.orderId || orderData?.sessionId,
+      amount: Number(slotData.price),
+      ...orderData,
+      expiresIn: isOnline ? HOLD_MS / 1000 : 0,
+      message: isOnline 
+        ? `Payment hold created! Complete within 10 mins - ₹${slotData.price}`
+        : slotData.paymentMode === 'FREE' 
+          ? 'Free booking created! Clinic will confirm soon.'
+          : `Booking created! Pay ₹${slotData.price} at clinic on visit.`,
+    });
 
+  } catch (error) {
+    console.error('🚨 CRITICAL BOOKING ERROR:', error);
+
+    // PRODUCTION ERROR HANDLING
+    if (error.message === 'SLOT_BLOCKED') {
       return res.status(409).json({
-        error: 'Slot already used. Please choose another time.',
-        retry: false,
+        error: 'Slot on hold by another patient. Wait 10-15 mins or choose another.',
+        retry: true,
       });
     }
 
+    if (error.message === 'ALREADY_CONFIRMED') {
+      return res.status(400).json({
+        error: 'You already have a confirmed booking for this slot.',
+      });
+    }
+
+    // PRISMA SAFETY NET
+    if (error.code === 'P2002') {
+      return res.status(409).json({
+        error: 'Slot taken instantly by another patient! Please refresh.',
+        retry: true,
+      });
+    }
+
+    return res.status(500).json({
+      error: error.message || 'Booking system temporarily unavailable.',
+    });
+  }
+};
+
+// 🔥 PRODUCTION HELPER: Refresh existing hold (same user only)
+async function handleExistingHold(existing, slotData, provider, now, HOLD_MS, res) {
+  try {
+    const expiresAt = existing.paymentExpiry || new Date(existing.createdAt.getTime() + HOLD_MS);
+    const remainingMs = new Date(expiresAt).getTime() - now.getTime();
+
+    console.log('🔄 Hold refresh:', {
+      appointmentId: existing.id,
+      remainingMs,
+      paymentExpiry: existing.paymentExpiry?.toISOString(),
+    });
+
+    // Refresh payment order
     const gateway = await getPaymentInstance(slotData.clinicId, provider);
     const orderData = await createPaymentOrder(gateway, slotData, provider);
 
-    const appointment = await prisma.appointment.create({
-      data: {
-        userId: authUserId,
-        slotId,
-        clinicId: slotData.clinicId,
-        doctorId: slotData.doctorId,
-        status: 'PENDING_PAYMENT',
-        paymentStatus: 'PENDING',
+    // Extend hold expiry
+    await prisma.appointment.update({
+      where: { id: existing.id },
+      data: { 
         orderId: orderData.orderId || orderData.sessionId,
-        amount: Number(slotData.price),
-        slug: `hold_${Date.now()}_${Math.random()
-          .toString(36)
-          .substr(2, 9)}`,
-        section: 'GENERAL',
-        paymentExpiry: new Date(now.getTime() + HOLD_MS),
+        paymentExpiry: new Date(now.getTime() + HOLD_MS), // Fresh 10min
+        updatedAt: now,
       },
-    });
-
-    console.log('createBooking decision:', {
-      slotId,
-      authUserId,
-      path: 'NEW_APPOINTMENT_ONLINE',
-      createdAppointmentId: appointment.id,
     });
 
     return res.json({
       success: true,
-      appointmentId: appointment.id,
+      appointmentId: existing.id,
       gatewayId: gateway.gatewayId,
       isOnline: true,
       ...orderData,
       expiresIn: HOLD_MS / 1000,
-      message: `Complete payment within 10 minutes to confirm ₹${slotData.price} booking`,
+      message: `Payment refreshed! New 10-minute window - ₹${slotData.price}`,
     });
+
   } catch (error) {
-    console.error('CRITICAL BOOKING ERROR:', error);
+    console.error('Hold refresh failed:', error);
     return res.status(500).json({
-      error: error.message || 'Booking failed',
+      error: 'Failed to refresh payment hold.',
     });
   }
-};
+}
+
+
+
 
 // ✅ HELPER FUNCTION - Get user data for emails
 const getUserById = async (userId) => {

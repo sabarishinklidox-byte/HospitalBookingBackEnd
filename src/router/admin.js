@@ -45,10 +45,10 @@ import { refreshClinicGoogleRating } from '../controllers/clinicController.js';
 
 import {
   getPayments,
-  getPaymentsSummary,
+  getPaymentsSummary
 } from '../controllers/adminPaymentController.js';
 
-import { getPatientHistory } from '../controllers/adminPatientController.js';
+import { getPatientHistory ,getPatientHistoryDetailed} from '../controllers/adminPatientController.js';
 
 import {
   getAdminProfile,
@@ -201,6 +201,12 @@ router.patch(
 // ---------------- Payments (History - OPEN) ----------------
 router.get('/payments', authMiddleware, requireAdmin, getPayments);
 router.get('/payments/summary', authMiddleware, requireAdmin, getPaymentsSummary);
+router.get(
+  "/patients/:userId/history",
+  authMiddleware,
+  requireAdmin,
+  getPatientHistoryDetailed
+);
 
 // ---------------- Patients (History - OPEN) ----------------
 router.get(

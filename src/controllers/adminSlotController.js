@@ -633,13 +633,13 @@ export const getDoctorSlotsWindow = async (req, res) => {
     }
 
     // 🔥 Base date: construct from YYYY-MM-DD at UTC midnight
-    const baseDateStr = from || new Date().toISOString().slice(0, 10); // '2025-12-24'
+    const baseDateStr = from || new Date().toISOString().slice(0, 10);
     const [y, m, d] = baseDateStr.split("-").map(Number);
     if (!y || !m || !d) {
       return res.status(400).json({ error: "Invalid from date" });
     }
 
-    const start = new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0)); // EXACT day start
+    const start = new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
     const endExclusive = new Date(start);
     endExclusive.setDate(endExclusive.getDate() + daysNum);
 
@@ -727,6 +727,17 @@ export const getDoctorSlotsWindow = async (req, res) => {
         endTime = `${eh}:${em}`;
       }
 
+      // 🔥 NEW: Slot Type & Price Display
+      const slotType = s.paymentMode === "FREE" 
+        ? "FREE" 
+        : s.paymentMode === "ONLINE" 
+        ? "Online Pay" 
+        : "Pay at Clinic";
+      
+      const priceDisplay = s.paymentMode === "FREE" 
+        ? "FREE" 
+        : `₹${Number(s.price || 0).toLocaleString()}`;
+
       byDate[slotDateStr].slots.push({
         slotId: s.id,
         isBlocked: false,
@@ -736,6 +747,10 @@ export const getDoctorSlotsWindow = async (req, res) => {
         startTime: s.time,
         endTime,
         isBooked: (s.appointments?.length || 0) > 0,
+        // 🔥 ADDED: Slot Type & Price
+        slotType,
+        price: Number(s.price || 0),
+        priceDisplay,
       });
     }
 
@@ -771,7 +786,7 @@ export const getDoctorSlotsWindow = async (req, res) => {
     return res.status(500).json({ error: "Failed to load slots" });
   }
 };
-;
+
 
 
 

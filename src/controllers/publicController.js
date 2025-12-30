@@ -39,9 +39,7 @@ export const getClinics = async (req, res) => {
   googleReviewsEmbedCode: true,
   googleRating: true,
   googleTotalReviews: true,
-  // ✅ REMOVE THESE:
-  // googleRatingUrl: true,     ❌ DOESN'T EXIST
-  // googleRatingLink: true,    ❌ DOESN'T EXIST
+  
 },
 
       orderBy: { name: 'asc' },
@@ -281,9 +279,7 @@ export const getSlotsForUser = async (req, res, next) => {
     const { clinicId, doctorId, date, excludeAppointmentId } = req.query;
 
     if (!clinicId || !doctorId || !date) {
-      return res
-        .status(400)
-        .json({ error: "clinicId, doctorId, date are required" });
+      return res.status(400).json({ error: "clinicId, doctorId, date are required" });
     }
 
     const start = new Date(`${date}T00:00:00+05:30`);
@@ -302,20 +298,45 @@ export const getSlotsForUser = async (req, res, next) => {
         appointments: {
           where: {
             deletedAt: null,
-            status: { in: ["PENDING", "CONFIRMED", "COMPLETED"] },
-            ...(excludeAppointmentId
-              ? { NOT: { id: excludeAppointmentId } }
-              : {}),
+            status: { 
+              in: ["PENDING", "CONFIRMED", "COMPLETED", "PENDING_PAYMENT"] 
+            },
+            ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {}),
           },
-          select: { id: true },
+          select: { 
+            id: true,
+            userId: true,      // 🔥 For isMyHold detection
+            status: true,
+            paymentStatus: true
+          },
           take: 1,
         },
       },
     });
 
+    const now = new Date();
+    const tenMinutesAgo = new Date(now.getTime() - 10 * 60 * 1000);
+    const currentUserId = req.user?.id;
+
     return res.json({
       data: slots.map((s) => {
         const isPassed = isSlotPassedIst(date, s.time);
+        const appointments = Array.isArray(s.appointments) ? s.appointments : [];
+        
+        // 🔥 1. Check existing appointments
+        const hasActiveAppointment = appointments.some(apt => 
+          apt.status !== 'CANCELLED'
+        );
+        
+        // 🔥 2. Check blocked slots (payment holds)
+        const isActiveHold = s.isBlocked && new Date(s.createdAt) >= tenMinutesAgo;
+        
+        // 🔥 3. Is this MY hold?
+        const isMyHold = isActiveHold && appointments.some(apt => 
+          apt.userId === currentUserId && apt.status === 'PENDING_PAYMENT'
+        );
+
+        const isBooked = hasActiveAppointment || (isActiveHold && !isMyHold);
 
         return {
           id: s.id,
@@ -324,26 +345,29 @@ export const getSlotsForUser = async (req, res, next) => {
           paymentMode: s.paymentMode,
           kind: s.kind,
           price: s.price,
-          isBooked: (s.appointments?.length || 0) > 0,
-          isPassed,
+          // 🔥 PERFECT FLAGS:
+          isBlocked: s.isBlocked,
+          isBooked: isBooked,
+          isMyHold: isMyHold,
+          isPassed: isPassed,
         };
       }),
     });
   } catch (error) {
     console.error("Get Slots For User Error:", error);
-    return next
-      ? next(error)
-      : res.status(500).json({ error: "Failed to load slots" });
+    return next ? next(error) : res.status(500).json({ error: "Failed to load slots" });
   }
 };
+
 
 /* ---------------- getSlotsByDoctor ---------------- */
 
 export const getSlotsByDoctor = async (req, res) => {
   try {
     const { doctorId } = req.params;
-    const { date } = req.query;
+    const { date, clinicId, showHolds = 'false' } = req.query; // ✅ Added clinicId & showHolds
 
+    // 0. Validate doctor exists and is active
     const doctor = await prisma.doctor.findUnique({
       where: { id: doctorId },
       include: { clinic: true },
@@ -353,13 +377,20 @@ export const getSlotsByDoctor = async (req, res) => {
       !doctor ||
       !doctor.isActive ||
       doctor.deletedAt ||
-      doctor.clinic.deletedAt
+      doctor.clinic?.deletedAt
     ) {
       return res.status(404).json({ error: "Doctor unavailable." });
     }
 
+    // Clinic validation
+    const targetClinicId = clinicId || doctor.clinicId;
+    if (!targetClinicId) {
+      return res.status(400).json({ error: "Missing clinic ID" });
+    }
+
     const where = {
       doctorId,
+      clinicId: targetClinicId, // ✅ CRITICAL: Clinic-specific slots
       deletedAt: null,
       kind: "APPOINTMENT", // hide BREAK / lunch slots
     };
@@ -375,13 +406,13 @@ export const getSlotsByDoctor = async (req, res) => {
       where.date = { gte: start, lte: end };
     }
 
-    // 🔥 1) All slots WITH isBlocked filter
+    // 🔥 1) All NON-BLOCKED slots for this DOCTOR + CLINIC
     const slots = await prisma.slot.findMany({
       where: {
         ...where,
-        isBlocked: false  // 🔥 ONLY return NON-BLOCKED slots
+        isBlocked: false
       },
-      select: { // 🔥 Add select for performance
+      select: {
         id: true,
         date: true,
         time: true,
@@ -392,35 +423,61 @@ export const getSlotsByDoctor = async (req, res) => {
       orderBy: [{ date: "asc" }, { time: "asc" }],
     });
 
-    // 2) Booked slots (confirmed + recent pending)
+    // 🔥 2) Booked slots (including ACTIVE holds)
     const blockedAppointments = await prisma.appointment.findMany({
       where: {
         slotId: { in: slots.map((slot) => slot.id) },
+        deletedAt: null,
         OR: [
-          { status: "CONFIRMED" }, // permanently booked
+          { status: "CONFIRMED" },     // ✅ Permanently booked
+          { status: "PENDING" },        // ✅ Clinic pending approval
           {
-            status: "PENDING", // active payment hold within last 10 minutes
-            createdAt: {
-              gt: new Date(Date.now() - 10 * 60 * 1000),
-            },
+            status: "PENDING_PAYMENT",  // 🔥 ACTIVE payment holds
+            AND: showHolds === 'true' ? [] : [  // ✅ Show holds only if requested
+              {
+                OR: [
+                  { paymentExpiry: null },                    // No expiry set
+                  { paymentExpiry: { gt: new Date() } },     // Still valid
+                  { createdAt: { gt: new Date(Date.now() - 15 * 60 * 1000) } } // Last 15min
+                ]
+              }
+            ]
           },
         ],
-        deletedAt: null,
       },
-      select: { slotId: true },
+      select: { 
+        slotId: true,
+        status: true,
+        paymentExpiry: true,
+        createdAt: true,
+        userId: true, // ✅ For debugging
+      },
     });
 
     const blockedSlotIds = new Set(blockedAppointments.map((a) => a.slotId));
 
-    // Build result slots
+    // 🔥 3) Hold info map (detailed)
+    const holdInfoMap = new Map();
+    blockedAppointments.forEach(appt => {
+      if (appt.status === 'PENDING_PAYMENT') {
+        holdInfoMap.set(appt.slotId, {
+          status: appt.status,
+          paymentExpiry: appt.paymentExpiry,
+          createdAt: appt.createdAt,
+          userId: appt.userId, // ✅ Helpful for debugging
+          expiresInMinutes: appt.paymentExpiry ? 
+            Math.ceil((new Date(appt.paymentExpiry) - new Date()) / (1000 * 60)) : null
+        });
+      }
+    });
+
+    // 4) Build result slots
     const resultSlots = slots
       .map((slot) => {
-        const slotDateStr =
-          dateStrForPassed ||
-          new Date(slot.date).toISOString().split("T")[0];
-
-        const isPassed = isSlotPassedIst(slotDateStr, slot.time);
+        const slotDateStr = dateStrForPassed || new Date(slot.date).toISOString().split("T")[0];
+        const isPassed = isSlotPassedIst(slotDateStr, slot.time); // ✅ Ensure this function exists
         const isBooked = blockedSlotIds.has(slot.id);
+        const holdInfo = holdInfoMap.get(slot.id);
 
         return {
           id: slot.id,
@@ -429,9 +486,18 @@ export const getSlotsByDoctor = async (req, res) => {
           paymentMode: slot.paymentMode || "FREE",
           kind: slot.kind,
           price: Number(slot.price || 0),
-          isBlocked: false,  // 🔥 Always false (already filtered)
+          isBlocked: false,
           isBooked,
           isPassed,
+          // 🔥 Enhanced hold information
+          holdStatus: holdInfo?.status || null,
+          holdExpiry: holdInfo?.paymentExpiry || null,
+          holdCreatedAt: holdInfo?.createdAt || null,
+          holdExpiresInMinutes: holdInfo?.expiresInMinutes || null,
+          // ✅ Frontend-friendly computed fields
+          isHoldActive: Boolean(holdInfo),
+          displayStatus: isPassed ? 'PASSED' : 
+                        isBooked ? (holdInfo ? 'HOLD' : 'BOOKED') : 'AVAILABLE',
         };
       })
       .sort((a, b) => a.time.localeCompare(b.time));
@@ -439,23 +505,25 @@ export const getSlotsByDoctor = async (req, res) => {
     return res.json({
       success: true,
       doctorId,
+      clinicId: targetClinicId,
       date,
       slots: resultSlots,
-      totalAvailable: resultSlots.filter((s) => !s.isBooked && !s.isPassed).length,
-      totalBlocked: resultSlots.filter((s) => s.isBooked).length,
       stats: {
-        free: resultSlots.filter(
-          (s) => s.paymentMode === "FREE" && !s.isBooked && !s.isPassed
-        ).length,
-        paid: resultSlots.filter(
-          (s) => s.paymentMode !== "FREE" && !s.isBooked && !s.isPassed
-        ).length,
+        total: resultSlots.length,
+        available: resultSlots.filter((s) => !s.isBooked && !s.isPassed).length,
+        booked: resultSlots.filter((s) => s.isBooked).length,
+        passed: resultSlots.filter((s) => s.isPassed).length,
+        holds: resultSlots.filter((s) => s.isHoldActive).length,
+        free: resultSlots.filter((s) => s.paymentMode === "FREE" && !s.isBooked && !s.isPassed).length,
+        paid: resultSlots.filter((s) => s.paymentMode !== "FREE" && !s.isBooked && !s.isPassed).length,
       },
     });
+
   } catch (error) {
-    console.error("Slot Fetch Error:", error);
-    return res.status(500).json({ error: "Failed to load slots." });
+    console.error("🚨 Slot Fetch Error:", error);
+    return res.status(500).json({ 
+      error: "Failed to load slots.",
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
   }
 };
-
-

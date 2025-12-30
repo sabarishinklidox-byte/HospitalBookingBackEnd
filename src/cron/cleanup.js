@@ -1,47 +1,47 @@
-// src/cron/cleanup.js
+// src/cron/cleanup.js - PRODUCTION READY!
 import { PrismaClient } from '@prisma/client';
-
 const prisma = new PrismaClient();
 
 const cleanupExpiredBookings = async () => {
   try {
     const now = new Date();
     const tenMinutesAgo = new Date(now.getTime() - 10 * 60 * 1000);
-    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
-    // 1. Clean expired online payment holds
-    //    - status = PENDING_PAYMENT
-    //    - either paymentExpiry < now, or (no paymentExpiry and createdAt < 10min ago)
-    const expiredPayments = await prisma.appointment.updateMany({
+    // 🔥 SLOTS
+    const expiredSlots = await prisma.slot.updateMany({
+      where: {
+        isBlocked: true,
+        createdAt: { lt: tenMinutesAgo }
+      },
+      data: { isBlocked: false, status: 'PENDING_PAYMENT' }
+    });
+
+    // 🔥 PENDING_PAYMENT Appointments
+    const expiredAppts = await prisma.appointment.updateMany({
       where: {
         status: 'PENDING_PAYMENT',
-        OR: [
-          { paymentExpiry: { lt: now } },
-          {
-            AND: [
-              { paymentExpiry: null },
-              { createdAt: { lt: tenMinutesAgo } },
-            ],
-          },
-        ],
+        paymentStatus: 'PENDING',
+        OR: [{ createdAt: { lt: tenMinutesAgo } }, { updatedAt: { lt: tenMinutesAgo } }]
       },
-      data: {
-        status: 'CANCELLED',
-        paymentStatus: 'FAILED',
-      },
+      data: { status: 'CANCELLED', paymentStatus: 'FAILED', financialStatus: null }
     });
 
-    // 2. Clean old unread notifications (30+ days)
-    const oldNotifications = await prisma.notification.deleteMany({
+    // 🔥 STALE PENDING
+    const stalePending = await prisma.appointment.updateMany({
       where: {
-        createdAt: { lt: thirtyDaysAgo },
-        readAt: null,
+        status: 'PENDING',
+        createdAt: { lt: oneDayAgo }
       },
+      data: { status: 'CANCELLED', paymentStatus: 'FAILED' }
     });
 
-    console.log(`🧹 Cleanup @ ${now.toISOString()}:`);
-    console.log(`   → Expired bookings: ${expiredPayments.count}`);
-    console.log(`   → Old notifications: ${oldNotifications.count}`);
+    const blockedLeft = await prisma.slot.count({ where: { isBlocked: true } });
+
+    console.log(`🧹 Cleanup @ ${now.toLocaleTimeString()}:`);
+    console.log(`  → Slots: ${expiredSlots.count} | Appts: ${expiredAppts.count} | Stale: ${stalePending.count}`);
+    console.log(`  → Blocked left: ${blockedLeft}`);
+
   } catch (error) {
     console.error('❌ Cleanup Error:', error);
   }
@@ -49,9 +49,3 @@ const cleanupExpiredBookings = async () => {
 
 cleanupExpiredBookings();
 setInterval(cleanupExpiredBookings, 5 * 60 * 1000);
-
-process.on('SIGTERM', async () => {
-  console.log('🛑 Shutting down cleanup...');
-  await prisma.$disconnect();
-  process.exit(0);
-});

@@ -3,7 +3,7 @@
   import dotenv from 'dotenv';
   import path from 'path';
 import cron from 'node-cron';
-
+import './cron/cleanup.js'; 
   // ✅ ROUTES
   import paymentRoutes from './router/paymentroutes.js';
   import superAdminRoutes from './router/superAdmin.js';
@@ -55,7 +55,8 @@ app.use(cors({
     });
   });
 cron.schedule(
-  '0 * * * *',                // at minute 0 of every hour
+  // '0 * * * *',    
+  '* * * * *',            // at minute 0 of every hour
   () => {
     console.log('Running hourly subscription check...');
     runExpirationCheck();

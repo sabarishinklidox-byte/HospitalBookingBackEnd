@@ -31,6 +31,7 @@ import { sendBookingEmails } from '../utils/email.js';
 // ----------------------------------------------------------------
 // GET APPOINTMENTS (List)
 // ----------------------------------------------------------------
+
 export const getAppointments = async (req, res) => {
   try {
     const { clinicId } = req.user;
@@ -166,9 +167,19 @@ export const getAppointments = async (req, res) => {
         : "N/A",
       timeFormatted: app.slot?.time || "N/A",
 
+      // Slot payment info
       paymentMode: app.slot?.paymentMode || null,
       slotType: app.slot?.type || null,
       price: app.slot?.price ?? null,
+
+      // Booking finance info (CRITICAL FIX: sending amount here)
+      amount: Number(app.amount ?? 0),
+      paymentStatus: app.paymentStatus,
+      financialStatus: app.financialStatus,
+      diffAmount: Number(app.diffAmount ?? 0),
+      adminNote: app.adminNote || null,
+      cancelReason: app.cancelReason || null,
+      cancelledBy: app.cancelledBy || null,
 
       isSlotBlocked: app.slot?.isBlocked || false,
       blockedReason: app.slot?.blockedReason || null,
@@ -178,18 +189,18 @@ export const getAppointments = async (req, res) => {
 
       history: (app.logs || []).map((log) => ({
         id: log.id,
-        action: "RESCHEDULE_APPOINTMENT",
-        changedBy: log.changedBy,
+        action: "RESCHEDULE_APPOINTMENT", // or simplify to log.action if you want actual action
+        changedBy: log.changedBy, // or log.userId depending on schema
         timestamp: new Date(log.createdAt).toLocaleString(),
-        oldDate: log.oldDate
-          ? new Date(log.oldDate).toLocaleDateString()
+        oldDate: log.details?.oldDate
+          ? new Date(log.details.oldDate).toLocaleDateString()
           : null,
-        newDate: log.newDate
-          ? new Date(log.newDate).toLocaleDateString()
+        newDate: log.details?.newDate
+          ? new Date(log.details.newDate).toLocaleDateString()
           : null,
-        oldTime: log.oldTime || null,
-        newTime: log.newTime || null,
-        reason: log.reason || null,
+        oldTime: log.details?.oldTime || null,
+        newTime: log.details?.newTime || null,
+        reason: log.details?.reason || null,
       })),
     }));
 
@@ -212,11 +223,82 @@ export const getAppointments = async (req, res) => {
 // ----------------------------------------------------------------
 // UPDATE STATUS (Admin quick actions)
 // ----------------------------------------------------------------
+// export const updateAppointmentStatus = async (req, res) => {
+//   try {
+//     const { clinicId, userId } = req.user;
+//     const { id } = req.params;
+//     const { status, reason } = req.body;
+
+//     const validStatuses = ["CONFIRMED", "COMPLETED", "NO_SHOW", "CANCELLED"];
+//     if (!validStatuses.includes(status)) {
+//       return res.status(400).json({ error: "Invalid status value" });
+//     }
+
+//     const existing = await prisma.appointment.findFirst({
+//       where: { id, clinicId, deletedAt: null },
+//       include: { slot: true, user: true },
+//     });
+//     if (!existing) {
+//       return res.status(404).json({ error: "Appointment not found" });
+//     }
+
+//     const data = { status };
+//     if (status === "CANCELLED") {
+//       data.cancelReason = reason || "Cancelled by clinic";
+//       // if you have cancelledBy in schema:
+//       // data.cancelledBy = "ADMIN";
+//     }
+
+//     const updated = await prisma.$transaction(async (tx) => {
+//       const appt = await tx.appointment.update({
+//         where: { id },
+//         data,
+//       });
+
+//       if (status === "CANCELLED") {
+//         // ✅ admin action => create as READ (no blinking)
+//         await tx.notification.create({
+//           data: {
+//             clinicId,
+//             type: "CANCELLATION",
+//             entityId: id,
+//             message: `Cancelled by admin — ${reason || "Cancelled by clinic"}`,
+//             readAt: new Date(),
+//           },
+//         });
+//       }
+
+//       return appt;
+//     });
+
+//     await logAudit({
+//       userId: userId || req.user.userId,
+//       clinicId,
+//       action: "UPDATE_STATUS",
+//       entity: "Appointment",
+//       entityId: id,
+//       details: {
+//         previousStatus: existing.status,
+//         newStatus: status,
+//         reason: status === "CANCELLED" ? (reason || "Cancelled by clinic") : null,
+//       },
+//       req,
+//     });
+
+//     return res.json({
+//       message: `Appointment status updated to ${status}`,
+//       appointment: updated,
+//     });
+//   } catch (error) {
+//     console.error("Update Status Error:", error);
+//     return res.status(500).json({ error: error.message });
+//   }
+// };
 export const updateAppointmentStatus = async (req, res) => {
   try {
     const { clinicId, userId } = req.user;
     const { id } = req.params;
-    const { status, reason } = req.body;
+    const { status, reason, adminNote } = req.body;
 
     const validStatuses = ["CONFIRMED", "COMPLETED", "NO_SHOW", "CANCELLED"];
     if (!validStatuses.includes(status)) {
@@ -232,10 +314,17 @@ export const updateAppointmentStatus = async (req, res) => {
     }
 
     const data = { status };
+
     if (status === "CANCELLED") {
       data.cancelReason = reason || "Cancelled by clinic";
-      // if you have cancelledBy in schema:
-      // data.cancelledBy = "ADMIN";
+    }
+
+    // ✅ When clinic marks COMPLETED, assume settlement is done at front desk
+    if (status === "COMPLETED") {
+      data.paymentStatus = "PAID";       // final state
+      data.financialStatus = null;       // no more diff pending
+      data.diffAmount = 0;
+      if (adminNote) data.adminNote = adminNote; // e.g. "Collected extra ₹100 cash"
     }
 
     const updated = await prisma.$transaction(async (tx) => {
@@ -245,7 +334,6 @@ export const updateAppointmentStatus = async (req, res) => {
       });
 
       if (status === "CANCELLED") {
-        // ✅ admin action => create as READ (no blinking)
         await tx.notification.create({
           data: {
             clinicId,
@@ -270,6 +358,20 @@ export const updateAppointmentStatus = async (req, res) => {
         previousStatus: existing.status,
         newStatus: status,
         reason: status === "CANCELLED" ? (reason || "Cancelled by clinic") : null,
+        financialBefore: {
+          paymentStatus: existing.paymentStatus,
+          financialStatus: existing.financialStatus,
+          diffAmount: existing.diffAmount,
+        },
+        financialAfter:
+          status === "COMPLETED"
+            ? {
+                paymentStatus: "PAID",
+                financialStatus: null,
+                diffAmount: 0,
+                adminNote: adminNote || null,
+              }
+            : null,
       },
       req,
     });
@@ -284,6 +386,7 @@ export const updateAppointmentStatus = async (req, res) => {
   }
 };
 
+
 // ----------------------------------------------------------------
 // RESCHEDULE APPOINTMENT BY ADMIN
 // ----------------------------------------------------------------
@@ -291,24 +394,14 @@ export const updateAppointmentStatus = async (req, res) => {
 
 export const rescheduleAppointmentByAdmin = async (req, res) => {
   try {
-    const { clinicId, userId } = req.user; // Admin ID
-    const { id } = req.params; // Appointment ID
-    const { newDate, newTime, note, deleteOldSlot } = req.body;
+    const { clinicId, userId } = req.user;
+    const { id } = req.params;
+    const { newDate, newTime, note } = req.body;
 
-    if (!newDate || !newTime) {
-      return res.status(400).json({ error: 'New date and time are required.' });
-    }
-
-    // 1. Fetch Appointment with Payment & Clinic Details
+    // 1. Fetch Appointment
     const appt = await prisma.appointment.findFirst({
       where: { id, clinicId, deletedAt: null },
-      include: {
-        slot: true,
-        doctor: true,
-        user: true,
-        payment: true,
-        clinic: true,
-      },
+      include: { slot: true, doctor: true, user: true, payment: true, clinic: true },
     });
 
     if (!appt) {
@@ -316,11 +409,9 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
     }
 
     const oldSlot = appt.slot;
-    const oldDate = oldSlot.date;
-    const oldTime = oldSlot.time;
     const targetDate = new Date(newDate);
 
-    // 2. Find/Create New Slot
+    // 2. Find/Create New Slot (NO BLOCK!)
     let newSlot = await prisma.slot.findFirst({
       where: {
         clinicId,
@@ -332,10 +423,6 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
     });
 
     if (!newSlot) {
-      const currentDoctor = await prisma.doctor.findUnique({
-        where: { id: appt.doctorId },
-      });
-
       newSlot = await prisma.slot.create({
         data: {
           clinicId,
@@ -344,136 +431,94 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
           time: newTime,
           duration: oldSlot.duration,
           type: oldSlot.type,
-          price: currentDoctor?.consultationFee || oldSlot.price,
+          price: oldSlot.price,  // ✅ Same price initially
           paymentMode: oldSlot.paymentMode,
-          // Slot.status uses AppointmentStatus enum
-          status: 'PENDING_PAYMENT', // ✅ valid enum value
+          status: 'PENDING_PAYMENT',
+          isBlocked: false,  // ✅ Admin = NO HOLD!
         },
       });
     }
 
-    // 3. Block Collision
+    // 3. Collision Check
     const anyApptOnSlot = await prisma.appointment.findFirst({
       where: {
         slotId: newSlot.id,
         deletedAt: null,
         id: { not: appt.id },
       },
-      select: { id: true, status: true },
     });
 
     if (anyApptOnSlot) {
-      return res.status(409).json({
-        error: `Slot already booked (Status: ${anyApptOnSlot.status}).`,
-      });
+      return res.status(409).json({ error: 'Slot already booked' });
     }
 
-    // 4. FINANCIAL LOGIC 💰
-    const amountPaid =
-      appt.payment?.status === 'COMPLETED' ? appt.payment.amount : 0;
+    // 🔥 4. FINANCIAL LOGIC (NO PAYMENT REQUIRED)
+    const amountPaid = appt.payment?.amount || 0;
     const newFee = newSlot.price;
     let financialStatus = 'NO_CHANGE';
+    let diffAmount = null;
     let financialMessage = '';
 
-    if (amountPaid === 0) {
-      financialStatus = 'PAY_AT_CLINIC';
-      financialMessage = `Please pay ₹${newFee} at the clinic.`;
-    } else if (newFee > amountPaid) {
+    if (newFee > amountPaid) {
       financialStatus = 'PAY_DIFFERENCE';
-      const diff = newFee - amountPaid;
-      financialMessage = `Price increased. Please pay the difference of ₹${diff} at the clinic.`;
+      diffAmount = newFee - amountPaid;
+      financialMessage = `Pay extra ₹${diffAmount} at clinic`;
     } else if (newFee < amountPaid) {
       financialStatus = 'REFUND_AT_CLINIC';
-      const diff = amountPaid - newFee;
-      financialMessage = `Price dropped. Collect refund of ₹${diff} at the clinic.`;
+      diffAmount = amountPaid - newFee;
+      financialMessage = `Collect refund ₹${diffAmount} at clinic`;
     }
 
-    // 5. Transaction: Update DB
+    // 🔥 5. ADMIN RESCHEDULE = IMMEDIATELY CONFIRMED!
     const updated = await prisma.$transaction(async (tx) => {
-      // Handle Old Slot
-      if (deleteOldSlot) {
-        await tx.slot.update({
-          where: { id: oldSlot.id },
-          data: { deletedAt: new Date() },
-        });
-      } else {
-        await tx.slot.update({
-          where: { id: oldSlot.id },
-          data: { status: 'PENDING_PAYMENT' }, // ✅ valid enum value
-        });
-      }
+      // Free old slot
+      await tx.slot.update({
+        where: { id: oldSlot.id },
+        data: { isBlocked: false, status: 'PENDING_PAYMENT' },
+      });
 
-      // Update Appointment
+      // Update appointment → CONFIRMED (NO payment hold!)
       const updatedAppt = await tx.appointment.update({
         where: { id: appt.id },
         data: {
           slotId: newSlot.id,
-          // AppointmentStatus enum: choose one existing value
-          status: 'CONFIRMED', // ✅ use CONFIRMED instead of invalid "RESCHEDULED"
+          status: 'CONFIRMED',           // ✅ Admin = CONFIRMED!
+          paymentStatus: 'PAID',         // ✅ Keep PAID status
+          financialStatus,               // Show refund/extra
+          diffAmount,
           updatedAt: new Date(),
         },
         include: { slot: true, doctor: true, user: true, clinic: true },
       });
 
-      // Log History
+      // Log
       await tx.appointmentLog.create({
         data: {
           appointmentId: appt.id,
-          oldDate,
-          oldTime,
+          oldDate: oldSlot.date,
+          oldTime: oldSlot.time,
           newDate: targetDate,
           newTime,
-          reason: note || 'Rescheduled by Admin',
+          reason: `Admin reschedule: ${financialMessage}`,
           changedBy: userId,
-          metadata: { financialStatus, financialMessage },
         },
       });
 
       return updatedAppt;
     });
 
-    // 6. Send Email (Async)
-    sendBookingEmails({
-      ...updated,
-      type: 'RESCHEDULE',
-      oldSlot,
-      customMessage: financialMessage,
-      clinicPhone: appt.clinic.phone,
-    }).catch(console.error);
-
-    // 7. Audit Log
-    await logAudit({
-      userId,
-      clinicId,
-      action: 'RESCHEDULE_APPOINTMENT',
-      entity: 'Appointment',
-      entityId: id,
-      details: {
-        financialAction: financialStatus,
-        financialMessage,
-        oldDate,
-        newDate: targetDate,
-      },
-      req,
-    });
-
-    // 8. RESPONSE with Admin Warning
-    return res.json({
+    res.json({
+      success: true,
       message: 'Rescheduled successfully',
       appointment: updated,
-      financialStatus,
-      adminAlert: `IMPORTANT: Please contact the patient at ${appt.user.phone} about this change. ${financialMessage}`,
+      financialAction: financialMessage || 'No payment change',
     });
   } catch (error) {
-    if (error?.code === 'P2002' && error?.meta?.target?.includes('slotId')) {
-      return res
-        .status(409)
-        .json({ error: 'Slot collision. Please refresh and try again.' });
-    }
-    console.error('Reschedule Error:', error);
-    return res.status(500).json({ error: 'Failed to reschedule' });
+    console.error('Admin Reschedule Error:', error);
+    res.status(500).json({ error: 'Failed to reschedule' });
   }
 };
+
 // ----------------------------------------------------------------
 // CANCEL APPOINTMENT (Admin) – direct admin cancel OR approve pending request
 // ----------------------------------------------------------------
@@ -597,15 +642,30 @@ export const getAppointmentDetails = async (req, res) => {
     const appointment = await prisma.appointment.findFirst({
       where: { id, clinicId, deletedAt: null },
       include: {
-        user: { select: { id: true, name: true, email: true, phone: true } },
+        user:   { select: { id: true, name: true, email: true, phone: true } },
         doctor: { select: { id: true, name: true, speciality: true } },
-        slot: true,
+        slot:   { select: { id: true, date: true, time: true, paymentMode: true, price: true } },
         clinic: true,
-        logs: { orderBy: { createdAt: 'desc' } },
+        logs:   { orderBy: { createdAt: "desc" } },
       },
     });
-
-    if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
+ console.log("ADMIN APPOINTMENT DETAILS RAW:", {
+      id: appointment?.id,
+      amount: appointment?.amount,
+      paymentStatus: appointment?.paymentStatus,
+      financialStatus: appointment?.financialStatus,
+      diffAmount: appointment?.diffAmount,
+      slot: appointment?.slot && {
+        id: appointment.slot.id,
+        paymentMode: appointment.slot.paymentMode,
+        price: appointment.slot.price,
+        date: appointment.slot.date,
+        time: appointment.slot.time,
+      },
+    });
+    if (!appointment) {
+      return res.status(404).json({ error: "Appointment not found" });
+    }
 
     const history = appointment.logs.map((log) => {
       const details = log.details || {};
@@ -624,16 +684,46 @@ export const getAppointmentDetails = async (req, res) => {
       };
     });
 
-    res.json({
-      ...appointment,
+    const amount = Number(appointment.amount ?? 0); // ensure number
+    const diffAmount = Number(appointment.diffAmount ?? 0);
+
+    return res.json({
+      id: appointment.id,
+      status: appointment.status,
+      paymentStatus: appointment.paymentStatus,
+      financialStatus: appointment.financialStatus,
+      amount,
+      diffAmount,
+      cancelReason: appointment.cancelReason,
+      cancelledBy: appointment.cancelledBy,
+      adminNote: appointment.adminNote,
+      hasUnreadCancellation: appointment.hasUnreadCancellation,
+      hasUnreadReschedule: appointment.hasUnreadReschedule,
+
       patient: appointment.user,
-      dateFormatted: new Date(appointment.slot.date).toLocaleDateString(),
-      timeFormatted: appointment.slot.time,
+      doctor: appointment.doctor,
+      clinic: appointment.clinic,
+
+      slot: appointment.slot
+        ? {
+            id: appointment.slot.id,
+            date: appointment.slot.date,
+            time: appointment.slot.time,
+            paymentMode: appointment.slot.paymentMode, // "CLINIC"/"ONLINE"/"FREE"
+            price: Number(appointment.slot.price ?? 0),
+          }
+        : null,
+
+      dateFormatted: appointment.slot
+        ? new Date(appointment.slot.date).toLocaleDateString()
+        : null,
+      timeFormatted: appointment.slot?.time ?? null,
+
       history,
     });
   } catch (error) {
-    console.error('Get Details Error:', error);
-    res.status(500).json({ error: error.message });
+    console.error("Get Details Error:", error);
+    return res.status(500).json({ error: error.message });
   }
 };
 
