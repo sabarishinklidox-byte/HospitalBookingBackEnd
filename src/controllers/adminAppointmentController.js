@@ -154,6 +154,9 @@ export const getAppointments = async (req, res) => {
       status: app.status,
       userId: app.userId,
       doctorId: app.doctorId,
+      
+      // 🔥 FIXED: ADDED createdAt FOR "Booked On" DISPLAY
+      createdAt: app.createdAt,
 
       patientName: app.user?.name || "Unknown",
       patientPhone: app.user?.phone || "N/A",
@@ -174,7 +177,7 @@ export const getAppointments = async (req, res) => {
       slotType: app.slot?.type || null,
       price: app.slot?.price ?? null,
 
-      // Booking finance info (CRITICAL FIX: sending amount here)
+      // Booking finance info
       amount: Number(app.amount ?? 0),
       paymentStatus: app.paymentStatus,
       financialStatus: app.financialStatus,
@@ -191,8 +194,8 @@ export const getAppointments = async (req, res) => {
 
       history: (app.logs || []).map((log) => ({
         id: log.id,
-        action: "RESCHEDULE_APPOINTMENT", // or simplify to log.action if you want actual action
-        changedBy: log.changedBy, // or log.userId depending on schema
+        action: "RESCHEDULE_APPOINTMENT",
+        changedBy: log.changedBy,
         timestamp: new Date(log.createdAt).toLocaleString(),
         oldDate: log.details?.oldDate
           ? new Date(log.details.oldDate).toLocaleDateString()
@@ -418,10 +421,38 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
     const { id } = req.params;
     const { newDate, newTime, note } = req.body;
 
-    // 1. Fetch Appointment
+    console.log('🔍 Admin Reschedule Request:', { id, newDate, newTime });
+
+    // 🔥 1. VALIDATE DATE FIRST (BLOCK INVALID!)
+    const safeDate = (dateStr) => {
+      if (!dateStr || typeof dateStr !== 'string') return null;
+      const date = new Date(dateStr);
+      if (isNaN(date.getTime()) || date.toString() === 'Invalid Date') return null;
+      // Ensure it's a valid date (not 1970)
+      if (date.getFullYear() < 2020) return null;
+      return date;
+    };
+
+    const targetDate = safeDate(newDate);
+    if (!targetDate || !newTime) {
+      console.error('❌ INVALID DATE:', newDate);
+      return res.status(400).json({ 
+        error: 'Invalid date or time format. Use YYYY-MM-DD and HH:MM' 
+      });
+    }
+
+    console.log('✅ Valid date:', targetDate);
+
+    // 2. Fetch Appointment
     const appt = await prisma.appointment.findFirst({
       where: { id, clinicId, deletedAt: null },
-      include: { slot: true, doctor: true, user: true, payment: true, clinic: true },
+      include: { 
+        slot: true, 
+        doctor: true, 
+        user: true, 
+        payment: true, 
+        clinic: true 
+      },
     });
 
     if (!appt) {
@@ -429,9 +460,9 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
     }
 
     const oldSlot = appt.slot;
-    const targetDate = new Date(newDate);
+    console.log('📅 Old slot:', oldSlot.date, oldSlot.time);
 
-    // 2. Find/Create New Slot (NO BLOCK!)
+    // 3. Find/Create New Slot
     let newSlot = await prisma.slot.findFirst({
       where: {
         clinicId,
@@ -449,17 +480,18 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
           doctorId: appt.doctorId,
           date: targetDate,
           time: newTime,
-          duration: oldSlot.duration,
-          type: oldSlot.type,
-          price: oldSlot.price,  // ✅ Same price initially
-          paymentMode: oldSlot.paymentMode,
-          status: 'PENDING_PAYMENT',
-          isBlocked: false,  // ✅ Admin = NO HOLD!
+          duration: oldSlot.duration || 30,
+          type: oldSlot.type || 'REGULAR',
+          price: oldSlot.price || 0,
+          paymentMode: oldSlot.paymentMode || 'OFFLINE',
+          status: 'PENDING',
+          isBlocked: false,
         },
       });
+      console.log('🆕 New slot created:', newSlot.id);
     }
 
-    // 3. Collision Check
+    // 4. Collision Check
     const anyApptOnSlot = await prisma.appointment.findFirst({
       where: {
         slotId: newSlot.id,
@@ -469,49 +501,103 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
     });
 
     if (anyApptOnSlot) {
-      return res.status(409).json({ error: 'Slot already booked' });
+      return res.status(409).json({ error: 'Slot already booked by another patient' });
     }
 
-    // 🔥 4. FINANCIAL LOGIC (NO PAYMENT REQUIRED)
-    const amountPaid = appt.payment?.amount || 0;
-    const newFee = newSlot.price;
+    // 🔥 5. FINANCIAL LOGIC
+    const oldPrice = Number(appt.amount || 0);
+    const oldPaidAmount = appt.paymentStatus === "PAID" ? Number(appt.payment?.amount || 0) : 0;
+    const newPrice = Number(newSlot.price || 0);
+    const isTargetOffline = newSlot.paymentMode === 'OFFLINE' || newSlot.paymentMode === 'CLINIC';
+
     let financialStatus = 'NO_CHANGE';
-    let diffAmount = null;
-    let financialMessage = '';
+    let diffAmount = 0;
+    let adminNote = '';
 
-    if (newFee > amountPaid) {
-      financialStatus = 'PAY_DIFFERENCE';
-      diffAmount = newFee - amountPaid;
-      financialMessage = `Pay extra ₹${diffAmount} at clinic`;
-    } else if (newFee < amountPaid) {
-      financialStatus = 'REFUND_AT_CLINIC';
-      diffAmount = amountPaid - newFee;
-      financialMessage = `Collect refund ₹${diffAmount} at clinic`;
+    if (isTargetOffline) {
+      if (newPrice === 0) {
+        if (oldPaidAmount > 0) {
+          financialStatus = 'FULL_REFUND';
+          diffAmount = oldPaidAmount;
+          adminNote = `Refund FULL ₹${(diffAmount/100).toFixed(0)} (online payment)`;
+        } else {
+          financialStatus = 'FREE_SLOT';
+          adminNote = 'Free consultation';
+        }
+      } else if (oldPaidAmount > 0) {
+        if (newPrice > oldPaidAmount) {
+          financialStatus = 'PAY_DIFFERENCE_OFFLINE';
+          diffAmount = newPrice - oldPaidAmount;
+          adminNote = `Collect ₹${(diffAmount/100).toFixed(0)} more (already paid ₹${(oldPaidAmount/100).toFixed(0)})`;
+        } else if (newPrice < oldPaidAmount) {
+          financialStatus = 'REFUND_AT_CLINIC';
+          diffAmount = oldPaidAmount - newPrice;
+          adminNote = `Refund ₹${(diffAmount/100).toFixed(0)} (paid ₹${(oldPaidAmount/100).toFixed(0)})`;
+        } else {
+          adminNote = `Same price ₹${(newPrice/100).toFixed(0)}`;
+        }
+      } else {
+        financialStatus = 'PAY_AT_CLINIC';
+        diffAmount = newPrice;
+        adminNote = `Collect FULL ₹${(newPrice/100).toFixed(0)} cash`;
+      }
+    } else {
+      // Online target (rare for admin)
+      if (newPrice !== oldPaidAmount) {
+        financialStatus = newPrice > oldPaidAmount ? 'PAY_DIFFERENCE' : 'REFUND_AT_CLINIC';
+        diffAmount = Math.abs(newPrice - oldPaidAmount);
+        adminNote = newPrice > oldPaidAmount 
+          ? `Pay ₹${(diffAmount/100).toFixed(0)} more online`
+          : `Refund ₹${(diffAmount/100).toFixed(0)}`;
+      }
     }
 
-    // 🔥 5. ADMIN RESCHEDULE = IMMEDIATELY CONFIRMED!
+    console.log(`💰 Financial: ${financialStatus} | ${adminNote}`);
+
+    // 6. TRANSACTION - Atomic Update
     const updated = await prisma.$transaction(async (tx) => {
       // Free old slot
       await tx.slot.update({
         where: { id: oldSlot.id },
-        data: { isBlocked: false, status: 'PENDING_PAYMENT' },
+        data: { 
+          status: 'PENDING', 
+          isBlocked: false 
+        },
       });
 
-      // Update appointment → CONFIRMED (NO payment hold!)
+      // Update appointment
       const updatedAppt = await tx.appointment.update({
         where: { id: appt.id },
         data: {
           slotId: newSlot.id,
-          status: 'CONFIRMED',           // ✅ Admin = CONFIRMED!
-          paymentStatus: 'PAID',         // ✅ Keep PAID status
-          financialStatus,               // Show refund/extra
+          status: 'CONFIRMED',           // ✅ Admin = INSTANT CONFIRM
+          paymentStatus: appt.paymentStatus, // ✅ Keep original status
+          financialStatus,
+          amount: newPrice,
           diffAmount,
+          adminNote,
           updatedAt: new Date(),
+          rescheduleCount: { increment: 1 }
         },
-        include: { slot: true, doctor: true, user: true, clinic: true },
+        include: { 
+          slot: true, 
+          doctor: true, 
+          user: true, 
+          clinic: true,
+          payment: true 
+        },
       });
 
-      // Log
+      // Confirm new slot
+      await tx.slot.update({
+        where: { id: newSlot.id },
+        data: { 
+          status: 'CONFIRMED',
+          isBlocked: false 
+        }
+      });
+
+      // Audit log
       await tx.appointmentLog.create({
         data: {
           appointmentId: appt.id,
@@ -519,7 +605,7 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
           oldTime: oldSlot.time,
           newDate: targetDate,
           newTime,
-          reason: `Admin reschedule: ${financialMessage}`,
+          reason: note || adminNote,
           changedBy: userId,
         },
       });
@@ -527,15 +613,19 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
       return updatedAppt;
     });
 
+    console.log('✅ Reschedule COMPLETE');
     res.json({
       success: true,
-      message: 'Rescheduled successfully',
+      message: `Rescheduled successfully! ${adminNote}`,
       appointment: updated,
-      financialAction: financialMessage || 'No payment change',
+      financialAction: adminNote,
     });
   } catch (error) {
-    console.error('Admin Reschedule Error:', error);
-    res.status(500).json({ error: 'Failed to reschedule' });
+    console.error('❌ Admin Reschedule FAILED:', error);
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ error: error.message });
+    }
+    return res.status(500).json({ error: 'Reschedule failed - check date format' });
   }
 };
 

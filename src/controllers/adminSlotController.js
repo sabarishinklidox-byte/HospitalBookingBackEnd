@@ -803,7 +803,7 @@ export const getManageableSlots = async (req, res) => {
       deletedAt: null,
     };
 
-    // 🔥 DATE FILTER (Today only by default)
+    // DATE FILTER (unchanged)
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     
@@ -813,55 +813,75 @@ export const getManageableSlots = async (req, res) => {
       const end = new Date(year, month - 1, day, 23, 59, 59);
       where.date = { gte: start, lte: end };
     } else {
-      // Default: TODAY only
       where.date = { gte: today, lte: new Date(today.getTime() + 24*60*60*1000 - 1) };
     }
 
-    // 🔥 DOCTOR FILTER (optional)
     if (doctorId) {
       where.doctorId = doctorId;
     }
 
-    const now = new Date(); // Current time for "passed" filter
+    const now = new Date();
 
+    // 🔥 SIMPLIFIED QUERY - NO APPOINTMENTS FILTER (SAFEST!)
     const slots = await prisma.slot.findMany({
       where,
       include: {
         doctor: { 
-          select: { 
-            id: true,
-            name: true 
-          } 
-        },
-        appointments: {
-          where: { 
-            deletedAt: null, 
-            status: { in: ['PENDING', 'CONFIRMED', 'PENDING_PAYMENT'] } 
-          },
-          select: { 
-            id: true,
-            // 🔥 FIXED: Use correct field (check your schema)
-            user: {
-              select: { name: true }
-            }
-          }
+          select: { id: true, name: true } 
         }
+        // 🔥 NO appointments include = NO CRASH!
       },
-      orderBy: [
-        { date: 'asc' },
-        { time: 'asc' }
-      ]
+      orderBy: [{ date: 'asc' }, { time: 'asc' }]
     });
 
-    // 🔥 ENRICH WITH PASSED/NOT_PASSED STATUS
+    // 🔥 SEPARATE APPOINTMENT QUERY (SAFE!)
+    const slotIds = slots.map(slot => slot.id);
+    const allAppointments = await prisma.appointment.findMany({
+      where: {
+        slotId: { in: slotIds },
+        deletedAt: null
+      },
+      select: {
+        id: true,
+        slotId: true,
+        status: true,
+        user: { select: { name: true } }
+      }
+    });
+
+    // 🔥 GROUP APPOINTMENTS BY SLOT
+    const apptBySlot = new Map();
+    allAppointments.forEach(appt => {
+      if (!apptBySlot.has(appt.slotId)) {
+        apptBySlot.set(appt.slotId, []);
+      }
+      apptBySlot.get(appt.slotId).push(appt);
+    });
+
+    // 🔥 ULTRA-SAFE PROCESSING
     const formattedSlots = slots.map(slot => {
-      // Parse slot datetime
       const slotDateTime = new Date(slot.date);
       const [hours, minutes] = slot.time.split(':').map(Number);
       slotDateTime.setHours(hours, minutes, 0, 0);
 
       const isPassed = slotDateTime < now;
       
+      // 🔥 SAFEST ARRAY CREATION
+      const appointments = apptBySlot.get(slot.id) || [];
+      
+      // 🔥 Filter active vs cancelled
+      const activeAppointments = appointments.filter(
+        appt => !['CANCELLED', 'REJECTED'].includes(appt.status)
+      );
+      
+      const cancelledAppointments = appointments.filter(
+        appt => ['CANCELLED', 'REJECTED'].includes(appt.status)
+      );
+      
+      const hasActiveAppointment = activeAppointments.length > 0;
+      const firstActiveAppt = activeAppointments[0];
+      const firstCancelledAppt = cancelledAppointments[0];
+
       return {
         id: slot.id,
         time: slot.time,
@@ -870,42 +890,41 @@ export const getManageableSlots = async (req, res) => {
         doctorId: slot.doctor?.id,
         price: slot.price || 0,
         
-        // 🔥 BLOCK STATUS
         isBlocked: Boolean(slot.isBlocked),
         blockedReason: slot.blockedReason || null,
         blockedBy: slot.blockedBy || null,
         blockedAt: slot.blockedAt ? slot.blockedAt.toISOString() : null,
         
-        // 🔥 APPOINTMENT STATUS
-        hasActiveAppointment: slot.appointments?.length > 0 || false,
-        patientName: slot.appointments?.[0]?.user?.name || null,
+        hasActiveAppointment,
+        appointmentCount: activeAppointments.length,
+        patientName: firstActiveAppt?.user?.name || null,
+        appointmentStatus: firstActiveAppt?.status || null,
+        cancelledAppointment: firstCancelledAppt,
         
-        // 🔥 🔥 NEW: TIME STATUS (CRUCIAL FOR MANAGER)
-        isPassed,  // true = PAST slot (grayed out)
-        slotDateTime: slotDateTime.toISOString(),  // Full datetime
+        isPassed,
+        slotDateTime: slotDateTime.toISOString(),
         
-        // 🔥 UTILIZATION STATUS
         status: slot.isBlocked 
           ? 'BLOCKED' 
-          : slot.hasActiveAppointment 
+          : hasActiveAppointment 
           ? 'BOOKED' 
           : isPassed 
           ? 'PASSED' 
-          : 'AVAILABLE'  // Can be blocked!
+          : 'AVAILABLE'
       };
     });
 
-    // 🔥 FILTER: Only show AVAILABLE + BLOCKED slots (hide fully booked/passed)
     const manageableSlots = formattedSlots.filter(slot => 
-      !slot.hasActiveAppointment &&  // Not booked
-      (slot.isBlocked || !slot.isPassed)  // Blocked OR still available
+      slot.status === 'AVAILABLE' || 
+      slot.status === 'BLOCKED' || 
+      slot.cancelledAppointment
     );
 
-    console.log(`✅ Found ${slots.length} total slots, ${manageableSlots.length} manageable`);
+    console.log(`✅ ${slots.length} slots, ${manageableSlots.length} manageable`);
 
     res.json({
       success: true,
-      slots: manageableSlots,  // Only blockable slots
+      slots: manageableSlots,
       filters: { doctorId, date },
       stats: {
         totalSlots: slots.length,
@@ -915,10 +934,11 @@ export const getManageableSlots = async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Slot Manager Error:', error);
+    console.error('🚨 Slot Manager Error:', error);
     res.status(500).json({ error: 'Failed to fetch slots' });
   }
 };
+
 
 
 export const blockSlot = async (req, res) => {
@@ -930,9 +950,9 @@ export const blockSlot = async (req, res) => {
     console.log('🔴 BLOCKING SLOT:', { slotId, reason, clinicId });
 
     const slot = await prisma.slot.update({
-      where: { 
+      where: {
         id: slotId,
-        clinicId 
+        clinicId,
       },
       data: {
         isBlocked: true,
@@ -941,8 +961,26 @@ export const blockSlot = async (req, res) => {
         blockedAt: new Date(),
       },
       include: {
-        doctor: { select: { name: true } }
-      }
+        doctor: { select: { name: true } },
+      },
+    });
+
+    // 🔥 AUDIT LOG
+    await logAudit({
+      userId,
+      clinicId,
+      action: 'BLOCK_SLOT',
+      entity: 'Slot',
+      entityId: slot.id,
+      details: {
+        doctorId: slot.doctorId,
+        doctorName: slot.doctor?.name,
+        date: slot.date,
+        time: slot.time,
+        newStatus: 'BLOCKED',
+        reason,
+      },
+      req,
     });
 
     res.json({
@@ -953,10 +991,9 @@ export const blockSlot = async (req, res) => {
         time: slot.time,
         doctorName: slot.doctor.name,
         isBlocked: true,
-        blockedReason: reason
-      }
+        blockedReason: reason,
+      },
     });
-
   } catch (error) {
     console.error('Block Slot Error:', error);
     if (error.code === 'P2025') {
@@ -966,17 +1003,18 @@ export const blockSlot = async (req, res) => {
   }
 };
 
+
 export const unblockSlot = async (req, res) => {
   try {
     const { slotId } = req.params;
-    const { clinicId } = req.user;
+    const { clinicId, userId } = req.user;
 
     console.log('🟢 UNBLOCKING SLOT:', { slotId, clinicId });
 
     const slot = await prisma.slot.update({
-      where: { 
+      where: {
         id: slotId,
-        clinicId 
+        clinicId,
       },
       data: {
         isBlocked: false,
@@ -985,8 +1023,25 @@ export const unblockSlot = async (req, res) => {
         blockedAt: null,
       },
       include: {
-        doctor: { select: { name: true } }
-      }
+        doctor: { select: { name: true } },
+      },
+    });
+
+    // 🔥 AUDIT LOG
+    await logAudit({
+      userId,
+      clinicId,
+      action: 'UNBLOCK_SLOT',
+      entity: 'Slot',
+      entityId: slot.id,
+      details: {
+        doctorId: slot.doctorId,
+        doctorName: slot.doctor?.name,
+        date: slot.date,
+        time: slot.time,
+        newStatus: 'UNBLOCKED',
+      },
+      req,
     });
 
     res.json({
@@ -996,10 +1051,9 @@ export const unblockSlot = async (req, res) => {
         id: slot.id,
         time: slot.time,
         doctorName: slot.doctor.name,
-        isBlocked: false
-      }
+        isBlocked: false,
+      },
     });
-
   } catch (error) {
     console.error('Unblock Slot Error:', error);
     if (error.code === 'P2025') {

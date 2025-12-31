@@ -16,7 +16,17 @@ import { sendBookingEmails } from '../utils/email.js'; // ✅ ADD EMAIL IMPORT
 // 1. RAZORPAY WEBHOOK
 // ----------------------------------------------------------------
 export const razorpayWebhook = async (req, res) => {
+    console.log('🔥 RAZORPAY RAW WEBHOOK HIT:', {
+    event: req.body.event,
+    orderId: req.body.payload?.payment?.entity?.order_id,
+    paymentId: req.body.payload?.payment?.entity?.id,
+    headers: {
+      signature: req.headers['x-razorpay-signature']?.slice(0, 20) + '...',
+      'user-agent': req.headers['user-agent']
+    }
+  });
   try {
+  
     const signature = req.headers['x-razorpay-signature'];
     const payload = req.body;
 

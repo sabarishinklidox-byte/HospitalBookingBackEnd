@@ -202,6 +202,7 @@ model Appointment {
   slug                String               @unique
   userId              String
   doctorId            String
+    rescheduleCount Int      @default(0)
   clinicId            String
   slotId              String               @unique
   section             BookingSection

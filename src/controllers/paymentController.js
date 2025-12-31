@@ -100,200 +100,237 @@ export const createCheckoutSession = async (req, res) => {
 // ---------------------------------------------------------------------
 // VERIFY PAYMENT + BOOK/RESCHEDULE (Unified Logic)
 // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// MAIN VERIFICATION ENDPOINT
+// ---------------------------------------------------------------------
+// Ensure correct import
+
 export const verifyPaymentAndBook = async (req, res) => {
   try {
-    const { provider, clinic_id } = req.body;
+    const { 
+      razorpay_order_id, 
+      razorpay_payment_id, 
+      razorpay_signature, 
+      appointmentId,
+      notes 
+    } = req.body;
 
-    if (!provider) return res.status(400).json({ error: 'provider is required' });
-    if (!clinic_id) return res.status(400).json({ error: 'clinic_id is required' });
+    if (!appointmentId) return res.status(400).json({ error: 'Appointment ID required' });
 
-    const gateway = await getActiveGateway(clinic_id);
-    if (!gateway || !gateway.secret) {
-      return res.status(400).json({ error: 'Gateway config missing.' });
+    console.log('🔍 VERIFYING PAYMENT:', { 
+      appointmentId, 
+      type: notes?.type || 'NEW_BOOKING',
+      amount: notes?.amount 
+    });
+
+    // 1. Fetch Appointment + Gateway
+    const appointment = await prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      include: { 
+        slot: true,
+        clinic: { include: { gateways: true } },
+        doctor: true,
+        user: true
+      }
+    });
+
+    if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
+
+    // 2. Gateway Lookup & Signature Verification
+    const gateway = appointment.clinic.gateways.find(g => g.name === 'RAZORPAY' && g.isActive);
+    if (!gateway?.secret) return res.status(400).json({ error: 'Gateway config missing' });
+
+    const generated_signature = crypto
+      .createHmac('sha256', gateway.secret)
+      .update(razorpay_order_id + '|' + razorpay_payment_id)
+      .digest('hex');
+
+    if (generated_signature !== razorpay_signature) {
+      return res.status(400).json({ error: 'Invalid payment signature' });
     }
 
-    // ============================================================
-    // 1. STRIPE FLOW
-    // ============================================================
-    if (provider === 'STRIPE') {
-      const { session_id } = req.body;
-      if (!session_id) return res.status(400).json({ error: 'session_id is required' });
+    // 3. DETERMINE IF RESCHEDULE OR NEW
+    const isReschedule = notes?.type === 'RESCHEDULE' || notes?.type === 'OFFLINE_TO_ONLINE';
 
-      const stripe = new Stripe(gateway.secret);
-      const session = await stripe.checkout.sessions.retrieve(session_id);
-
-      if (session.payment_status !== 'paid') {
-        return res.status(400).json({ error: 'Payment not completed.' });
-      }
-
-      const metadata = session.metadata || {};
-
-      // ✅ DETECT RESCHEDULE
-      if (metadata.type === 'RESCHEDULE') {
-        return await handleRescheduleSuccess(res, metadata, session.payment_intent, session.amount_total, gateway.id);
-      }
-
-      // NORMAL BOOKING LOGIC
-      const { slotId, doctorId, userId, clinicId } = metadata;
-      if (!slotId) return res.status(400).json({ error: 'Missing metadata.' });
-
-      // Idempotent check
-      const existing = await prisma.appointment.findUnique({ where: { slotId } });
-      if (existing) return res.json({ success: true, appointment: existing });
-
-      // Create Booking
-      const appointment = await prisma.$transaction(async (tx) => {
-        await tx.slot.update({ where: { id: slotId }, data: { status: 'CONFIRMED', isBooked: true } });
-        
-        const appt = await tx.appointment.create({
-          data: {
-            userId, doctorId, clinicId, slotId, section: 'GENERAL', status: 'CONFIRMED', paymentId: session.payment_intent,
-          },
-        });
-
-        await tx.payment.create({
-          data: {
-            appointmentId: appt.id, clinicId, doctorId, gatewayId: gateway.id, amount: Number(session.amount_total) / 100, status: 'PAID', gatewayRefId: session.payment_intent,
-          },
-        });
-        return appt;
+    // 🔥 4. UNIFIED TRANSACTION (Handles both cases safely)
+    const result = await prisma.$transaction(async (tx) => {
+      
+      // A. Update Appointment Status
+      const updatedAppt = await tx.appointment.update({
+        where: { id: appointmentId },
+        data: {
+          status: "CONFIRMED",
+          paymentStatus: "PAID",
+          financialStatus: "PAID",
+          paymentId: razorpay_payment_id,
+          orderId: razorpay_order_id,
+          adminNote: isReschedule 
+            ? `Reschedule Paid: ${razorpay_payment_id}` 
+            : `Booking Paid: ${razorpay_payment_id}`,
+          updatedAt: new Date()
+        },
+        include: { slot: true, clinic: true, doctor: true, user: true }
       });
 
-      return res.json({ success: true, appointment });
-    }
-
-    // ============================================================
-    // 2. RAZORPAY FLOW
-    // ============================================================
-    if (provider === 'RAZORPAY') {
-      const { razorpay_order_id, razorpay_payment_id, razorpay_signature, notes } = req.body;
-
-      // Verify Signature
-      const hmac = crypto.createHmac('sha256', gateway.secret)
-        .update(razorpay_order_id + '|' + razorpay_payment_id)
-        .digest('hex');
-
-      if (hmac !== razorpay_signature) {
-        return res.status(400).json({ error: 'Invalid payment signature.' });
-      }
-
-      // Fetch order details to get notes (metadata) if not provided in body
-      let paymentMetadata = notes || {};
-      if (!paymentMetadata.type && !paymentMetadata.slotId) {
-         const razorpay = new Razorpay({ key_id: gateway.apiKey, key_secret: gateway.secret });
-         const order = await razorpay.orders.fetch(razorpay_order_id);
-         paymentMetadata = order.notes || {};
-      }
-
-      // ✅ DETECT RESCHEDULE
-      if (paymentMetadata.type === 'RESCHEDULE') {
-        // Amount is in paise, convert to rupees for storage
-        const amountPaise = req.body.amount || 0; 
-        return await handleRescheduleSuccess(res, paymentMetadata, razorpay_payment_id, amountPaise, gateway.id);
-      }
-
-      // NORMAL BOOKING LOGIC
-      const { slotId, doctorId, userId } = paymentMetadata;
-      if (!slotId) return res.status(400).json({ error: 'Missing metadata notes.' });
-
-      // Ensure slot matches clinic
-      const slot = await prisma.slot.findUnique({ where: { id: slotId } });
-      if (!slot || slot.clinicId !== clinic_id) return res.status(404).json({ error: 'Slot/Clinic mismatch.' });
-
-      // Idempotent check
-      const existing = await prisma.appointment.findUnique({ where: { slotId } });
-      if (existing) return res.json({ success: true, appointment: existing });
-
-      // Create Booking
-      const appointment = await prisma.$transaction(async (tx) => {
-        await tx.slot.update({ where: { id: slotId }, data: { status: 'CONFIRMED', isBooked: true } });
-
-        const appt = await tx.appointment.create({
-          data: {
-            userId, doctorId, clinicId: clinic_id, slotId, section: 'GENERAL', status: 'CONFIRMED', paymentId: razorpay_payment_id,
-          },
+      // B. Update Slot Status
+      // (For reschedule, the slotId is already updated in the reschedule step before this)
+      if (updatedAppt.slotId) {
+        await tx.slot.update({
+          where: { id: updatedAppt.slotId },
+          data: { 
+            status: "CONFIRMED", 
+            isBlocked: false, 
+            isBooked: true 
+          }
         });
+      }
 
-        await tx.payment.create({
-          data: {
-            appointmentId: appt.id, clinicId: clinic_id, doctorId, gatewayId: gateway.id, amount: Number(slot.price), status: 'PAID', gatewayRefId: razorpay_payment_id,
-          },
-        });
-        return appt;
+      // 🔥 C. SAFELY HANDLE PAYMENT RECORD (UPSERT)
+      // This is the specific fix for your P2002 error.
+      // It works for both new bookings (creates) and reschedules (updates).
+      
+      const paymentAmount = notes?.amount ? Number(notes.amount) : Number(appointment.amount);
+
+      await tx.payment.upsert({
+        where: { appointmentId: appointmentId }, 
+        update: {
+          // If payment row exists (Reschedule), update it
+          amount: paymentAmount,
+          gatewayRefId: razorpay_payment_id,
+          status: "PAID",
+          gatewayId: gateway.id,
+          createdAt: new Date() // Refresh timestamp
+        },
+        create: {
+          // If payment row missing (New Booking), create it
+          appointmentId: appointmentId,
+          clinicId: appointment.clinicId,
+          doctorId: appointment.doctorId,
+          gatewayId: gateway.id,
+          amount: paymentAmount,
+          status: "PAID",
+          gatewayRefId: razorpay_payment_id
+        }
       });
 
-      return res.json({ success: true, appointment });
-    }
+      return updatedAppt;
+    });
 
-    return res.status(400).json({ error: `Unsupported provider: ${provider}` });
+    // 5. Send Email Notification
+    sendBookingEmails({
+      type: isReschedule ? "RESCHEDULE_CONFIRMED" : "CONFIRMED",
+      id: result.id,
+      clinic: result.clinic,
+      doctor: result.doctor,
+      slot: result.slot,
+      user: result.user
+    }).catch(err => console.error("Email failed:", err));
 
-  } catch (err) {
-    console.error('Verify Payment Error:', err);
-    return res.status(500).json({ error: 'Failed to verify payment' });
+    return res.json({ 
+      success: true, 
+      message: isReschedule ? "Reschedule confirmed!" : "Booking confirmed!", 
+      data: result 
+    });
+
+  } catch (error) {
+    console.error('🚨 VERIFY ERROR:', error);
+    return res.status(500).json({ error: 'Payment verification failed' });
   }
 };
 
-// ----------------------------------------------------------------
-// PRIVATE HELPER: Handle Reschedule Logic (Shared)
-// ----------------------------------------------------------------
+// ---------------------------------------------------------------------
+// SHARED RESCHEDULE HANDLER (Used by both verifyPayment & webhooks)
+// ---------------------------------------------------------------------
 async function handleRescheduleSuccess(res, metadata, paymentId, amountTotal, gatewayId) {
-    const appointmentId = metadata.appointmentId;
-    const newSlotId = metadata.slotId || metadata.rescheduleToSlot;
+  const appointmentId = metadata.appointmentId;
+  const newSlotId = metadata.slotId || metadata.rescheduleToSlot;
 
-    console.log(`🔄 Verifying Reschedule: Appt ${appointmentId} -> New Slot ${newSlotId}`);
+  if (!appointmentId || !newSlotId) {
+    return res.status(400).json({ error: 'Missing appointmentId or newSlotId' });
+  }
 
-    try {
-        await prisma.$transaction(async (tx) => {
-            // 1. Fetch current appointment to identify OLD slot
-            const currentAppt = await tx.appointment.findUnique({ where: { id: appointmentId } });
-            if (!currentAppt) throw new Error("Appointment not found");
+  console.log(`🔄 RESCHEDULE: ${appointmentId} → ${newSlotId}`);
 
-            // 2. Free up OLD Slot
-            if (currentAppt.slotId) {
-                await tx.slot.update({
-                    where: { id: currentAppt.slotId },
-                    data: { isBooked: false, status: 'AVAILABLE' }
-                });
-            }
+  try {
+    await prisma.$transaction(async (tx) => {
+      const currentAppt = await tx.appointment.findUnique({ 
+        where: { id: appointmentId },
+        include: { clinic: { include: { gateways: true } }, doctor: true, user: true, slot: true }
+      });
+      
+      if (!currentAppt) throw new Error(`Appointment not found: ${appointmentId}`);
 
-            // 3. Occupy NEW Slot
-            await tx.slot.update({
-                where: { id: newSlotId },
-                data: { isBooked: true, status: 'CONFIRMED' }
-            });
+      // Idempotency
+      if (currentAppt.paymentId === paymentId || currentAppt.status === 'CONFIRMED') {
+        return res.status(200).json({ success: true, message: 'Already processed' });
+      }
 
-            // 4. Update Appointment
-            const updated = await tx.appointment.update({
-                where: { id: appointmentId },
-                data: {
-                    slotId: newSlotId,
-                    status: 'CONFIRMED',
-                    paymentStatus: 'PAID',
-                    paymentId: paymentId,
-                    amount: Number(amountTotal) / 100, // Convert paise to rupees
-                    adminNote: 'Rescheduled via Online Payment',
-                    updatedAt: new Date()
-                }
-            });
-
-            // 5. Create Payment Record
-            await tx.payment.create({
-                data: {
-                    appointmentId: updated.id,
-                    clinicId: updated.clinicId,
-                    doctorId: updated.doctorId,
-                    gatewayId: gatewayId,
-                    amount: Number(amountTotal) / 100,
-                    status: 'PAID',
-                    gatewayRefId: paymentId,
-                }
-            });
+      // Free OLD slot
+      if (currentAppt.slotId && currentAppt.slotId !== newSlotId) {
+        await tx.slot.update({
+          where: { id: currentAppt.slotId },
+          data: { isBooked: false, status: 'AVAILABLE', isBlocked: false }
         });
+      }
 
-        return res.json({ success: true, message: "Reschedule Confirmed" });
+      // Book NEW slot
+      await tx.slot.update({
+        where: { id: newSlotId },
+        data: { isBooked: true, status: 'CONFIRMED', isBlocked: false }
+      });
 
-    } catch (error) {
-        console.error("Reschedule Verification Failed:", error);
-        return res.status(500).json({ error: "Database update failed during reschedule" });
-    }
+      // Update appointment
+      const updatedAppt = await tx.appointment.update({
+        where: { id: appointmentId },
+        data: {
+          slotId: newSlotId,
+          status: 'CONFIRMED',
+          paymentStatus: 'PAID',
+          financialStatus: 'PAID',
+          paymentId: paymentId,
+          amount: Number(amountTotal) / 100,
+          adminNote: `Rescheduled via payment (${paymentId})`,
+          updatedAt: new Date()
+        },
+        include: { clinic: true, doctor: true, user: true, slot: true }
+      });
+
+      // Payment record (idempotent)
+      const existingPayment = await tx.payment.findFirst({ where: { gatewayRefId: paymentId } });
+      if (!existingPayment) {
+        await tx.payment.create({
+          data: {
+            appointmentId: updatedAppt.id,
+            clinicId: updatedAppt.clinicId,
+            doctorId: updatedAppt.doctorId,
+            gatewayId: gatewayId,
+            amount: Number(amountTotal) / 100,
+            status: 'PAID',
+            gatewayRefId: paymentId,
+          }
+        });
+      }
+
+      // Email
+      sendBookingEmails({
+        type: "RESCHEDULE",
+        id: updatedAppt.id,
+        clinic: updatedAppt.clinic,
+        doctor: updatedAppt.doctor,
+        slot: updatedAppt.slot,
+        oldSlot: { id: currentAppt.slotId },
+        user: updatedAppt.user
+      }).catch(console.error);
+    });
+
+    return res.status(200).json({ 
+      success: true, 
+      type: 'RESCHEDULE_PROCESSED',
+      appointmentId 
+    });
+
+  } catch (error) {
+    console.error('❌ RESCHEDULE FAILED:', error);
+    return res.status(500).json({ error: 'Reschedule processing failed' });
+  }
 }
