@@ -296,7 +296,7 @@ export const createBooking = async (req, res) => {
     const SAFETY_MS = 15 * 60 * 1000;
     const now = new Date();
 
-    // 1. Fetch Slot + Clinic + Doctor (unchanged)
+    // 1. Fetch Slot + Clinic + Doctor
     const slotData = await prisma.slot.findUnique({
       where: { id: slotId },
       include: { clinic: true, doctor: true },
@@ -304,7 +304,7 @@ export const createBooking = async (req, res) => {
 
     if (!slotData) return res.status(404).json({ error: 'Slot not found' });
 
-    // 2. RECENT HOLD CHECK (unchanged)
+    // 2. RECENT HOLD CHECK
     const recentHold = await prisma.appointment.findFirst({
       where: {
         slotId,
@@ -315,17 +315,16 @@ export const createBooking = async (req, res) => {
     });
 
     if (recentHold) {
-  if (recentHold.userId !== authUserId) {
-    return res.status(409).json({
-      error: 'Slot on hold by another user. Please wait 10-15 mins or choose another.',
-      retry: true,
-    });
-  }
-      // Same user → refresh hold
- return handleExistingHold(recentHold, slotData, provider, now, HOLD_MS, res, slotData.clinicId, req);
+      if (recentHold.userId !== authUserId) {
+        return res.status(409).json({
+          error: 'Slot on hold by another user. Please wait 10-15 mins or choose another.',
+          retry: true,
+        });
+      }
+      return handleExistingHold(recentHold, slotData, provider, now, HOLD_MS, res, slotData.clinicId, req);
     }
 
-    // 3. Plan validation (unchanged)
+    // 3. Plan validation
     const plan = await getClinicPlan(slotData.clinicId);
     if (!plan) {
       return res.status(400).json({ error: 'Clinic has no active subscription plan.' });
@@ -338,10 +337,10 @@ export const createBooking = async (req, res) => {
       });
     }
 
-    // 🔥 4. ATOMIC TRANSACTION (unchanged)
+    // 🔥 4. ATOMIC TRANSACTION - FIXED CLEANUP!
     const result = await prisma.$transaction(async (tx) => {
-      // CLEANUP + SAFETY CHECKS (unchanged)
-      await tx.appointment.deleteMany({
+      // 🔥 FIXED: SAFE CLEANUP (DELETE PAYMENTS FIRST!)
+      const staleAppts = await tx.appointment.findMany({
         where: {
           slotId,
           OR: [
@@ -352,9 +351,31 @@ export const createBooking = async (req, res) => {
               createdAt: { lt: new Date(now.getTime() - SAFETY_MS) }
             }
           ]
-        }
+        },
+        select: { id: true }
       });
 
+      const staleIds = staleAppts.map(a => a.id);
+      
+      if (staleIds.length > 0) {
+        console.log(`🧹 Cleaning ${staleIds.length} stale appointments`);
+        
+        // CRITICAL: DELETE PAYMENTS FIRST!
+        await tx.payment.deleteMany({
+          where: { 
+            appointmentId: { in: staleIds } 
+          }
+        });
+        
+        // NOW delete appointments (SAFE!)
+        await tx.appointment.deleteMany({
+          where: { id: { in: staleIds } }
+        });
+        
+        console.log(`✅ Cleaned ${staleIds.length} appointments + payments`);
+      }
+
+      // SAFETY CHECKS
       const confirmed = await tx.appointment.findFirst({
         where: { slotId, status: 'CONFIRMED', deletedAt: null }
       });
@@ -418,10 +439,9 @@ export const createBooking = async (req, res) => {
       };
     });
 
-    // 🔥 5. SUCCESS PROCESSING + AUDIT LOG (NEW!)
+    // 5. SUCCESS PROCESSING + AUDIT LOG
     const { appointment, gatewayId, orderData, isOnline, createNew } = result;
     
-    // 🔥 AUDIT LOG AFTER TRANSACTION SUCCESS!
     await logAudit({
       userId: authUserId,
       clinicId: slotData.clinicId,
@@ -444,7 +464,7 @@ export const createBooking = async (req, res) => {
       req,
     });
 
-    // NON-BLOCKING EMAILS (unchanged)
+    // NON-BLOCKING EMAILS
     if (!isOnline && createNew) {
       getUserById(authUserId).then(user => {
         sendBookingEmails({
@@ -465,7 +485,6 @@ export const createBooking = async (req, res) => {
       status: appointment.status,
     });
 
-    // PERFECT RESPONSE (unchanged)
     return res.json({
       success: true,
       appointmentId: appointment.id,
@@ -483,7 +502,6 @@ export const createBooking = async (req, res) => {
     });
 
   } catch (error) {
-    // ERROR HANDLING (unchanged)
     console.error('🚨 CRITICAL BOOKING ERROR:', error);
 
     if (error.message === 'SLOT_BLOCKED') {
@@ -511,6 +529,7 @@ export const createBooking = async (req, res) => {
     });
   }
 };
+
 
 // 🔥 PRODUCTION HELPER: Refresh existing hold (same user only)
 // ✅ FIXED handleExistingHold (Updated signature + fix)
