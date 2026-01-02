@@ -30,6 +30,8 @@ import PDFDocument from "pdfkit";
 import { sendBookingEmails,sendAppointmentStatusEmail, 
   sendCancellationEmail 
     } from '../utils/email.js';
+    import Razorpay from "razorpay";
+
 // ----------------------------------------------------------------
 // GET APPOINTMENTS (List)
 // ----------------------------------------------------------------
@@ -119,6 +121,9 @@ export const getAppointments = async (req, res) => {
             },
           },
           logs: { orderBy: { createdAt: "desc" } },
+
+          // ✅ ADD THIS (must match schema field name exactly)
+          cancellationRequest: true,
         },
       }),
     ]);
@@ -154,8 +159,7 @@ export const getAppointments = async (req, res) => {
       status: app.status,
       userId: app.userId,
       doctorId: app.doctorId,
-      
-      // 🔥 FIXED: ADDED createdAt FOR "Booked On" DISPLAY
+
       createdAt: app.createdAt,
 
       patientName: app.user?.name || "Unknown",
@@ -172,12 +176,10 @@ export const getAppointments = async (req, res) => {
         : "N/A",
       timeFormatted: app.slot?.time || "N/A",
 
-      // Slot payment info
       paymentMode: app.slot?.paymentMode || null,
       slotType: app.slot?.type || null,
       price: app.slot?.price ?? null,
 
-      // Booking finance info
       amount: Number(app.amount ?? 0),
       paymentStatus: app.paymentStatus,
       financialStatus: app.financialStatus,
@@ -196,17 +198,26 @@ export const getAppointments = async (req, res) => {
         id: log.id,
         action: "RESCHEDULE_APPOINTMENT",
         changedBy: log.changedBy,
-        timestamp: new Date(log.createdAt).toLocaleString(),
-        oldDate: log.details?.oldDate
-          ? new Date(log.details.oldDate).toLocaleDateString()
-          : null,
-        newDate: log.details?.newDate
-          ? new Date(log.details.newDate).toLocaleDateString()
-          : null,
-        oldTime: log.details?.oldTime || null,
-        newTime: log.details?.newTime || null,
-        reason: log.details?.reason || null,
+        timestamp: log.createdAt,
+        oldDate: log.oldDate,
+        newDate: log.newDate,
+        oldTime: log.oldTime,
+        newTime: log.newTime,
+        reason: log.reason,
       })),
+
+      // ✅ NEW: send cancellation request details for admin UI buttons
+      cancellationRequest: app.cancellationRequest
+        ? {
+            id: app.cancellationRequest.id,
+            status: app.cancellationRequest.status,
+            reason: app.cancellationRequest.reason,
+            createdAt: app.cancellationRequest.createdAt,
+            processedAt: app.cancellationRequest.processedAt,
+            processedById: app.cancellationRequest.processedById,
+            adminNote: app.cancellationRequest.adminNote,
+          }
+        : null,
     }));
 
     return res.json({
@@ -1061,3 +1072,239 @@ export const exportAppointmentsExcel = async (req, res) => {
 // CANCEL APPOINTMENT (Admin)  – direct admin cancel OR approve pending request
 // ----------------------------------------------------------------
 
+export const processCancellationRequest = async (req, res) => {
+  try {
+    const adminId = req.user?.id || req.user?.userId || req.user?._id;
+    const { requestId, action, adminNote } = req.body;
+
+    console.log("🔄 Processing:", { requestId, action, adminNote });
+
+    if (!adminId) return res.status(401).json({ error: "Unauthorized" });
+    if (!requestId || !action) {
+      return res.status(400).json({ error: "Missing requestId/action" });
+    }
+
+    // 🔥 LOOKUP FIRST
+    const request = await prisma.cancellationRequest.findUnique({
+      where: { id: requestId },
+      include: {
+        appointment: {
+          include: {
+            slot: true,
+            payment: true,
+            clinic: { include: { gateways: { where: { isActive: true } } } },
+          },
+        },
+      },
+    });
+
+    if (!request) return res.status(404).json({ error: "Request not found" });
+    if (request.status !== "PENDING") {
+      return res.status(400).json({ error: "Request already processed" });
+    }
+
+    const appointment = request.appointment;
+    if (!appointment) {
+      return res.status(404).json({ error: "Appointment not found for request" });
+    }
+
+    console.log("✅ Found:", { 
+      requestId, 
+      appointmentId: appointment.id, 
+      userId: appointment.userId,
+      hasUserId: !!appointment.userId 
+    });
+
+    // ❌ REJECT (unchanged)
+    if (action === "REJECT") {
+      await prisma.cancellationRequest.update({
+        where: { id: requestId },
+        data: {
+          status: "REJECTED",
+          reason: adminNote || request.reason || null,
+          processedAt: new Date(),
+          processedById: adminId,
+        },
+      });
+
+      if (appointment.userId) {
+        await prisma.notification.create({
+          data: {
+            userId: appointment.userId,
+            type: "CANCEL_REQUEST",
+            entityId: appointment.id,
+            message: adminNote
+              ? `Cancellation request rejected by clinic. Reason: ${adminNote}`
+              : "Cancellation request rejected by clinic.",
+          },
+        });
+      }
+
+      await logAudit({
+        userId: adminId,
+        clinicId: appointment.clinicId,
+        action: "REJECT_CANCELLATION_REQUEST",
+        entity: "Appointment",
+        entityId: appointment.id,
+        details: { requestId, adminNote },
+        req,
+      });
+
+      return res.json({
+        success: true,
+        message: "Cancellation request rejected by clinic.",
+        data: { requestId, status: "REJECTED", note: adminNote || null },
+      });
+    }
+
+    // ✅ APPROVE (FULLY FIXED)
+    if (action === "APPROVE") {
+      const gateway = (appointment.clinic?.gateways || []).find(
+        (g) => g.name === "RAZORPAY"
+      );
+
+      const isPaidOnline =
+        appointment.paymentStatus === "PAID" &&
+        (appointment.slot?.paymentMode === "ONLINE");
+
+      let refundId = null;
+      const razorpayPaymentId = appointment.payment?.gatewayRefId;
+
+      if (isPaidOnline) {
+        if (!gateway?.apiKey || !gateway?.secret) {
+          return res.status(400).json({ error: "Razorpay gateway keys missing for this clinic." });
+        }
+        if (!razorpayPaymentId) {
+          return res.status(400).json({
+            error: "Missing Razorpay payment id. Cannot refund.",
+          });
+        }
+
+        try {
+          const razorpay = new Razorpay({
+            key_id: gateway.apiKey,
+            key_secret: gateway.secret,
+          });
+
+          const refund = await razorpay.payments.refund(razorpayPaymentId, {
+            amount: Math.round(Number(appointment.amount || 0) * 100),
+            notes: { reason: "Admin Approved Cancellation" },
+          });
+
+          refundId = refund?.id || null;
+          console.log("💰 Refund success:", refundId);
+        } catch (err) {
+          console.error("Refund Error:", err?.error || err);
+          return res.status(500).json({
+            error: err?.error?.description || "Razorpay Refund Failed.",
+          });
+        }
+      }
+
+      // 🔥 FIXED TRANSACTION WITH 3 CHANGES
+      await prisma.$transaction(async (tx) => {
+        // A) Mark request approved
+        await tx.cancellationRequest.update({
+          where: { id: requestId },
+          data: {
+            status: "APPROVED",
+            processedAt: new Date(),
+            processedById: adminId,
+            reason: refundId
+              ? `${request.reason || ""} | RefundId:${refundId}`.trim()
+              : (request.reason || null),
+          },
+        });
+
+        // B) Cancel appointment + ✅ FIXED DATA
+        await tx.appointment.update({
+          where: { id: appointment.id },
+          data: {
+            status: "CANCELLED",
+            cancelReason: request.reason || "Admin approved cancellation",
+            cancelledBy: "ADMIN",
+            financialStatus: "REFUNDED",
+            paymentStatus: "REFUNDED",                           // ✅ 1. UI detects refund
+            adminNote: refundId                                   // ✅ 2. Shows refund message
+              ? `Refund initiated (RefundId: ${refundId}). Expected 5-7 working days.`
+              : "Cancellation approved by clinic (no refund required).",
+            logs: {
+              create: {
+                oldDate: appointment.slot.date,
+                oldTime: appointment.slot.time,
+                newDate: appointment.slot.date,
+                newTime: appointment.slot.time,
+                reason: "Admin approved cancellation",
+                changedBy: adminId,
+                metadata: { refundId },
+              },
+            },
+          },
+        });
+
+        // C) Free slot
+        await tx.slot.update({
+          where: { id: appointment.slotId },
+          data: { status: "PENDING", isBlocked: false, blockedReason: null },
+        });
+
+        // D) Mark payment refunded
+        if (isPaidOnline && appointment.payment?.id) {
+          await tx.payment.update({
+            where: { id: appointment.payment.id },
+            data: { status: "REFUNDED" },
+          });
+        }
+
+        // ✅ 3. Clear reschedule logs (FIXES badge bug)
+        await tx.appointmentLog.deleteMany({
+          where: {
+            appointmentId: appointment.id,
+            action: "RESCHEDULE_APPOINTMENT"
+          }
+        });
+      });
+
+      // 2) User notification
+      if (appointment.userId) {
+        await prisma.notification.create({
+          data: {
+            userId: appointment.userId,
+            type: "CANCEL_REQUEST",
+            entityId: appointment.id,
+            message: refundId
+              ? `Cancellation approved. Refund initiated (RefundId: ${refundId}). It may take 5-7 working days to reflect.`
+              : "Cancellation request approved.",
+          },
+        });
+      }
+
+      await logAudit({
+        userId: adminId,
+        clinicId: appointment.clinicId,
+        action: "APPROVE_CANCELLATION_REFUND",
+        entity: "Appointment",
+        entityId: appointment.id,
+        details: { requestId, refundId, amount: appointment.amount },
+        req,
+      });
+
+      return res.json({
+        success: true,
+        message: refundId
+          ? `Refund initiated! RefundId: ${refundId}`
+          : "Appointment cancelled successfully.",
+        data: { requestId, refundId, amount: appointment.amount },
+      });
+    }
+
+    return res.status(400).json({ error: "Invalid action. Use APPROVE or REJECT." });
+  } catch (error) {
+    console.error("💥 ProcessCancellationRequest ERROR:", {
+      message: error.message,
+      code: error.code,
+      meta: error.meta,
+    });
+    return res.status(500).json({ error: "Processing failed", details: error.message });
+  }
+};

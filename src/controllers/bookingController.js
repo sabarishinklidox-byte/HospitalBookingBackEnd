@@ -282,6 +282,7 @@ const getPaymentInstance = async (clinicId, provider = 'RAZORPAY') => {
 //     });
 //   }
 // };
+// ✅ FULLY FIXED createBooking - Handles ALL FK + Race Conditions!
 export const createBooking = async (req, res) => {
   try {
     const { slotId, paymentMethod = 'ONLINE', provider = 'RAZORPAY' } = req.body;
@@ -337,9 +338,9 @@ export const createBooking = async (req, res) => {
       });
     }
 
-    // 🔥 4. ATOMIC TRANSACTION - FIXED CLEANUP!
+    // 🔥 4. ATOMIC TRANSACTION - FULLY FIXED CLEANUP!
     const result = await prisma.$transaction(async (tx) => {
-      // 🔥 FIXED: SAFE CLEANUP (DELETE PAYMENTS FIRST!)
+      // 🔥 COMPLETE STALE CLEANUP (ALL CHILDREN FIRST!)
       const staleAppts = await tx.appointment.findMany({
         where: {
           slotId,
@@ -358,24 +359,40 @@ export const createBooking = async (req, res) => {
       const staleIds = staleAppts.map(a => a.id);
       
       if (staleIds.length > 0) {
-        console.log(`🧹 Cleaning ${staleIds.length} stale appointments`);
+        console.log(`🧹 Cleaning ${staleIds.length} stale appointments + children`);
         
-        // CRITICAL: DELETE PAYMENTS FIRST!
+        // CRITICAL ORDER: Children → Parent (No FK Violations!)
+        await tx.cancellationRequest.deleteMany({  // 🔥 ADDED
+          where: { appointmentId: { in: staleIds } }
+        });
         await tx.payment.deleteMany({
-          where: { 
-            appointmentId: { in: staleIds } 
-          }
+          where: { appointmentId: { in: staleIds } }
+        });
+        await tx.appointmentLog.deleteMany({  // 🔥 ADDED
+          where: { appointmentId: { in: staleIds } }
         });
         
-        // NOW delete appointments (SAFE!)
+        // NOW safe to delete appointments
         await tx.appointment.deleteMany({
           where: { id: { in: staleIds } }
         });
         
-        console.log(`✅ Cleaned ${staleIds.length} appointments + payments`);
+        console.log(`✅ Cleaned ${staleIds.length} appts + payments/requests/logs`);
       }
+      const freshSlot = await tx.slot.findUnique({
+    where: { id: slotId },
+    select: { isBlocked: true, status: true }
+  });
 
-      // SAFETY CHECKS
+  if (!freshSlot) throw new Error('SLOT_NOT_FOUND');
+  
+  // Check if Admin blocked it while user was on the page
+  if (freshSlot.isBlocked) {
+    throw new Error('ADMIN_BLOCKED');
+  }
+  // ============================================================
+
+      // SAFETY CHECKS (Inside transaction!)
       const confirmed = await tx.appointment.findFirst({
         where: { slotId, status: 'CONFIRMED', deletedAt: null }
       });
@@ -439,7 +456,7 @@ export const createBooking = async (req, res) => {
       };
     });
 
-    // 5. SUCCESS PROCESSING + AUDIT LOG
+    // 5. SUCCESS PROCESSING + AUDIT LOG (unchanged)
     const { appointment, gatewayId, orderData, isOnline, createNew } = result;
     
     await logAudit({
@@ -464,7 +481,7 @@ export const createBooking = async (req, res) => {
       req,
     });
 
-    // NON-BLOCKING EMAILS
+    // NON-BLOCKING EMAILS (unchanged)
     if (!isOnline && createNew) {
       getUserById(authUserId).then(user => {
         sendBookingEmails({
@@ -529,6 +546,7 @@ export const createBooking = async (req, res) => {
     });
   }
 };
+
 
 
 // 🔥 PRODUCTION HELPER: Refresh existing hold (same user only)

@@ -39,6 +39,7 @@ import {
   exportAppointmentsExcel,
   exportAppointmentsPdf,
   rescheduleAppointmentByAdmin,
+  processCancellationRequest
 } from '../controllers/adminAppointmentController.js';
 
 import { refreshClinicGoogleRating } from '../controllers/clinicController.js';
@@ -305,6 +306,12 @@ router.get('/notifications/unread-count', authMiddleware, requireAdmin, getUnrea
 router.patch('/notifications/mark-all-read', authMiddleware, requireAdmin, markAllRead);
 router.patch('/notifications/mark-read', authMiddleware, requireAdmin, markReadByIds);
 router.patch('/notifications/mark-read-by-entity', authMiddleware, requireAdmin, markReadByEntity);
+router.post(
+  '/cancellation-process', 
+  authMiddleware, 
+  requireAdmin, // 🔒 CRITICAL: Only Admins can approve refunds
+  processCancellationRequest
+);
 
 export default router;
 

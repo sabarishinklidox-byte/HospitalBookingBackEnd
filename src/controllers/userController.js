@@ -328,74 +328,131 @@ export const cancelUserAppointment = async (req, res) => {
       return res.status(400).json({ error: "Appointment cannot be cancelled" });
     }
 
+    // ============================================================
+    // ⏳ 1. TIME WINDOW CHECK (Configurable)
+    // ============================================================
     const now = new Date();
     const slotDate = new Date(appointment.slot.date);
+    
+    // Calculate difference in hours
     const diffHours = (slotDate.getTime() - now.getTime()) / (1000 * 60 * 60);
-    const withinWindow = diffHours >= 2;
+    
+    // 🔥 RULE: User defined "1 Day Before" (24 Hours)
+    // You can also fetch this from clinic settings: appointment.clinic.cancelWindow || 24
+    const MIN_NOTICE_HOURS = 24; 
+    const withinWindow = diffHours >= MIN_NOTICE_HOURS;
 
     const isPayAtClinic =
       appointment.slot.paymentMode === "OFFLINE" || appointment.slot.paymentMode === "FREE";
     const isOnlinePay = appointment.slot.paymentMode === "ONLINE";
 
     const doctorName = appointment.doctor?.name || "Doctor";
-    const dateStr = appointment.slot?.date
-      ? new Date(appointment.slot.date).toLocaleDateString()
-      : "N/A";
-    const timeStr = appointment.slot?.time || "N/A";
+    const dateStr = new Date(appointment.slot.date).toLocaleDateString();
+    const timeStr = appointment.slot.time;
 
-    // PAY-AT-CLINIC / FREE → direct cancel (if within window)
+    // ============================================================
+    // 🟢 2. PAY-AT-CLINIC / FREE (Instant Cancel)
+    // ============================================================
     if (isPayAtClinic) {
       if (!withinWindow) {
         return res.status(400).json({
-          error: "Too late to cancel this appointment online. Please contact clinic.",
+          error: `Too late. Cancellations are only allowed ${MIN_NOTICE_HOURS} hours in advance. Please call the clinic.`,
         });
       }
 
       const updated = await prisma.$transaction(async (tx) => {
+        // A. Cancel Appointment
         const u = await tx.appointment.update({
           where: { id: appointment.id },
           data: {
             status: "CANCELLED",
             cancelReason: reason || "Cancelled by patient",
             cancelledBy: "USER",
+            logs: { // Track history
+               create: {
+                  reason: reason || "Cancelled by patient",
+                  changedBy: userId,
+                  action: "CANCEL_OFFLINE",
+                  oldDate: appointment.slot.date,
+                  oldTime: appointment.slot.time
+               }
+            }
           },
         });
 
+        // B. 🔥 CRITICAL FIX: FREE UP THE SLOT
+        await tx.slot.update({
+           where: { id: appointment.slotId },
+           data: { 
+             status: 'PENDING', // Make it available for others
+             isBlocked: false,
+             blockedReason: null 
+           }
+        });
+
+        // C. Notify Clinic
         await tx.notification.create({
           data: {
             clinicId: appointment.clinicId,
             type: "CANCELLATION",
             entityId: appointment.id,
-            message: `Patient cancelled appointment with ${doctorName} on ${dateStr} at ${timeStr}. Reason: ${
-              reason || "Cancelled by patient"
-            }`,
-            // readAt omitted => unread
+            message: `Patient cancelled appointment with ${doctorName} on ${dateStr} at ${timeStr}.`,
           },
         });
 
         return u;
       });
 
+      // Audit Log (Keep your existing function)
       await logAudit({
         userId,
         clinicId: appointment.clinicId,
         action: "CANCEL_APPOINTMENT_USER",
         entity: "Appointment",
         entityId: id,
-        details: {
-          reason: reason || "Cancelled by patient (pay at clinic)",
-          paymentMode: appointment.slot.paymentMode,
-        },
+        details: { reason, paymentMode: "OFFLINE" },
         req,
       });
 
       return res.json(updated);
     }
 
-    // ONLINE payment → create/reuse CancellationRequest + notify clinic
-    // ✅ No CANCEL_REQUESTED status (not in enum)
-    // ✅ No CANCEL_REQUEST notification type (not in enum)
+    // ============================================================
+    // 🔴 3. ONLINE PAYMENT (Request Workflow)
+    // ============================================================
     if (isOnlinePay) {
+      
+      // OPTIONAL: Do you want to block requests if it's too late?
+      // If yes, uncomment this block. If no, remove it to allow late requests (for admin decision).
+      /*
+      if (!withinWindow) {
+        return res.status(400).json({
+          error: `Too late. Online refunds are only considered ${MIN_NOTICE_HOURS} hours in advance.`,
+        });
+      }
+      */
+     if (appointment.cancellationRequest) {
+    const status = appointment.cancellationRequest.status;
+
+    if (status === "PENDING") {
+      return res.status(400).json({
+        error: "You have already submitted a cancellation request. Please wait for the clinic to review it.",
+      });
+    }
+
+    if (status === "APPROVED") {
+      return res.status(400).json({
+        error: "This request has already been approved and the appointment is being cancelled.",
+      });
+    }
+
+    if (status === "REJECTED") {
+      return res.status(400).json({
+        error: "Your previous cancellation request was declined. Please contact the clinic directly.",
+      });
+    }
+  }
+
       if (appointment.cancellationRequest?.status === "PENDING") {
         return res.status(400).json({
           error: "Cancellation already requested and pending clinic approval.",
@@ -418,19 +475,12 @@ export const cancelUserAppointment = async (req, res) => {
           },
         });
 
-        // Optional: keep appointment status as-is, OR set to PENDING.
-        // Since CANCEL_REQUESTED doesn't exist, do nothing here:
-        // await tx.appointment.update({ where: { id: appointment.id }, data: { status: "PENDING" } });
-
         await tx.notification.create({
           data: {
             clinicId: appointment.clinicId,
-            type: "CANCELLATION",
+            type: "CANCELLATION", // Or "CANCELLATION_REQUEST" if you add it to Enum
             entityId: appointment.id,
-            message: `Patient requested cancellation with ${doctorName} on ${dateStr} at ${timeStr}. Reason: ${
-              reason || "N/A"
-            }`,
-            // readAt omitted => unread
+            message: `⚠️ REFUND REQUEST: Patient requested cancellation with ${doctorName}. Reason: ${reason || "N/A"}`,
           },
         });
       });
@@ -441,27 +491,25 @@ export const cancelUserAppointment = async (req, res) => {
         action: "REQUEST_CANCEL_APPOINTMENT_USER",
         entity: "Appointment",
         entityId: id,
-        details: {
-          reason: reason || null,
-          paymentMode: appointment.slot.paymentMode,
-        },
+        details: { reason, paymentMode: "ONLINE" },
         req,
       });
 
       return res.json({
-        message:
-          "Cancellation request submitted. Clinic will review and process refund if applicable.",
+        message: "Cancellation request submitted. Clinic will review and process refund if applicable.",
       });
     }
 
     return res.status(400).json({
       error: "Cancellation flow not configured for this appointment.",
     });
+
   } catch (error) {
     console.error("Cancel Appointment Error:", error);
     return res.status(500).json({ error: error.message });
   }
 };
+
 
 // ----------------------------------------------------------------
 // 8. RESCHEDULE APPOINTMENT
@@ -764,6 +812,8 @@ async function createPaymentOrder(gateway, slot, provider, notes = {}) {
 //   }
 // };
 
+
+
 export const rescheduleAppointment = async (req, res) => {
   try {
     const userId = req.user?.id || req.user?.userId || req.user?._id;
@@ -803,12 +853,11 @@ export const rescheduleAppointment = async (req, res) => {
       if (!isOwner && !isAdmin) throw { statusCode: 403, message: "Not authorized" };
       if (["COMPLETED", "CANCELLED"].includes(oldAppt.status)) throw { statusCode: 400, message: "Cannot reschedule completed/cancelled" };
 
-      // LIMIT CHECK (Users only)
       if (!isAdmin && (oldAppt.rescheduleCount || 0) >= 1) {
         throw { statusCode: 400, message: "You can only reschedule once. Please cancel and re-book." };
       }
 
-      // 🔥 2. PERFECT FINANCIAL LOGIC
+      // 2. FINANCIAL LOGIC
       const oldPrice = Number(oldAppt.amount || 0);
       const newPrice = Number(newSlot.price || 0);
       const oldPaidAmount = oldAppt.paymentStatus === "PAID" ? oldPrice : 0;
@@ -820,45 +869,36 @@ export const rescheduleAppointment = async (req, res) => {
       let diffAmount = 0;
       let adminNote = '';
 
-      console.log(`💳 Old: ${oldAppt.slot.paymentMode}(₹${oldPrice}, paid:${oldPaidAmount}) → New: ${newSlot.paymentMode}(₹${newPrice})`);
-
       if (isTargetOffline) {
-        // 🔥 RULE #1: TARGET OFFLINE
         needsPayment = false;
-        
         if (newPrice === 0) {
-          // 🔥 FREE SLOT
           if (wasOnlinePaid && oldPaidAmount > 0) {
             financialStatus = 'FULL_REFUND';
             diffAmount = oldPaidAmount;
-            adminNote = `Refund FULL ₹${oldPaidAmount} (paid online for previous slot)`;
+            adminNote = `Refund FULL ₹${oldPaidAmount}`;
           } else {
             financialStatus = 'FREE_SLOT';
-            adminNote = `Free slot (collect nothing)`;
+            adminNote = `Free slot`;
           }
         } else if (wasOnlinePaid && oldPaidAmount > 0) {
-          // 🔥 Previous ONLINE payment exists
           if (newPrice > oldPaidAmount) {
             financialStatus = 'PAY_DIFFERENCE_OFFLINE';
             diffAmount = newPrice - oldPaidAmount;
-            adminNote = `Collect ₹${diffAmount} more at clinic (already paid ₹${oldPaidAmount})`;
+            adminNote = `Collect ₹${diffAmount} more at clinic`;
           } else if (newPrice < oldPaidAmount) {
             financialStatus = 'REFUND_AT_CLINIC';
             diffAmount = oldPaidAmount - newPrice;
-            adminNote = `Refund ₹${diffAmount} at clinic (paid ₹${oldPaidAmount})`;
+            adminNote = `Refund ₹${diffAmount} at clinic`;
           } else {
             financialStatus = 'NO_CHANGE';
-            adminNote = `Rescheduled (already paid ₹${oldPaidAmount})`;
+            adminNote = `Rescheduled (no price change)`;
           }
         } else {
-          // 🔥 No previous payment (Offline→Offline/Free)
           financialStatus = 'PAY_AT_CLINIC';
           diffAmount = newPrice;
           adminNote = `Collect FULL ₹${newPrice} at clinic`;
         }
-
       } else {
-        // 🔥 RULE #2: TARGET ONLINE
         if (newPrice > oldPaidAmount) {
           needsPayment = true;
           financialStatus = 'PAY_DIFFERENCE';
@@ -874,8 +914,6 @@ export const rescheduleAppointment = async (req, res) => {
           adminNote = `Rescheduled (same price)`;
         }
       }
-
-      console.log(`💰 Final: ${financialStatus} | needsPayment: ${needsPayment} | Collect: ₹${diffAmount}`);
 
       // FREE OLD SLOT
       const oldSlotId = oldAppt.slotId;
@@ -909,6 +947,25 @@ export const rescheduleAppointment = async (req, res) => {
         }
       });
 
+      // 🔥 LOG RESCHEDULE HISTORY (FIXED!)
+      await tx.appointmentLog.create({
+        data: {
+          appointmentId: appointmentId,
+          oldDate: oldAppt.slot.date,
+          oldTime: oldAppt.slot.time,
+          newDate: newSlot.date,
+          newTime: newSlot.time,
+          reason: "User Rescheduled",
+          changedBy: userId,
+          metadata: { 
+            fromSlotId: oldAppt.slotId, 
+            toSlotId: newSlotId,
+            financialStatus,
+            diffAmount
+          }
+        }
+      });
+
       // LOCK NEW SLOT
       await tx.slot.update({
         where: { id: newSlotId },
@@ -918,22 +975,16 @@ export const rescheduleAppointment = async (req, res) => {
         }
       });
 
-      // 3. SUCCESS RESPONSE (No Online Payment)
+      // SUCCESS RESPONSE
       if (!needsPayment) {
         return {
           status: 'SUCCESS',
-          message: financialStatus === 'PAY_AT_CLINIC' 
-            ? `Rescheduled! Please pay FULL ₹${diffAmount} at the clinic.` 
-            : financialStatus === 'PAY_DIFFERENCE_OFFLINE'
-            ? `Rescheduled! Please pay ₹${diffAmount} more at the clinic.`
-            : financialStatus === 'FULL_REFUND'
-            ? `Rescheduled to FREE! Clinic will refund ₹${diffAmount}.`
-            : 'Rescheduled successfully!',
+          message: 'Rescheduled successfully!',
           data: { updatedAppt }
         };
       }
 
-      // 4. ONLINE PAYMENT REQUIRED
+      // PAYMENT REQUIRED
       const gateways = updatedAppt.clinic.gateways || [];
       const gateway = gateways.find(g => g.name === provider && g.isActive);
 
@@ -985,6 +1036,7 @@ export const rescheduleAppointment = async (req, res) => {
     return res.status(500).json({ error: 'Reschedule failed' });
   }
 };
+
   
 
 
@@ -1010,15 +1062,28 @@ export const getUserAppointments = async (req, res) => {
     const pageNumber = Number(page) || 1;
     const pageSize = Number(limit) || 10;
 
-    // 🔥 FIXED: Hide CANCELLED appointments by default!
     const where = { 
       userId, 
-      deletedAt: null,
-      status: { not: 'CANCELLED' }  // ✅ Cards DISAPPEAR after 10min cron!
+      deletedAt: null
     };
 
-    // 🔄 Override filters if provided (admin can see cancelled)
-    if (status) where.status = status;
+    // 🔥 FIXED STATUS LOGIC - "All" shows EVERYTHING!
+    if (status && status !== "") {
+      where.status = { equals: status };
+    } else {
+      where.status = {
+        in: [
+          'PENDING',
+          'PENDING_PAYMENT',
+          'CONFIRMED',
+          'COMPLETED',
+          'CANCELLED',
+          'CANCEL_REQUESTED',
+          'NO_SHOW'
+        ]
+      };
+    }
+
     if (doctor) where.doctorId = doctor;
 
     if (dateFrom || dateTo) {
@@ -1060,6 +1125,22 @@ export const getUserAppointments = async (req, res) => {
           clinic: {
             select: { id: true, name: true, city: true },
           },
+          // 🔥 NEW: For refund/reject messages
+          cancellationRequest: {
+            select: {
+              id: true,
+              status: true,
+              reason: true,
+            }
+          },
+          // 🔥 NEW: Payment details
+          payment: {
+            select: {
+              id: true,
+              status: true,
+              gatewayRefId: true,
+            }
+          },
         },
       }),
     ]);
@@ -1071,18 +1152,24 @@ export const getUserAppointments = async (req, res) => {
       slotId: app.slotId,
       status: app.status,
 
+      // 🔥 NEW: Essential fields for UI
+      cancelledBy: app.cancelledBy,
+      paymentStatus: app.paymentStatus,
+      financialStatus: app.financialStatus,
+      adminNote: app.adminNote,        // ← Refund message
+      cancelReason: app.cancelReason,
+
       doctor: app.doctor,
       slot: app.slot,
       clinic: app.clinic,
       review: app.review,
+      cancellationRequest: app.cancellationRequest,  // ← Reject reason
+      payment: app.payment,
 
       prescription: app.prescription || null,
-      cancelReason: app.cancelReason || null,
 
       // payment info for AppointmentCard
       amount: app.amount ?? app.slot?.price ?? 0,
-      paymentStatus: app.paymentStatus || "PENDING",
-      financialStatus: app.financialStatus || null,
       diffAmount: app.diffAmount ?? 0,
 
       history: app.logs.map((log) => ({
@@ -1112,6 +1199,7 @@ export const getUserAppointments = async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 };
+
 
 
 export const getSlotsForUser = async (req, res, next) => {
