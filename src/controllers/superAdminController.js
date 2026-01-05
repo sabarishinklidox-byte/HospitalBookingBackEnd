@@ -115,36 +115,25 @@ export const superAdminLogin = async (req, res) => {
 export const createClinic = async (req, res) => {
   try {
     const {
-      name,
-      phone,
-      address,
-      city,
-      pincode,
-      accountNumber,
-      ifscCode,
-      bankName,
-      timings,
-      details,
-      // logo, banner,  <-- REMOVED
-      planId,
-      isActive,
-      allowAuditView,
+      name, phone, address, city, pincode,
+      accountNumber, ifscCode, bankName,
+      timings, details,
+      planId, isActive, allowAuditView,
     } = req.body;
 
     if (!name || !phone || !address || !city || !pincode) {
       return res.status(400).json({ error: "Name, Phone, Address, City, and Pincode are required" });
     }
+    if (!planId) return res.status(400).json({ error: "planId is required" });
 
-    if (!planId) {
-      return res.status(400).json({ error: "planId is required" });
-    }
-
-    const slug = name.toLowerCase().replace(/[^a-z0-9]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+    const slug = name.toLowerCase()
+      .replace(/[^a-z0-9]/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
 
     const plan = await prisma.plan.findFirst({
-      where: { id: planId },
+      where: { id: planId, isActive: true, deletedAt: null },
     });
-
     if (!plan) return res.status(404).json({ error: "Plan not found" });
 
     const safeAllowAuditView = plan.enableAuditLogs ? !!allowAuditView : false;
@@ -152,37 +141,54 @@ export const createClinic = async (req, res) => {
     const result = await prisma.$transaction(async (tx) => {
       const clinic = await tx.clinic.create({
         data: {
-          slug,
-          name,
-          phone,
-          address,
-          city,
-          pincode,
+          slug, name, phone, address, city, pincode,
           accountNumber: accountNumber || "N/A",
           ifscCode: ifscCode || "N/A",
           bankName: bankName || "N/A",
           timings: timings || {},
           details: details || "",
-          logo: null,    // ✅ Always null initially
-          banner: null,  // ✅ Always null initially
+          logo: null,
+          banner: null,
           isActive: isActive ?? true,
           allowAuditView: safeAllowAuditView,
         },
       });
+
+      // ✅ subscription dates (same idea as your performPlanUpgrade)
+      const now = new Date();
+      let startDate = now, endDate = null, nextBillingDate = null;
+
+      if (plan.durationDays) {
+        endDate = new Date(now);
+        endDate.setDate(endDate.getDate() + plan.durationDays);
+      } else if (plan.trialDays) {
+        endDate = new Date(now);
+        endDate.setDate(endDate.getDate() + plan.trialDays);
+      } else {
+        nextBillingDate = new Date(now);
+        nextBillingDate.setMonth(nextBillingDate.getMonth() + 1);
+      }
 
       const subscription = await tx.subscription.create({
         data: {
           clinicId: clinic.id,
           planId: plan.id,
           status: "ACTIVE",
-          startDate: new Date(),
+          priceAtPurchase: plan.priceMonthly,
+          maxDoctors: plan.maxDoctors,
+          maxBookingsPerPeriod: plan.maxBookingsPerMonth,
+          isTrial: plan.isTrial,
+          durationDays: plan.durationDays,
+          trialDays: plan.trialDays,
+          startDate,
+          endDate,
+          nextBillingDate,
         },
+        include: { plan: true },
       });
 
       return { clinic, subscription };
     });
-
-    // ... audit log code ...
 
     return res.status(201).json(result);
   } catch (error) {
@@ -919,5 +925,76 @@ export const getGlobalBookingsStats = async (req, res) => {
   } catch (err) {
     console.error('getGlobalBookingsStats error', err);
     return res.status(500).json({ error: 'Failed to load stats' });
+  }
+};
+// src/controllers/superAdminController.js
+;
+
+export const getPlatformRevenue = async (req, res) => {
+  try {
+    // 1. Initial Registrations
+    const registrations = await prisma.registrationPayment.findMany({
+      where: { status: "SUCCESS" },
+      include: { clinic: { select: { name: true } } }
+    });
+
+    // 2. Plan Switches / Upgrades (Found in Subscriptions)
+    // We look for subscriptions that have a Payment ID but are NOT the initial registration
+    const planSwitches = await prisma.subscription.findMany({
+      where: {
+        status: "ACTIVE",
+        razorpayPaymentId: { not: null },
+      },
+      include: { 
+        clinic: { select: { name: true } },
+        plan: { select: { name: true } }
+      }
+    });
+
+    // 3. Patient Appointment Payments
+    const appointmentPayments = await prisma.payment.findMany({
+      where: { status: "PAID" },
+      include: { clinic: { select: { name: true } } }
+    });
+
+    // --- CALCULATE TOTALS ---
+    const regTotal = registrations.reduce((sum, p) => sum + Number(p.amount || 0), 0);
+    
+    // For upgrades, we use priceAtPurchase from the subscription model
+    const upgradeTotal = planSwitches.reduce((sum, s) => sum + Number(s.priceAtPurchase || 0), 0);
+
+    // --- FORMAT TRANSACTIONS ---
+    const formattedTransactions = [
+      ...registrations.map(r => ({
+        id: r.id,
+        type: 'REGISTRATION',
+        clinic: r.clinic?.name || 'Unknown Clinic',
+        amount: Number(r.amount || 0).toFixed(2),
+        date: r.createdAt,
+        ref: r.razorpayPaymentId
+      })),
+      ...planSwitches.map(s => ({
+        id: s.id,
+        type: 'UPGRADE/SWITCH',
+        clinic: s.clinic?.name || 'Unknown Clinic',
+        amount: Number(s.priceAtPurchase || 0).toFixed(2),
+        date: s.updatedAt, // Use updatedAt to show when the switch happened
+        ref: s.razorpayPaymentId
+      }))
+    ].sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    res.json({
+      summary: {
+        totalRevenue: (regTotal + upgradeTotal).toFixed(2),
+        registrationRevenue: regTotal.toFixed(2),
+        upgradeRevenue: upgradeTotal.toFixed(2),
+        totalTransactions: formattedTransactions.length
+      },
+      transactions: formattedTransactions
+    });
+
+  } catch (error) {
+    console.error('REVENUE_API_ERROR:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 };

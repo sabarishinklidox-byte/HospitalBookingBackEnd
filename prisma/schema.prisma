@@ -29,35 +29,43 @@ model Plan {
   durationDays        Int?
   isTrial             Boolean        @default(false)
   trialDays           Int?
+  razorpayPlanId      String?  // To store "plan_Hq78..."
+  stripePriceId       String?  // To store "price_123..."
+
   subscriptions       Subscription[]
 
   @@map("plans")
 }
 
 model Subscription {
-  id                    String             @id @default(uuid())
-  clinicId              String             @unique
+  id                    String              @id @default(uuid())
+  clinicId              String              @unique
   planId                String
-  status                SubscriptionStatus @default(ACTIVE)
-  startDate             DateTime           @default(now())
+  status                SubscriptionStatus  @default(ACTIVE)
+  startDate             DateTime            @default(now())
   endDate               DateTime?
   nextBillingDate       DateTime?
-  gatewaySubscriptionId String?
-  gatewayCustomerId     String?
-  createdAt             DateTime           @default(now())
-  updatedAt             DateTime           @updatedAt
+  gatewaySubscriptionId String?             // Razorpay sub_XXX (future recurring)
+  gatewayCustomerId     String?             // Razorpay cust_XXX
+  razorpayOrderId       String? @unique     // 🔥 NEW: order_XXX
+  razorpayPaymentId     String?             // 🔥 NEW: pay_XXX
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
   deletedAt             DateTime?
   durationDays          Int?
-  isTrial               Boolean            @default(false)
+  isTrial               Boolean             @default(false)
+    razorpayCustomerId String? @map("razorpay_customer_id")
   maxBookingsPerPeriod  Int?
   maxDoctors            Int?
   priceAtPurchase       Decimal?
   trialDays             Int?
-  clinic                Clinic             @relation(fields: [clinicId], references: [id])
-  plan                  Plan               @relation(fields: [planId], references: [id])
-
+    registrationPayments RegistrationPayment[]
+  clinic                Clinic              @relation(fields: [clinicId], references: [id])
+  plan                  Plan                @relation(fields: [planId], references: [id])
+  
   @@map("subscriptions")
 }
+
 
 model PaymentGateway {
   id            String    @id @default(uuid())
@@ -135,6 +143,9 @@ bankName               String?
   slots                  Slot[]
   subscription           Subscription?
   admins                 User[]           @relation("ClinicAdmins")
+    specialities Speciality[]
+     registrationPayments RegistrationPayment[]
+
 
   @@map("clinics")
 }
@@ -251,7 +262,7 @@ model CancellationRequest {
 
 model Payment {
   id            String         @id @default(uuid())
-  appointmentId String         @unique
+  appointmentId String        @unique
   clinicId      String
   doctorId      String
   gatewayId     String
@@ -265,6 +276,23 @@ model Payment {
   gateway       PaymentGateway @relation(fields: [gatewayId], references: [id])
 
   @@map("payments")
+}
+// Add to schema.prisma (after Payment model)
+model RegistrationPayment {
+  id               String   @id @default(uuid())
+  clinicId         String
+  subscriptionId   String   @unique
+  amount           Decimal
+  currency         String   @default("INR")
+  status           String   // "PENDING", "SUCCESS", "FAILED"
+  razorpayOrderId  String?
+  razorpayPaymentId String?
+  createdAt        DateTime @default(now())
+  
+  clinic      Clinic      @relation(fields: [clinicId], references: [id])
+  subscription Subscription @relation(fields: [subscriptionId], references: [id])
+  
+  @@map("registration_payments")
 }
 
 model AppointmentLog {
@@ -330,6 +358,21 @@ model Notification {
   @@index([userId, type, readAt]) // ✅ NEW
   @@index([userId, readAt])       // ✅ NEW
 }
+// Add to schema.prisma
+model SuperAdminPaymentGateway {
+  id             String   @id @default(uuid())
+  name           String   // "RAZORPAY", "STRIPE"
+  apiKey         String
+  secret         String   @db.VarChar(512)  // Secure length
+  webhookSecret  String?
+  isActive       Boolean  @default(true)
+  mode           String   @default("TEST") // "TEST", "LIVE"
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([name])
+  @@map("super_admin_payment_gateways")
+}
 
 
 enum NotificationType {
@@ -388,17 +431,24 @@ enum SubscriptionStatus {
 
 model Speciality {
   id          String   @id @default(uuid())
-  name        String   @unique  // e.g. "Dentist", "Cardiologist"
+  name        String  
   description String?
   isActive    Boolean  @default(true)
   
-  doctors     Doctor[] // Relation to doctors
+
+  clinicId    String? 
+  clinic      Clinic?  @relation(fields: [clinicId], references: [id])
+
+  doctors     Doctor[] 
 
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   @@map("specialities")
-}
+  
+
+  @@unique([name, clinicId]) 
+  }
 
 enum BookingSection {
   DENTAL

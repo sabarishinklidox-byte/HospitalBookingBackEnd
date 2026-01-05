@@ -43,7 +43,7 @@ import {
 } from '../controllers/adminAppointmentController.js';
 
 import { refreshClinicGoogleRating } from '../controllers/clinicController.js';
-
+ import {verifyClinicPlanPayment} from '../controllers/superAdminPlanPaymentController.js'
 import {
   getPayments,
   getPaymentsSummary
@@ -89,6 +89,7 @@ const router = express.Router();
 // ---------------- Auth ----------------
 router.post('/login', adminLogin);
 
+
 // ---------------- Dashboard (OPEN - View Only) ----------------
 router.get('/dashboard', authMiddleware, requireAdmin, getAdminDashboard);
 
@@ -101,7 +102,10 @@ router.post(
   upload.single('avatar'),
   createDoctor
 );
-
+router.post('/webhook/verify-plan-payment', 
+  express.raw({type: 'application/json'}),  // Raw body for signature
+  verifyClinicPlanPayment
+);
 router.get('/doctors', authMiddleware, requireAdmin, getDoctors); // ✅ Open (View only)
 
 router.put(
@@ -306,6 +310,7 @@ router.get('/notifications/unread-count', authMiddleware, requireAdmin, getUnrea
 router.patch('/notifications/mark-all-read', authMiddleware, requireAdmin, markAllRead);
 router.patch('/notifications/mark-read', authMiddleware, requireAdmin, markReadByIds);
 router.patch('/notifications/mark-read-by-entity', authMiddleware, requireAdmin, markReadByEntity);
+
 router.post(
   '/cancellation-process', 
   authMiddleware, 

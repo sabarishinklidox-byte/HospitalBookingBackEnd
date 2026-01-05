@@ -17,7 +17,7 @@ import {
   incrementClinicLinkClicks,
   toggleClinicStatus,
   toggleAuditPermission,
-  getClinicAdminById,toggleClinicVisibility 
+  getClinicAdminById,toggleClinicVisibility ,getPlatformRevenue
 } from '../controllers/superAdminController.js';
 import {
   listPlans,
@@ -26,6 +26,11 @@ import {
   deletePlan,
 } from '../controllers/planController.js';
 import { authMiddleware, requireSuperAdmin } from '../middleware/auth.js';
+import {
+  getSuperAdminGateway,
+  upsertSuperAdminGateway,
+  deactivateSuperAdminGateway,
+} from '../controllers/superAdminGatewayController.js';
 
 const router = Router();
 
@@ -99,5 +104,9 @@ router.get('/plans', authMiddleware, requireSuperAdmin, listPlans);
 router.post('/plans', authMiddleware, requireSuperAdmin, createPlan);
 router.put('/plans/:id', authMiddleware, requireSuperAdmin, updatePlan);
 router.delete('/plans/:id', authMiddleware, requireSuperAdmin, deletePlan);
+router.get('/gateway/razorpay', authMiddleware, requireSuperAdmin, getSuperAdminGateway);
+router.post('/gateway/razorpay', authMiddleware, requireSuperAdmin, upsertSuperAdminGateway);
+router.delete('/gateway/razorpay', authMiddleware, requireSuperAdmin, deactivateSuperAdminGateway);
+router.get('/revenue',authMiddleware,  requireSuperAdmin,getPlatformRevenue);
 
 export default router;

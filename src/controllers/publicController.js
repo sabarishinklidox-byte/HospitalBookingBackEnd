@@ -6,42 +6,46 @@ import prisma from '../prisma.js';
 // ----------------------------------------------------------------
 export const getClinics = async (req, res) => {
   try {
-    const { q, city } = req.query;
+    const qRaw = req.query.q;
+    const cityRaw = req.query.city;
+
+    const q = typeof qRaw === 'string' ? qRaw.trim() : '';
+    const city = typeof cityRaw === 'string' ? cityRaw.trim() : '';
 
     const clinics = await prisma.clinic.findMany({
       where: {
-        isActive: true, 
+        isActive: true,
         isPublic: true,
         deletedAt: null,
         ...(city ? { city: { equals: city, mode: 'insensitive' } } : {}),
-        ...(q ? {
-          OR: [
-            { name: { contains: q, mode: 'insensitive' } },
-            { address: { contains: q, mode: 'insensitive' } },
-            { city: { contains: q, mode: 'insensitive' } },
-            { pincode: { contains: q, mode: 'insensitive' } },
-          ],
-        } : {}),
+        ...(q
+          ? {
+              OR: [
+                { name: { contains: q, mode: 'insensitive' } },
+                { address: { contains: q, mode: 'insensitive' } },
+                { city: { contains: q, mode: 'insensitive' } },
+                { pincode: { contains: q, mode: 'insensitive' } },
+              ],
+            }
+          : {}),
       },
-    select: {
-  id: true,
-  name: true,
-  phone: true,
-  city: true,
-  timings: true,
-  address: true,
-  pincode: true,
-  details: true,
-  logo: true,
-  banner: true,
-  googlePlaceId: true,
-  googleMapsUrl: true,           // ✅ EXISTS
-  googleReviewsEmbedCode: true,
-  googleRating: true,
-  googleTotalReviews: true,
-  
-},
-
+      select: {
+        id: true,
+        name: true,
+        phone: true,
+        city: true,
+        timings: true,
+        address: true,
+        pincode: true,
+        details: true,
+        logo: true,
+        banner: true,
+        googlePlaceId: true,
+        googleMapsUrl: true,
+        googleReviewsEmbedCode: true,
+        googleRating: true,
+        googleTotalReviews: true,
+      },
       orderBy: { name: 'asc' },
     });
 
@@ -53,6 +57,61 @@ export const getClinics = async (req, res) => {
 };
 
 
+
+export const getClinicCities = async (req, res) => {
+  try {
+    const rows = await prisma.clinic.findMany({
+      where: {
+        isActive: true,
+        isPublic: true,
+        deletedAt: null,
+
+        // ✅ for required String fields:
+        city: { not: "" },
+      },
+      distinct: ['city'],
+      select: { city: true },
+      orderBy: { city: 'asc' },
+    });
+
+    const cities = rows.map(r => r.city.trim()).filter(Boolean);
+    return res.json({ cities });
+  } catch (error) {
+    console.error('getClinicCities error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+};
+export const getClinicSpecialities = async (req, res) => {
+  try {
+    const { clinicId } = req.params;
+
+    // 1) get distinct specialityId used by doctors in this clinic
+    const rows = await prisma.doctor.findMany({
+      where: {
+        clinicId,
+        isActive: true,
+        deletedAt: null, // remove if you don't have deletedAt in doctor
+        specialityId: { not: null }, // only if specialityId is nullable
+      },
+      distinct: ['specialityId'],
+      select: { specialityId: true },
+    });
+
+    const specialityIds = rows.map(r => r.specialityId).filter(Boolean);
+
+    // 2) fetch speciality records
+    const specialities = await prisma.speciality.findMany({
+      where: { id: { in: specialityIds } },
+      select: { id: true, name: true },
+      orderBy: { name: 'asc' },
+    });
+
+    return res.json({ specialities });
+  } catch (error) {
+    console.error('getClinicSpecialities error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+};
 
 
 

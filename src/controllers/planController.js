@@ -73,6 +73,7 @@ export const listPlans = async (req, res) => {
 };
 
 // POST /api/super-admin/plans
+// ✅ FULL FIXED createPlan controller (ALL your fields + payment integration)
 export const createPlan = async (req, res) => {
   try {
     const userId = req.user.id;
@@ -84,8 +85,8 @@ export const createPlan = async (req, res) => {
       currency = 'INR',
       maxDoctors = 1,
       maxBookingsPerMonth = 100,
-      allowOnlinePayments = false,        // 🔒 PLAN FEATURE
-      allowCustomBranding = false,       // 🔒 PLAN FEATURE
+      allowOnlinePayments = false,
+      allowCustomBranding = false,
       enableReviews = true,
       enableBulkSlots = true,
       enableExports = true,
@@ -97,20 +98,12 @@ export const createPlan = async (req, res) => {
       trialDays,
     } = req.body;
 
-    // Validation
+    // 1. Validation
     if (!name || !slug || priceMonthly == null) {
       return res.status(400).json({ error: 'name, slug, priceMonthly required' });
     }
 
-    if (durationDays != null && durationDays <= 0) {
-      return res.status(400).json({ error: 'durationDays must be > 0' });
-    }
-
-    if (isTrial && !durationDays) {
-      return res.status(400).json({ error: 'Trial plans must have durationDays' });
-    }
-
-    // Check slug uniqueness
+    // 2. Check slug uniqueness
     const slugExists = await prisma.plan.findFirst({
       where: { slug, deletedAt: null }
     });
@@ -118,6 +111,49 @@ export const createPlan = async (req, res) => {
       return res.status(400).json({ error: 'Slug already exists' });
     }
 
+    let razorpayPlanId = null;
+
+    // 🔥 3. RAZORPAY INTEGRATION
+    // Only create on Razorpay if it's NOT a trial and has a price
+    if (!isTrial && Number(priceMonthly) > 0) {
+      
+      // A. Fetch Super Admin API Keys from DB
+      const gateway = await prisma.superAdminPaymentGateway.findUnique({
+        where: { name: 'RAZORPAY' }
+      });
+
+      // B. Create Plan on Razorpay
+      if (gateway && gateway.isActive && gateway.apiKey && gateway.secret) {
+        try {
+          const razorpay = new Razorpay({
+            key_id: gateway.apiKey,
+            key_secret: gateway.secret,
+          });
+
+          const rzPlan = await razorpay.plans.create({
+            period: "monthly",
+            interval: 1,
+            item: {
+              name: `Plan: ${name}`,
+              amount: Math.round(Number(priceMonthly) * 100), // Convert to paise
+              currency: currency,
+              description: `Monthly subscription for ${name}`
+            }
+          });
+
+          razorpayPlanId = rzPlan.id; // e.g. "plan_LOk7w..."
+          console.log(`✅ Razorpay Plan Created: ${razorpayPlanId}`);
+
+        } catch (rzError) {
+          console.error("⚠️ Failed to create plan on Razorpay:", rzError);
+          // We continue execution, but you might want to return an error depending on requirements
+        }
+      } else {
+        console.warn("⚠️ Super Admin Razorpay keys missing/inactive. Skipping sync.");
+      }
+    }
+
+    // 4. Save to Database
     const plan = await prisma.plan.create({
       data: {
         name,
@@ -126,7 +162,7 @@ export const createPlan = async (req, res) => {
         currency,
         maxDoctors,
         maxBookingsPerMonth,
-        allowOnlinePayments,           // ✅ Controls payment gateways
+        allowOnlinePayments,
         allowCustomBranding,
         enableReviews,
         enableBulkSlots,
@@ -137,21 +173,30 @@ export const createPlan = async (req, res) => {
         isTrial,
         durationDays: durationDays ?? null,
         trialDays: trialDays ?? null,
+        
+        // 🔥 Save the generated ID
+        razorpayPlanId: razorpayPlanId || null, 
       },
     });
 
-    await logPlanAudit(userId, 'PLAN_CREATED', plan.id, { new: plan });
+    // 5. Audit Log
+    if (logPlanAudit) {
+        await logPlanAudit(userId, 'PLAN_CREATED', plan.id, { new: plan });
+    }
 
     return res.status(201).json({
       success: true,
       plan,
-      message: `Plan "${name}" created successfully`
+      message: `Plan "${name}" created successfully`,
+      razorpaySynced: !!razorpayPlanId
     });
+
   } catch (err) {
     console.error('Create Plan Error:', err);
     return res.status(500).json({ error: err.message });
   }
 };
+
 
 // PUT /api/super-admin/plans/:id
 export const updatePlan = async (req, res) => {

@@ -741,6 +741,12 @@ export const verifyPayment = async (req, res) => {
       .createHmac('sha256', gateway.secret)
       .update(razorpay_order_id + '|' + razorpay_payment_id)
       .digest('hex');
+      console.log("---------------- PAYMENT DEBUG ----------------");
+console.log("🛠️ SECRET USED (First 4 chars):", gateway.secret?.substring(0, 4) + "****"); 
+console.log("🛠️ STRING TO SIGN:", razorpay_order_id + '|' + razorpay_payment_id);
+console.log("🛠️ GENERATED SIGNATURE:", generated_signature);
+console.log("🛠️ RECEIVED SIGNATURE:", razorpay_signature);
+console.log("-----------------------------------------------");
 
     if (generated_signature !== razorpay_signature) {
       return res.status(400).json({ error: 'Invalid payment signature' });
