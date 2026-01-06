@@ -329,21 +329,15 @@ export const cancelUserAppointment = async (req, res) => {
     }
 
     // ============================================================
-    // ⏳ 1. TIME WINDOW CHECK (Configurable)
+    // ⏳ 1. TIME WINDOW CHECK (24 Hours)
     // ============================================================
     const now = new Date();
     const slotDate = new Date(appointment.slot.date);
-    
-    // Calculate difference in hours
     const diffHours = (slotDate.getTime() - now.getTime()) / (1000 * 60 * 60);
-    
-    // 🔥 RULE: User defined "1 Day Before" (24 Hours)
-    // You can also fetch this from clinic settings: appointment.clinic.cancelWindow || 24
-    const MIN_NOTICE_HOURS = 24; 
+    const MIN_NOTICE_HOURS = 24;
     const withinWindow = diffHours >= MIN_NOTICE_HOURS;
 
-    const isPayAtClinic =
-      appointment.slot.paymentMode === "OFFLINE" || appointment.slot.paymentMode === "FREE";
+    const isPayAtClinic = appointment.slot.paymentMode === "OFFLINE" || appointment.slot.paymentMode === "FREE";
     const isOnlinePay = appointment.slot.paymentMode === "ONLINE";
 
     const doctorName = appointment.doctor?.name || "Doctor";
@@ -351,59 +345,73 @@ export const cancelUserAppointment = async (req, res) => {
     const timeStr = appointment.slot.time;
 
     // ============================================================
-    // 🟢 2. PAY-AT-CLINIC / FREE (Instant Cancel)
+    // 🟢 2. BLOCK DUPLICATE REQUESTS (Unified Check)
+    // ============================================================
+    if (isOnlinePay && appointment.cancellationRequest) {
+      const status = appointment.cancellationRequest.status;
+      return res.status(400).json({
+        error: `Cancellation already ${status.toLowerCase()}. Contact clinic.`,
+      });
+    }
+
+    // ============================================================
+    // 🟢 3. PAY-AT-CLINIC / FREE (Instant Cancel + Slot Free)
     // ============================================================
     if (isPayAtClinic) {
       if (!withinWindow) {
         return res.status(400).json({
-          error: `Too late. Cancellations are only allowed ${MIN_NOTICE_HOURS} hours in advance. Please call the clinic.`,
+          error: `Too late. Cancellations allowed ${MIN_NOTICE_HOURS} hours in advance. Call clinic.`,
         });
       }
 
       const updated = await prisma.$transaction(async (tx) => {
-        // A. Cancel Appointment
+        // A. Cancel Appointment ✅ Schema-Aligned
         const u = await tx.appointment.update({
           where: { id: appointment.id },
           data: {
-            status: "CANCELLED",
+            status: "CANCELLED",           // ✅ Exact enum match
             cancelReason: reason || "Cancelled by patient",
-            cancelledBy: "USER",
-            logs: { // Track history
-               create: {
-                  reason: reason || "Cancelled by patient",
-                  changedBy: userId,
-                  action: "CANCEL_OFFLINE",
-                  oldDate: appointment.slot.date,
-                  oldTime: appointment.slot.time
-               }
+            cancelledBy: "USER",            // ✅ CancellationActor enum
+            logs: {
+              create: {
+                oldDate: appointment.slot.date,
+                oldTime: appointment.slot.time,
+                newDate: null,               // Reschedules only
+                newTime: null,
+                reason: reason || "Cancelled by patient",
+                changedBy: userId,
+                metadata: { paymentMode: appointment.slot.paymentMode }
+              }
             }
           },
         });
 
-        // B. 🔥 CRITICAL FIX: FREE UP THE SLOT
+        // B. 🔥 FREE SLOT (Critical!)
         await tx.slot.update({
-           where: { id: appointment.slotId },
-           data: { 
-             status: 'PENDING', // Make it available for others
-             isBlocked: false,
-             blockedReason: null 
-           }
+          where: { id: appointment.slotId },
+          data: {
+            status: 'PENDING_PAYMENT',    // ✅ Exact enum: Available
+            isBlocked: false,
+            blockedReason: null,
+            blockedBy: null,
+            blockedAt: null
+          }
         });
 
         // C. Notify Clinic
         await tx.notification.create({
           data: {
             clinicId: appointment.clinicId,
-            type: "CANCELLATION",
+            type: "CANCELLATION",         // ✅ NotificationType enum
             entityId: appointment.id,
-            message: `Patient cancelled appointment with ${doctorName} on ${dateStr} at ${timeStr}.`,
+            message: `Patient cancelled with ${doctorName} on ${dateStr} ${timeStr}.`,
           },
         });
 
         return u;
       });
 
-      // Audit Log (Keep your existing function)
+      // Audit
       await logAudit({
         userId,
         clinicId: appointment.clinicId,
@@ -418,55 +426,34 @@ export const cancelUserAppointment = async (req, res) => {
     }
 
     // ============================================================
-    // 🔴 3. ONLINE PAYMENT (Request Workflow)
+    // 🔴 4. ONLINE PAYMENT (Refund Request Workflow)
     // ============================================================
     if (isOnlinePay) {
-      
-      // OPTIONAL: Do you want to block requests if it's too late?
-      // If yes, uncomment this block. If no, remove it to allow late requests (for admin decision).
+      // Optional: Block late requests (uncomment if needed)
       /*
       if (!withinWindow) {
         return res.status(400).json({
-          error: `Too late. Online refunds are only considered ${MIN_NOTICE_HOURS} hours in advance.`,
+          error: `Refunds considered ${MIN_NOTICE_HOURS} hours in advance only.`,
         });
       }
       */
-     if (appointment.cancellationRequest) {
-    const status = appointment.cancellationRequest.status;
-
-    if (status === "PENDING") {
-      return res.status(400).json({
-        error: "You have already submitted a cancellation request. Please wait for the clinic to review it.",
-      });
-    }
-
-    if (status === "APPROVED") {
-      return res.status(400).json({
-        error: "This request has already been approved and the appointment is being cancelled.",
-      });
-    }
-
-    if (status === "REJECTED") {
-      return res.status(400).json({
-        error: "Your previous cancellation request was declined. Please contact the clinic directly.",
-      });
-    }
-  }
-
-      if (appointment.cancellationRequest?.status === "PENDING") {
-        return res.status(400).json({
-          error: "Cancellation already requested and pending clinic approval.",
-        });
+     
+  await prisma.$transaction(async (tx) => {
+    // 🔥 NEW: Set appointment status to CANCEL_REQUESTED (shows orange UI)
+    await tx.appointment.update({
+      where: { id: appointment.id },
+      data: { 
+        status: "CANCEL_REQUESTED"  // ← THIS LINE FIXES "CONFIRMED" BUG
       }
+    });
 
       await prisma.$transaction(async (tx) => {
+        // Create/Update Request (status is String, not enum ✅)
         await tx.cancellationRequest.upsert({
           where: { appointmentId: appointment.id },
           update: {
             status: "PENDING",
             reason: reason || null,
-            processedAt: null,
-            processedById: null,
           },
           create: {
             appointmentId: appointment.id,
@@ -475,15 +462,16 @@ export const cancelUserAppointment = async (req, res) => {
           },
         });
 
+        // Notify Clinic (REFUND priority)
         await tx.notification.create({
           data: {
             clinicId: appointment.clinicId,
-            type: "CANCELLATION", // Or "CANCELLATION_REQUEST" if you add it to Enum
+            type: "CANCEL_REQUEST",       // ✅ NotificationType enum
             entityId: appointment.id,
-            message: `⚠️ REFUND REQUEST: Patient requested cancellation with ${doctorName}. Reason: ${reason || "N/A"}`,
+            message: `⚠️ REFUND REQUEST: ${doctorName} on ${dateStr} ${timeStr}. Reason: ${reason || "N/A"}`,
           },
         });
-      });
+      });});
 
       await logAudit({
         userId,
@@ -496,19 +484,143 @@ export const cancelUserAppointment = async (req, res) => {
       });
 
       return res.json({
-        message: "Cancellation request submitted. Clinic will review and process refund if applicable.",
+        message: "Cancellation request submitted. Clinic will review refund.",
+        appointmentId: id,
       });
     }
 
     return res.status(400).json({
-      error: "Cancellation flow not configured for this appointment.",
+      error: "Cancellation not configured for this payment mode.",
     });
 
   } catch (error) {
-    console.error("Cancel Appointment Error:", error);
-    return res.status(500).json({ error: error.message });
+    console.error("💥 Cancel Appointment Error:", {
+      message: error.message,
+      code: error.code,
+      meta: error.meta,
+      appointmentId: req.params.id,
+    });
+    return res.status(500).json({ error: "Cancellation failed" });
   }
 };
+
+
+// export const cancelUserAppointment= async (req, res) => {
+//   try {
+//     const { clinicId, userId } = req.user;
+//     const { id } = req.params;
+//     const { reason } = req.body || {};
+
+//     // 1. Fetch appointment with relations
+//     const existing = await prisma.appointment.findFirst({
+//       where: { id, clinicId, deletedAt: null },
+//       include: { 
+//         cancellationRequest: true, 
+//         slot: { include: { doctor: true, clinic: true } },
+//         user: true,
+//         payment: true 
+//       },
+//     });
+
+//     if (!existing) return res.status(404).json({ error: "Appointment not found" });
+
+//     // 2. Identify Policy Type
+//     // Logic: If it was rescheduled, we do NOT process an online refund
+//     const isRescheduled = existing.type === 'RESCHEDULE' || existing.adminNote?.includes('RESCHEDULED');
+//     const POLICY_MESSAGE = "Online refund is not applicable for rescheduled appointments. For any queries, please contact the clinic directly.";
+    
+//     let refundSuccessful = false;
+
+//     // 3. RAZORPAY REFUND LOGIC (Conditional)
+//     if (existing.paymentStatus === 'PAID' && !isRescheduled) {
+//       try {
+//         const gatewayObj = await getPaymentInstance(clinicId, 'RAZORPAY');
+//         const paymentId = existing.paymentId || existing.payment?.gatewayRefId;
+//         const amountInPaise = Math.round(Number(existing.amount) * 100);
+
+//         if (paymentId && amountInPaise > 0) {
+//           await gatewayObj.instance.payments.refund(paymentId, {
+//             amount: amountInPaise,
+//             notes: { reason: "Standard Cancellation Refund", appointmentId: id }
+//           });
+//           refundSuccessful = true;
+//         }
+//       } catch (refundErr) {
+//         console.error("🚨 Refund Failed:", refundErr.description);
+//         // We continue with cancellation but notify admin refund failed
+//       }
+//     }
+
+//     // 4. DATABASE UPDATES (Transaction)
+//     const finalReason = reason || (isRescheduled ? "Rescheduled & Cancelled" : "Cancelled by admin");
+//     const hasPendingRequest = !!existing.cancellationRequest && existing.cancellationRequest.status === "PENDING";
+
+//     const [updatedAppt] = await prisma.$transaction([
+//       // A. Update Appointment
+//       prisma.appointment.update({
+//         where: { id },
+//         data: {
+//           status: "CANCELLED",
+//           // If rescheduled, paymentStatus stays PAID (Clinic keeps the money)
+//           paymentStatus: refundSuccessful ? "REFUNDED" : "PAID",
+//           cancelReason: finalReason,
+//           adminNote: isRescheduled 
+//             ? `${existing.adminNote || ''} | POLICY: ${POLICY_MESSAGE}`.trim()
+//             : existing.adminNote,
+//           updatedAt: new Date()
+//         },
+//       }),
+
+//       // B. Update Cancellation Request
+//       hasPendingRequest
+//         ? prisma.cancellationRequest.update({
+//             where: { appointmentId: existing.id },
+//             data: {
+//               status: "APPROVED",
+//               processedAt: new Date(),
+//               processedById: userId,
+//               reason: finalReason,
+//             },
+//           })
+//         : prisma.$queryRaw`SELECT 1`,
+
+//       // C. Update Slot to make it available again
+//       prisma.slot.update({
+//         where: { id: existing.slotId },
+//         data: { status: "AVAILABLE", isBlocked: false }
+//       })
+//     ]);
+
+//     // 5. EMAIL & AUDIT
+//     const emailData = {
+//       ...existing,
+//       policyNote: isRescheduled ? POLICY_MESSAGE : null
+//     };
+    
+//     await sendCancellationEmail(emailData, finalReason, hasPendingRequest, req.user);
+
+//     await logAudit({
+//       userId,
+//       clinicId,
+//       action: "CANCEL_APPOINTMENT",
+//       entity: "Appointment",
+//       entityId: id,
+//       details: { isRescheduled, refundProcessed: refundSuccessful },
+//       req,
+//     });
+
+//     // 6. RESPONSE
+//     return res.json({
+//       success: true,
+//       message: isRescheduled ? POLICY_MESSAGE : "Appointment cancelled successfully.",
+//       data: updatedAppt
+//     });
+
+//   } catch (error) {
+//     console.error("🚨 Cancel Error:", error);
+//     return res.status(500).json({ error: error.message });
+//   }
+// };
 
 
 // ----------------------------------------------------------------
@@ -597,237 +709,20 @@ async function createPaymentOrder(gateway, slot, provider, notes = {}) {
   }
 }
 
-// ----------------------------------------------------------------
-// 3. MAIN CONTROLLER: Reschedule Appointment
-// export const rescheduleAppointment = async (req, res) => {
-//   try {
-//     const userId = req.user?.id || req.user?.userId || req.user?._id;
-//     const { id } = req.params; 
-//     const appointmentId = id || req.body.appointmentId; 
-//     const { newSlotId, provider = 'RAZORPAY' } = req.body; 
-
-//     if (!userId || !appointmentId || !newSlotId) {
-//       return res.status(400).json({ error: 'Missing required fields' });
-//     }
-
-//     const result = await prisma.$transaction(async (tx) => {
-//       // 1. ATOMIC FETCH + VALIDATION
-//       const [oldAppt, newSlot, slotBookings] = await Promise.all([
-//         tx.appointment.findUnique({ 
-//           where: { id: appointmentId },
-//           include: { 
-//             slot: true, 
-//             clinic: { include: { gateways: { where: { name: provider, isActive: true } } } },
-//             doctor: true 
-//           }
-//         }),
-//         tx.slot.findUnique({ where: { id: newSlotId }, include: { clinic: true } }),
-//         tx.appointment.count({
-//           where: { slotId: newSlotId, status: { notIn: ['CANCELLED'] }, deletedAt: null }
-//         })
-//       ]);
-
-//       if (!oldAppt || !newSlot) {
-//         throw { statusCode: 404, message: "Appointment or slot not found" };
-//       }
-//       if (slotBookings > 0) {
-//         throw { statusCode: 409, message: "Slot already booked" };
-//       }
-
-//       // AUTH CHECKS
-//       if (String(oldAppt.userId) !== String(userId)) {
-//         throw { statusCode: 403, message: "Not authorized" };
-//       }
-//       if (["COMPLETED", "CANCELLED"].includes(oldAppt.status)) {
-//         throw { statusCode: 400, message: "Cannot reschedule completed/cancelled" };
-//       }
-
-//       // 🔥 2. COMPLETE FINANCIAL LOGIC (6 SCENARIOS)
-//       const oldPrice = Number(oldAppt.amount || 0);
-//       const newPrice = Number(newSlot.price || 0);
-//       const oldPaidAmount = oldAppt.paymentStatus === "PAID" ? oldPrice : 0;
-//       const isOfflineToOnline = oldAppt.slot.paymentMode === 'OFFLINE' && newSlot.paymentMode === 'ONLINE';
-      
-//       let needsPayment = false;
-//       let financialStatus = 'NO_CHANGE';
-//       let diffAmount = 0;
-//       let adminNote = '';
-
-//       console.log(`💳 Old: ${oldAppt.slot.paymentMode}(${oldAppt.paymentStatus}) ₹${oldPrice} → New: ${newSlot.paymentMode} ₹${newPrice}`);
-
-//       // 🔥 SCENARIO LOGIC
-//       if (newPrice > oldPaidAmount) {
-//         // CASE 1-3: Need to pay more
-//         needsPayment = true;
-//         financialStatus = 'PAY_DIFFERENCE';
-//         diffAmount = newPrice - oldPaidAmount;
-//         adminNote = `Pay ₹${diffAmount} difference (₹${oldPaidAmount} already paid)`;
-        
-//       } else if (newPrice < oldPaidAmount) {
-//         // CASE 4: REFUND (₹500 → ₹300)
-//         needsPayment = false;
-//         financialStatus = 'REFUND_AT_CLINIC';
-//         diffAmount = oldPaidAmount - newPrice;
-//         adminNote = `Refund ₹${diffAmount} at clinic (Paid ₹${oldPaidAmount}, New ₹${newPrice})`;
-        
-//       } else if (isOfflineToOnline) {
-//         // CASE 5: OFFLINE → ONLINE (same price)
-//         needsPayment = true;
-//         financialStatus = 'OFFLINE_TO_ONLINE';
-//         diffAmount = newPrice;
-//         adminNote = `Pay ₹${newPrice} for online slot`;
-        
-//       } else {
-//         // CASE 6: NO CHANGE (FREE→FREE, same price)
-//         financialStatus = 'NO_CHANGE';
-//         adminNote = `Rescheduled (no financial change)`;
-//       }
-
-//       console.log(`💰 Result: ${financialStatus} | Diff: ₹${diffAmount} | Payment: ${needsPayment ? 'YES' : 'NO'}`);
-
-//       const oldSlotId = oldAppt.slotId;
-      
-//       // FREE OLD SLOT
-//       if (oldSlotId && oldSlotId !== newSlotId) {
-//         await tx.slot.update({
-//           where: { id: oldSlotId },
-//           data: { status: 'PENDING', isBlocked: false }
-//         });
-//       }
-
-//       // UPDATE APPOINTMENT (atomic swap)
-//       const updatedAppt = await tx.appointment.update({
-//         where: { id: appointmentId },
-//         data: {
-//           slotId: newSlotId,
-//           status: needsPayment ? 'PENDING_PAYMENT' : 'CONFIRMED',
-//           paymentStatus: needsPayment ? 'PENDING' : 'PAID',
-//           financialStatus,
-//           amount: newPrice,
-//           diffAmount: diffAmount,
-//           adminNote: adminNote,
-//           updatedAt: new Date()
-//         },
-//         include: { 
-//           clinic: { include: { gateways: { where: { name: provider, isActive: true } } } },
-//           slot: true 
-//         }
-//       });
-
-//       // LOCK NEW SLOT
-//       await tx.slot.update({
-//         where: { id: newSlotId },
-//         data: { 
-//           status: needsPayment ? 'PENDING_PAYMENT' : 'CONFIRMED', 
-//           isBlocked: needsPayment 
-//         }
-//       });
-
-//       // 3. FREE/REFUND CASE - INSTANT SUCCESS
-//       if (!needsPayment) {
-//         return {
-//           status: 'SUCCESS',
-//           message: financialStatus === 'REFUND_AT_CLINIC' 
-//             ? `Rescheduled! Get ₹${diffAmount} refund at clinic.`
-//             : 'Rescheduled successfully!',
-//           data: { 
-//             updatedAppt,
-//             financialStatus,
-//             refundAmount: financialStatus === 'REFUND_AT_CLINIC' ? diffAmount : 0
-//           }
-//         };
-//       }
-
-//       // 🔥 4. PAID CASE - RAZORPAY (Pay ONLY difference!)
-//       const gateways = updatedAppt.clinic.gateways || [];
-//       const gateway = gateways.find(g => g.name === provider && g.isActive);
-
-//       console.log('🔍 GATEWAY:', gateway ? '✅' : '❌');
-
-//       if (!gateway?.apiKey || !gateway?.secret) {
-//         console.log('🔴 No gateway → CLINIC_PAYMENT');
-//         return {
-//           status: 'CLINIC_PAYMENT',
-//           message: `Pay ₹${diffAmount} at clinic`,
-//           data: { 
-//             appointmentId, 
-//             amount: diffAmount,  // ✅ Only difference!
-//             clinic: updatedAppt.clinic 
-//           }
-//         };
-//       }
-
-//       const razorpay = new Razorpay({
-//         key_id: gateway.apiKey,
-//         key_secret: gateway.secret
-//       });
-
-//       const receipt = `resch_${appointmentId.slice(-10)}`;
-
-//       // ✅ CHARGE ONLY DIFFERENCE!
-//       const razorpayOrder = await razorpay.orders.create({
-//         amount: Math.round(diffAmount * 100),  // ✅ diffAmount NOT newPrice!
-//         currency: 'INR',
-//         receipt: receipt,
-//         notes: { 
-//           type: financialStatus,
-//           appointmentId, 
-//           slotId: newSlotId,
-//           oldAmount: oldPaidAmount,
-//           newAmount: newPrice,
-//           difference: diffAmount
-//         }
-//       });
-
-//       console.log('✅ RAZORPAY ORDER:', razorpayOrder.id, `₹${diffAmount}`);
-
-//       return {
-//         status: 'PAYMENT_REQUIRED',
-//         message: `Pay ₹${diffAmount} difference`,
-//         data: {
-//           appointmentId,
-//           key: gateway.apiKey,
-//           amount: razorpayOrder.amount,  // ₹200 NOT ₹500!
-//           orderId: razorpayOrder.id,
-//           diffAmount: diffAmount,
-//           oldPaidAmount: oldPaidAmount,
-//           newPrice: newPrice,
-//           expiresIn: 600,
-//           paymentExpiry: new Date(Date.now() + 10 * 60 * 1000).toISOString()
-//         }
-//       };
-//     });
-
-//     return res.json(result);
-
-//   } catch (error) {
-//     console.error('❌ RESCHEDULE ERROR:', error);
-//     if (error.code === 'P2002') {
-//       return res.status(409).json({ error: 'Slot taken. Try again.' });
-//     }
-//     if (error.statusCode) {
-//       return res.status(error.statusCode).json({ error: error.message });
-//     }
-//     return res.status(500).json({ error: 'Reschedule failed' });
-//   }
-// };
-
-
 
 export const rescheduleAppointment = async (req, res) => {
-  try {
-    const userId = req.user?.id || req.user?.userId || req.user?._id;
-    const userRole = req.user?.role || 'USER'; 
-    const { id } = req.params; 
-    const appointmentId = id || req.body.appointmentId; 
-    const { newSlotId, provider = 'RAZORPAY' } = req.body; 
+  // 🔥 SCOPE FIX: Move to top
+  const userId = req.user?.id || req.user?.userId || req.user?._id;
+  const { id } = req.params; 
+  const appointmentId = id || req.body.appointmentId; 
+  const { newSlotId, provider = 'RAZORPAY' } = req.body; 
 
-    if (!appointmentId || !newSlotId) {
+  try {
+    if (!userId || !appointmentId || !newSlotId) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
     const result = await prisma.$transaction(async (tx) => {
-      // 1. ATOMIC FETCH
       const [oldAppt, newSlot, slotBookings] = await Promise.all([
         tx.appointment.findUnique({ 
           where: { id: appointmentId },
@@ -843,199 +738,382 @@ export const rescheduleAppointment = async (req, res) => {
         })
       ]);
 
-      if (!oldAppt || !newSlot) throw { statusCode: 404, message: "Appointment/Slot not found" };
-      if (slotBookings > 0) throw { statusCode: 409, message: "Slot already booked" };
-
-      // AUTH CHECKS
-      const isOwner = String(oldAppt.userId) === String(userId);
-      const isAdmin = ['SUPER_ADMIN', 'ADMIN', 'DOCTOR'].includes(userRole);
-
-      if (!isOwner && !isAdmin) throw { statusCode: 403, message: "Not authorized" };
-      if (["COMPLETED", "CANCELLED"].includes(oldAppt.status)) throw { statusCode: 400, message: "Cannot reschedule completed/cancelled" };
-
-      if (!isAdmin && (oldAppt.rescheduleCount || 0) >= 1) {
-        throw { statusCode: 400, message: "You can only reschedule once. Please cancel and re-book." };
+      if (!oldAppt || !newSlot) {
+        throw { statusCode: 404, message: "Appointment or slot not found" };
+      }
+      if (slotBookings > 0) {
+        throw { statusCode: 409, message: "Slot already booked" };
       }
 
-      // 2. FINANCIAL LOGIC
+      // AUTH CHECKS
+      if (String(oldAppt.userId) !== String(userId)) {
+        throw { statusCode: 403, message: "Not authorized" };
+      }
+      if (["COMPLETED", "CANCELLED"].includes(oldAppt.status)) {
+        throw { statusCode: 400, message: "Cannot reschedule completed/cancelled" };
+      }
+
+      // 🔥 SAFE MULTIPLE RESCHEDULE BLOCK
+      const currentRescheduleCount = Number(oldAppt.rescheduleCount || 0);
+      if (currentRescheduleCount >= 1) {
+        throw { statusCode: 400, message: "Cannot reschedule more than once per policy" };
+      }
+
+      // FINANCIAL LOGIC (unchanged)
       const oldPrice = Number(oldAppt.amount || 0);
       const newPrice = Number(newSlot.price || 0);
       const oldPaidAmount = oldAppt.paymentStatus === "PAID" ? oldPrice : 0;
-      const isTargetOffline = newSlot.paymentMode === 'OFFLINE' || newSlot.paymentMode === 'CLINIC';
-      const wasOnlinePaid = oldAppt.paymentStatus === "PAID" && oldAppt.slot.paymentMode === 'ONLINE';
+      const isOfflineToOnline = oldAppt.slot.paymentMode === 'OFFLINE' && newSlot.paymentMode === 'ONLINE';
       
-      let needsPayment = false;
-      let financialStatus = 'NO_CHANGE';
-      let diffAmount = 0;
-      let adminNote = '';
+      let needsPayment = false, financialStatus = 'NO_CHANGE', diffAmount = 0, adminNote = '';
 
-      if (isTargetOffline) {
-        needsPayment = false;
-        if (newPrice === 0) {
-          if (wasOnlinePaid && oldPaidAmount > 0) {
-            financialStatus = 'FULL_REFUND';
-            diffAmount = oldPaidAmount;
-            adminNote = `Refund FULL ₹${oldPaidAmount}`;
-          } else {
-            financialStatus = 'FREE_SLOT';
-            adminNote = `Free slot`;
-          }
-        } else if (wasOnlinePaid && oldPaidAmount > 0) {
-          if (newPrice > oldPaidAmount) {
-            financialStatus = 'PAY_DIFFERENCE_OFFLINE';
-            diffAmount = newPrice - oldPaidAmount;
-            adminNote = `Collect ₹${diffAmount} more at clinic`;
-          } else if (newPrice < oldPaidAmount) {
-            financialStatus = 'REFUND_AT_CLINIC';
-            diffAmount = oldPaidAmount - newPrice;
-            adminNote = `Refund ₹${diffAmount} at clinic`;
-          } else {
-            financialStatus = 'NO_CHANGE';
-            adminNote = `Rescheduled (no price change)`;
-          }
-        } else {
-          financialStatus = 'PAY_AT_CLINIC';
-          diffAmount = newPrice;
-          adminNote = `Collect FULL ₹${newPrice} at clinic`;
-        }
+      console.log(`💳 Old: ${oldAppt.slot.paymentMode}(${oldAppt.paymentStatus}) ₹${oldPrice} → New: ${newSlot.paymentMode} ₹${newPrice}`);
+
+      if (newPrice > oldPaidAmount) {
+        needsPayment = true; financialStatus = 'PAY_DIFFERENCE'; diffAmount = newPrice - oldPaidAmount;
+        adminNote = `Pay ₹${diffAmount} difference (₹${oldPaidAmount} already paid)`;
+      } else if (newPrice < oldPaidAmount) {
+        needsPayment = false; financialStatus = 'REFUND_AT_CLINIC'; diffAmount = oldPaidAmount - newPrice;
+        adminNote = `Refund ₹${diffAmount} at clinic (Paid ₹${oldPaidAmount}, New ₹${newPrice})`;
+      } else if (isOfflineToOnline) {
+        needsPayment = true; financialStatus = 'OFFLINE_TO_ONLINE'; diffAmount = newPrice;
+        adminNote = `Pay ₹${newPrice} for online slot`;
       } else {
-        if (newPrice > oldPaidAmount) {
-          needsPayment = true;
-          financialStatus = 'PAY_DIFFERENCE';
-          diffAmount = newPrice - oldPaidAmount;
-          adminNote = `Pay ₹${diffAmount} online`;
-        } else if (newPrice < oldPaidAmount) {
-          needsPayment = false;
-          financialStatus = 'REFUND_AT_CLINIC';
-          diffAmount = oldPaidAmount - newPrice;
-          adminNote = `Refund ₹${diffAmount}`;
-        } else {
-          financialStatus = 'NO_CHANGE';
-          adminNote = `Rescheduled (same price)`;
-        }
+        financialStatus = 'NO_CHANGE'; adminNote = `Rescheduled (no financial change)`;
       }
 
-      // FREE OLD SLOT
       const oldSlotId = oldAppt.slotId;
+      
       if (oldSlotId && oldSlotId !== newSlotId) {
-        await tx.slot.update({
-          where: { id: oldSlotId },
-          data: { status: 'PENDING', isBlocked: false }
-        });
+        await tx.slot.update({ where: { id: oldSlotId }, data: { status: 'PENDING', isBlocked: false } });
       }
 
-      // UPDATE APPOINTMENT
-      const newPaymentStatus = needsPayment ? 'PENDING' : (newPrice === 0 ? 'PAID' : (isTargetOffline ? 'PENDING' : 'PAID'));
-      const newStatus = needsPayment ? 'PENDING_PAYMENT' : 'CONFIRMED';
+      // 🔥 SAFE UPDATE (works with/without schema)
+      const baseData = {
+        slot: { connect: { id: newSlotId } },
+        adminNote: `RESCHEDULED: ${adminNote}`,
+        status: needsPayment ? 'PENDING_PAYMENT' : 'CONFIRMED',
+        paymentStatus: needsPayment ? 'PENDING' : 'PAID',
+        financialStatus,
+        amount: newPrice,
+        diffAmount: diffAmount,
+        updatedAt: new Date()
+      };
 
-      const updatedAppt = await tx.appointment.update({
-        where: { id: appointmentId },
-        data: {
-          slotId: newSlotId,
-          status: newStatus,
-          paymentStatus: newPaymentStatus, 
-          financialStatus,
-          amount: newPrice,
-          diffAmount: diffAmount,
-          adminNote: adminNote,
-          updatedAt: new Date(),
-          rescheduleCount: { increment: 1 } 
-        },
-        include: { 
-          clinic: { include: { gateways: { where: { name: provider, isActive: true } } } },
-          slot: true 
-        }
-      });
-
-      // 🔥 LOG RESCHEDULE HISTORY (FIXED!)
-      await tx.appointmentLog.create({
-        data: {
-          appointmentId: appointmentId,
-          oldDate: oldAppt.slot.date,
-          oldTime: oldAppt.slot.time,
-          newDate: newSlot.date,
-          newTime: newSlot.time,
-          reason: "User Rescheduled",
-          changedBy: userId,
-          metadata: { 
-            fromSlotId: oldAppt.slotId, 
-            toSlotId: newSlotId,
-            financialStatus,
-            diffAmount
+      const safeTracking = {
+        ...(typeof oldAppt.rescheduleCount !== 'undefined' && { rescheduleCount: { increment: 1 } }),
+        ...(typeof oldAppt.type !== 'undefined' && { type: 'RESCHEDULE' }),
+        ...(Array.isArray(oldAppt.history) && {
+          history: {
+            push: {
+              oldSlotId, oldDate: oldAppt.slot.date.toISOString(),
+              newDate: newSlot.date.toISOString(), oldTime: oldAppt.slot.time,
+              newTime: newSlot.time, timestamp: new Date().toISOString()
+            }
           }
-        }
-      });
+        })
+      };
 
-      // LOCK NEW SLOT
-      await tx.slot.update({
-        where: { id: newSlotId },
-        data: { 
-          status: needsPayment ? 'PENDING_PAYMENT' : 'CONFIRMED', 
-          isBlocked: needsPayment 
-        }
-      });
+  const updatedAppt = await tx.appointment.update({
+  where: { id: appointmentId },
+  data: { ...baseData, ...safeTracking },
+  include: { clinic: { include: { gateways: { where: { name: provider, isActive: true } } } }, slot: true }
+});
 
-      // SUCCESS RESPONSE
-      if (!needsPayment) {
-        return {
-          status: 'SUCCESS',
-          message: 'Rescheduled successfully!',
-          data: { updatedAppt }
-        };
-      }
+await tx.slot.update({
+  where: { id: newSlotId },
+  data: { status: needsPayment ? 'PENDING_PAYMENT' : 'CONFIRMED', isBlocked: needsPayment }
+});
 
-      // PAYMENT REQUIRED
+// 🔥 ADD THIS: Create reschedule history log
+await tx.appointmentLog.create({
+  data: {
+    appointmentId,
+    oldDate: oldAppt.slot.date,
+    oldTime: oldAppt.slot.time,
+    newDate: newSlot.date,
+    newTime: newSlot.time,
+    changedBy: userId,
+    reason: `Rescheduled: ${financialStatus}`,
+    metadata: { 
+      oldSlotId: oldAppt.slotId,
+      newSlotId,
+      oldPrice,
+      newPrice,
+      financialStatus 
+    }
+  }
+});
+
+if (!needsPayment) {
+  return {
+    status: 'SUCCESS',
+    message: financialStatus === 'REFUND_AT_CLINIC' ? `Rescheduled! Get ₹${diffAmount} refund at clinic.` : 'Rescheduled successfully!',
+    data: { updatedAppt, financialStatus, refundAmount: financialStatus === 'REFUND_AT_CLINIC' ? diffAmount : 0 }
+  };
+}
+  
+      // RAZORPAY (unchanged)
       const gateways = updatedAppt.clinic.gateways || [];
       const gateway = gateways.find(g => g.name === provider && g.isActive);
 
       if (!gateway?.apiKey || !gateway?.secret) {
-        return {
-          status: 'CLINIC_PAYMENT',
-          message: `Pay ₹${diffAmount} at clinic`,
-          data: { appointmentId, amount: diffAmount }
-        };
+        return { status: 'CLINIC_PAYMENT', message: `Pay ₹${diffAmount} at clinic`, data: { appointmentId, amount: diffAmount, clinic: updatedAppt.clinic } };
       }
 
-      const razorpay = new Razorpay({
-        key_id: gateway.apiKey,
-        key_secret: gateway.secret
-      });
-
+      const razorpay = new Razorpay({ key_id: gateway.apiKey, key_secret: gateway.secret });
       const receipt = `resch_${appointmentId.slice(-10)}`;
       const razorpayOrder = await razorpay.orders.create({
-        amount: Math.round(diffAmount * 100),
-        currency: 'INR',
-        receipt: receipt,
-        notes: { 
-          type: financialStatus,
-          appointmentId, 
-          slotId: newSlotId,
-          userRole 
-        }
+        amount: Math.round(diffAmount * 100), currency: 'INR', receipt,
+        notes: { type: financialStatus, appointmentId, slotId: newSlotId, oldAmount: oldPaidAmount, newAmount: newPrice, difference: diffAmount }
       });
 
       return {
         status: 'PAYMENT_REQUIRED',
-        message: `Pay ₹${diffAmount}`,
-        data: {
-          appointmentId,
-          key: gateway.apiKey,
-          amount: razorpayOrder.amount,
-          orderId: razorpayOrder.id,
-          expiresIn: 600
-        }
+        message: `Pay ₹${diffAmount} difference`,
+        data: { appointmentId, key: gateway.apiKey, amount: razorpayOrder.amount, orderId: razorpayOrder.id, diffAmount, oldPaidAmount, newPrice, expiresIn: 600, paymentExpiry: new Date(Date.now() + 10 * 60 * 1000).toISOString() }
       };
     });
 
-    return res.json(result);
+    res.json(result);
 
   } catch (error) {
-    console.error('❌ RESCHEDULE ERROR:', error);
-    if (error.code === 'P2002') return res.status(409).json({ error: 'Slot taken.' });
+    // 🔥 FIXED: Variables in scope
+    console.error('❌ RESCHEDULE ERROR:', { appointmentId, userId, newSlotId, error: error.message });
+    
+    if (error.code === 'P2002') return res.status(409).json({ error: 'Slot taken. Try again.' });
     if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
-    return res.status(500).json({ error: 'Reschedule failed' });
+    return res.status(500).json({ error: 'Reschedule failed - please try again' });
   }
 };
+
+
+
+
+
+
+// export const rescheduleAppointment = async (req, res) => {
+//   try {
+//     const userId = req.user?.id || req.user?.userId || req.user?._id;
+//     const userRole = req.user?.role || 'USER'; 
+//     const { id } = req.params; 
+//     const appointmentId = id || req.body.appointmentId; 
+//     const { newSlotId, provider = 'RAZORPAY' } = req.body; 
+
+//     if (!appointmentId || !newSlotId) {
+//       return res.status(400).json({ error: 'Missing required fields' });
+//     }
+
+//     const result = await prisma.$transaction(async (tx) => {
+//       // 1. ATOMIC FETCH
+//       const [oldAppt, newSlot, slotBookings] = await Promise.all([
+//         tx.appointment.findUnique({ 
+//           where: { id: appointmentId },
+//           include: { 
+//             slot: true, 
+//             clinic: { include: { gateways: { where: { name: provider, isActive: true } } } },
+//             doctor: true 
+//           }
+//         }),
+//         tx.slot.findUnique({ where: { id: newSlotId }, include: { clinic: true } }),
+//         tx.appointment.count({
+//           where: { slotId: newSlotId, status: { notIn: ['CANCELLED'] }, deletedAt: null }
+//         })
+//       ]);
+
+//       if (!oldAppt || !newSlot) throw { statusCode: 404, message: "Appointment/Slot not found" };
+//       if (slotBookings > 0) throw { statusCode: 409, message: "Slot already booked" };
+
+//       // AUTH CHECKS
+//       const isOwner = String(oldAppt.userId) === String(userId);
+//       const isAdmin = ['SUPER_ADMIN', 'ADMIN', 'DOCTOR'].includes(userRole);
+
+//       if (!isOwner && !isAdmin) throw { statusCode: 403, message: "Not authorized" };
+//       if (["COMPLETED", "CANCELLED"].includes(oldAppt.status)) throw { statusCode: 400, message: "Cannot reschedule completed/cancelled" };
+
+//       if (!isAdmin && (oldAppt.rescheduleCount || 0) >= 1) {
+//         throw { statusCode: 400, message: "You can only reschedule once. Please cancel and re-book." };
+//       }
+
+//       // 2. FINANCIAL LOGIC
+//       const oldPrice = Number(oldAppt.amount || 0);
+//       const newPrice = Number(newSlot.price || 0);
+//       const oldPaidAmount = oldAppt.paymentStatus === "PAID" ? oldPrice : 0;
+//       const isTargetOffline = newSlot.paymentMode === 'OFFLINE' || newSlot.paymentMode === 'CLINIC';
+//       const wasOnlinePaid = oldAppt.paymentStatus === "PAID" && oldAppt.slot.paymentMode === 'ONLINE';
+      
+//       let needsPayment = false;
+//       let financialStatus = 'NO_CHANGE';
+//       let diffAmount = 0;
+//       let adminNote = '';
+
+//       if (isTargetOffline) {
+//         needsPayment = false;
+//         if (newPrice === 0) {
+//           if (wasOnlinePaid && oldPaidAmount > 0) {
+//             financialStatus = 'FULL_REFUND';
+//             diffAmount = oldPaidAmount;
+//             adminNote = `Refund FULL ₹${oldPaidAmount}`;
+//           } else {
+//             financialStatus = 'FREE_SLOT';
+//             adminNote = `Free slot`;
+//           }
+//         } else if (wasOnlinePaid && oldPaidAmount > 0) {
+//           if (newPrice > oldPaidAmount) {
+//             financialStatus = 'PAY_DIFFERENCE_OFFLINE';
+//             diffAmount = newPrice - oldPaidAmount;
+//             adminNote = `Collect ₹${diffAmount} more at clinic`;
+//           } else if (newPrice < oldPaidAmount) {
+//             financialStatus = 'REFUND_AT_CLINIC';
+//             diffAmount = oldPaidAmount - newPrice;
+//             adminNote = `Refund ₹${diffAmount} at clinic`;
+//           } else {
+//             financialStatus = 'NO_CHANGE';
+//             adminNote = `Rescheduled (no price change)`;
+//           }
+//         } else {
+//           financialStatus = 'PAY_AT_CLINIC';
+//           diffAmount = newPrice;
+//           adminNote = `Collect FULL ₹${newPrice} at clinic`;
+//         }
+//       } else {
+//         if (newPrice > oldPaidAmount) {
+//           needsPayment = true;
+//           financialStatus = 'PAY_DIFFERENCE';
+//           diffAmount = newPrice - oldPaidAmount;
+//           adminNote = `Pay ₹${diffAmount} online`;
+//         } else if (newPrice < oldPaidAmount) {
+//           needsPayment = false;
+//           financialStatus = 'REFUND_AT_CLINIC';
+//           diffAmount = oldPaidAmount - newPrice;
+//           adminNote = `Refund ₹${diffAmount}`;
+//         } else {
+//           financialStatus = 'NO_CHANGE';
+//           adminNote = `Rescheduled (same price)`;
+//         }
+//       }
+
+//       // FREE OLD SLOT
+//       const oldSlotId = oldAppt.slotId;
+//       if (oldSlotId && oldSlotId !== newSlotId) {
+//         await tx.slot.update({
+//           where: { id: oldSlotId },
+//           data: { status: 'PENDING', isBlocked: false }
+//         });
+//       }
+
+//       // UPDATE APPOINTMENT
+//       const newPaymentStatus = needsPayment ? 'PENDING' : (newPrice === 0 ? 'PAID' : (isTargetOffline ? 'PENDING' : 'PAID'));
+//       const newStatus = needsPayment ? 'PENDING_PAYMENT' : 'CONFIRMED';
+
+//       const updatedAppt = await tx.appointment.update({
+//         where: { id: appointmentId },
+//         data: {
+//           slotId: newSlotId,
+//           status: newStatus,
+//           paymentStatus: newPaymentStatus, 
+//           financialStatus,
+//           amount: newPrice,
+//           diffAmount: diffAmount,
+//           adminNote: adminNote,
+//           updatedAt: new Date(),
+//           rescheduleCount: { increment: 1 } 
+//         },
+//         include: { 
+//           clinic: { include: { gateways: { where: { name: provider, isActive: true } } } },
+//           slot: true 
+//         }
+//       });
+
+//       // 🔥 LOG RESCHEDULE HISTORY (FIXED!)
+//       await tx.appointmentLog.create({
+//         data: {
+//           appointmentId: appointmentId,
+//           oldDate: oldAppt.slot.date,
+//           oldTime: oldAppt.slot.time,
+//           newDate: newSlot.date,
+//           newTime: newSlot.time,
+//           reason: "User Rescheduled",
+//           changedBy: userId,
+//           metadata: { 
+//             fromSlotId: oldAppt.slotId, 
+//             toSlotId: newSlotId,
+//             financialStatus,
+//             diffAmount
+//           }
+//         }
+//       });
+
+//       // LOCK NEW SLOT
+//       await tx.slot.update({
+//         where: { id: newSlotId },
+//         data: { 
+//           status: needsPayment ? 'PENDING_PAYMENT' : 'CONFIRMED', 
+//           isBlocked: needsPayment 
+//         }
+//       });
+
+//       // SUCCESS RESPONSE
+//       if (!needsPayment) {
+//         return {
+//           status: 'SUCCESS',
+//           message: 'Rescheduled successfully!',
+//           data: { updatedAppt }
+//         };
+//       }
+
+//       // PAYMENT REQUIRED
+//       const gateways = updatedAppt.clinic.gateways || [];
+//       const gateway = gateways.find(g => g.name === provider && g.isActive);
+
+//       if (!gateway?.apiKey || !gateway?.secret) {
+//         return {
+//           status: 'CLINIC_PAYMENT',
+//           message: `Pay ₹${diffAmount} at clinic`,
+//           data: { appointmentId, amount: diffAmount }
+//         };
+//       }
+
+//       const razorpay = new Razorpay({
+//         key_id: gateway.apiKey,
+//         key_secret: gateway.secret
+//       });
+
+//       const receipt = `resch_${appointmentId.slice(-10)}`;
+//       const razorpayOrder = await razorpay.orders.create({
+//         amount: Math.round(diffAmount * 100),
+//         currency: 'INR',
+//         receipt: receipt,
+//         notes: { 
+//           type: financialStatus,
+//           appointmentId, 
+//           slotId: newSlotId,
+//           userRole 
+//         }
+//       });
+
+//       return {
+//         status: 'PAYMENT_REQUIRED',
+//         message: `Pay ₹${diffAmount}`,
+//         data: {
+//           appointmentId,
+//           key: gateway.apiKey,
+//           amount: razorpayOrder.amount,
+//           orderId: razorpayOrder.id,
+//           expiresIn: 600
+//         }
+//       };
+//     });
+
+//     return res.json(result);
+
+//   } catch (error) {
+//     console.error('❌ RESCHEDULE ERROR:', error);
+//     if (error.code === 'P2002') return res.status(409).json({ error: 'Slot taken.' });
+//     if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+//     return res.status(500).json({ error: 'Reschedule failed' });
+//   }
+// };
 
   
 
@@ -1152,18 +1230,21 @@ export const getUserAppointments = async (req, res) => {
       slotId: app.slotId,
       status: app.status,
 
-      // 🔥 NEW: Essential fields for UI
+      // 🔥 FIXED: Essential reschedule fields for frontend
+      type: app.type,                    // ✅ isRescheduled check #1
+      rescheduleCount: app.rescheduleCount, // ✅ isRescheduled check #2 + blocks multiples
+      adminNote: app.adminNote,          // ✅ isRescheduled check #4 + messages
+
       cancelledBy: app.cancelledBy,
       paymentStatus: app.paymentStatus,
       financialStatus: app.financialStatus,
-      adminNote: app.adminNote,        // ← Refund message
       cancelReason: app.cancelReason,
 
       doctor: app.doctor,
       slot: app.slot,
       clinic: app.clinic,
       review: app.review,
-      cancellationRequest: app.cancellationRequest,  // ← Reject reason
+      cancellationRequest: app.cancellationRequest,
       payment: app.payment,
 
       prescription: app.prescription || null,
@@ -1182,7 +1263,7 @@ export const getUserAppointments = async (req, res) => {
         oldTime: log.oldTime,
         newTime: log.newTime,
         reason: log.reason,
-      })),
+      })),  // ✅ isRescheduled check #3
     }));
 
     return res.json({
