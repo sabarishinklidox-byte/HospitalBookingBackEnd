@@ -474,34 +474,23 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
     console.log('📅 Old slot:', oldSlot.date, oldSlot.time);
 
     // 3. Find/Create New Slot
-    let newSlot = await prisma.slot.findFirst({
-      where: {
-        clinicId,
-        doctorId: appt.doctorId,
-        date: targetDate,
-        time: newTime,
-        deletedAt: null,
-      },
-    });
+   let newSlot = await prisma.slot.findFirst({
+  where: {
+    clinicId,
+    doctorId: appt.doctorId,
+    date: targetDate,
+    time: newTime,
+    deletedAt: null,
+  },
+});
 
-    if (!newSlot) {
-      newSlot = await prisma.slot.create({
-        data: {
-          clinicId,
-          doctorId: appt.doctorId,
-          date: targetDate,
-          time: newTime,
-          duration: oldSlot.duration || 30,
-          type: oldSlot.type || 'REGULAR',
-          price: oldSlot.price || 0,
-          paymentMode: oldSlot.paymentMode || 'OFFLINE',
-          status: 'PENDING',
-          isBlocked: false,
-        },
-      });
-      console.log('🆕 New slot created:', newSlot.id);
-    }
+if (!newSlot) {
+  return res.status(404).json({ 
+    error: 'No available slot at this time. Please choose an existing slot.' 
+  });
+}
 
+console.log('✅ Found existing slot:', newSlot.id, 'Price:', newSlot.price);
     // 4. Collision Check
     const anyApptOnSlot = await prisma.appointment.findFirst({
       where: {
@@ -515,56 +504,40 @@ export const rescheduleAppointmentByAdmin = async (req, res) => {
       return res.status(409).json({ error: 'Slot already booked by another patient' });
     }
 
-    // 🔥 5. FINANCIAL LOGIC
-    const oldPrice = Number(appt.amount || 0);
-    const oldPaidAmount = appt.paymentStatus === "PAID" ? Number(appt.payment?.amount || 0) : 0;
-    const newPrice = Number(newSlot.price || 0);
-    const isTargetOffline = newSlot.paymentMode === 'OFFLINE' || newSlot.paymentMode === 'CLINIC';
+   // 🔥 5. FINANCIAL LOGIC
+const oldPaidAmount = appt.paymentStatus === "PAID" ? Number(appt.amount || 0) : 0;
+const newPrice = Number(newSlot.price || 0);
 
-    let financialStatus = 'NO_CHANGE';
-    let diffAmount = 0;
-    let adminNote = '';
+let financialStatus = 'NO_CHANGE';
+let diffAmount = 0;
+let adminNote = '';
 
-    if (isTargetOffline) {
-      if (newPrice === 0) {
-        if (oldPaidAmount > 0) {
-          financialStatus = 'FULL_REFUND';
-          diffAmount = oldPaidAmount;
-          adminNote = `Refund FULL ₹${(diffAmount/100).toFixed(0)} (online payment)`;
-        } else {
-          financialStatus = 'FREE_SLOT';
-          adminNote = 'Free consultation';
-        }
-      } else if (oldPaidAmount > 0) {
-   if (newPrice > oldPaidAmount) {
-  financialStatus = 'PAY_DIFFERENCE_OFFLINE';  // Keep
-  diffAmount = newPrice - oldPaidAmount;       // 900-500=400 ✅
-  adminNote = `Collect ₹${(diffAmount/100).toFixed(0)} MORE at clinic`;  // "MORE" ✅
-} 
-         else if (newPrice < oldPaidAmount) {
-          financialStatus = 'REFUND_AT_CLINIC';
-          diffAmount = oldPaidAmount - newPrice;
-          adminNote = `Refund ₹${(diffAmount/100).toFixed(0)} (paid ₹${(oldPaidAmount/100).toFixed(0)})`;
-        } else {
-          adminNote = `Same price ₹${(newPrice/100).toFixed(0)}`;
-        }
-      } else {
-        financialStatus = 'PAY_AT_CLINIC';
-        diffAmount = newPrice;
-        adminNote = `Collect FULL ₹${(newPrice/100).toFixed(0)} cash`;
-      }
-    } else {
-      // Online target (rare for admin)
-      if (newPrice !== oldPaidAmount) {
-        financialStatus = newPrice > oldPaidAmount ? 'PAY_DIFFERENCE' : 'REFUND_AT_CLINIC';
-        diffAmount = Math.abs(newPrice - oldPaidAmount);
-        adminNote = newPrice > oldPaidAmount 
-          ? `Pay ₹${(diffAmount/100).toFixed(0)} more online`
-          : `Refund ₹${(diffAmount/100).toFixed(0)}`;
-      }
-    }
+if (newPrice > oldPaidAmount) {
+  diffAmount = newPrice - oldPaidAmount;
+  
+  // If they already paid 500, they owe 400 more.
+  // If they hadn't paid anything (Offline), they now owe the full 900.
+  if (oldPaidAmount > 0) {
+    financialStatus = 'PAY_DIFFERENCE_OFFLINE';
+    adminNote = `Price increased. Already paid ₹${oldPaidAmount}. Collect ₹${diffAmount} MORE at clinic.`;
+  } else {
+    financialStatus = 'PAY_AT_CLINIC';
+    diffAmount = newPrice;
+    adminNote = `Offline booking moved. Collect total ₹${newPrice} at clinic.`;
+  }
 
-    console.log(`💰 Financial: ${financialStatus} | ${adminNote}`);
+} else if (newPrice < oldPaidAmount) {
+  diffAmount = oldPaidAmount - newPrice;
+  financialStatus = 'REFUND_AT_CLINIC';
+  adminNote = `Price decreased. Refund ₹${diffAmount} at clinic.`;
+
+} else {
+  financialStatus = 'NO_CHANGE';
+  adminNote = `Price remains same (₹${newPrice})`;
+}
+
+if (note) adminNote += ` | Note: ${note}`;
+console.log(`💰 Financial Update: ${financialStatus} | Total: ${newPrice} | Diff: ${diffAmount}`);
 
     // 6. TRANSACTION - Atomic Update
     const updated = await prisma.$transaction(async (tx) => {
