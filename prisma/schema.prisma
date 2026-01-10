@@ -26,6 +26,7 @@ model Plan {
   enableBulkSlots     Boolean        @default(true)
   enableExports       Boolean        @default(true)
   enableReviews       Boolean        @default(true)
+    enableGoogleCalendarSync Boolean @default(false)
   durationDays        Int?
   isTrial             Boolean        @default(false)
   trialDays           Int?
@@ -134,6 +135,10 @@ bankName               String?
   googleReviewsCache     Json?
   googleTotalReviews     Int?
   lastGoogleSync         DateTime?
+    googleCalendarId      String?  @map("google_calendar_id")
+  googleAccessToken     String?  @map("google_access_token")
+  googleRefreshToken    String?  @map("google_refresh_token")
+   googleTokenExpiry     DateTime?
   phone                  String           @default("0000000000")
   appointments           Appointment[]
   auditLogs              AuditLog[]
@@ -167,7 +172,11 @@ model Doctor {
   experience   Int
   clinicId     String
   isActive     Boolean  @default(true)
-  
+  googleCalendarId     String?  @default("primary")
+  googleRefreshToken   String?
+  googleAccessToken    String?
+  googleTokenExpiry    DateTime?
+  googleCalendarEmail  String?
   // ... rest of your fields (appointments, clinic, etc.) remain the same
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
@@ -225,6 +234,7 @@ model Appointment {
   diffAmount             Decimal?            // store positive difference
   // relations
   prescription        String?
+    googleCalendarEventId String?  @map("google_calendar_event_id")
   adminNote String?  @db.Text
   createdAt           DateTime             @default(now())
   updatedAt           DateTime             @updatedAt
@@ -243,7 +253,8 @@ model Appointment {
   cancellationRequest CancellationRequest?
   payment             Payment?
   review              Review?
-
+ googleCalendarUrl   String?  // "https://calendar.google.com/..."
+  googleCalendarIcs   String?  // ICS content for download
   @@map("appointments")
 }
 
@@ -300,8 +311,8 @@ model AppointmentLog {
   appointmentId String
   oldDate       DateTime
   oldTime       String
-  newDate       DateTime
-  newTime       String
+  newDate       DateTime?
+  newTime       String?
     metadata      Json?  
   reason        String?
   changedBy     String

@@ -204,14 +204,92 @@ export const createClinic = async (req, res) => {
 // -------------------------
 // GET ALL CLINICS (Active Only)
 // -------------------------
+// export const getClinics = async (req, res) => {
+//   try {
+//     const page = parseInt(req.query.page) || 1;
+//     const limit = parseInt(req.query.limit) || 10;
+//     const skip = (page - 1) * limit;
+//     const search = req.query.search || ''; // ✅ Get search query
+
+//     // ✅ Build search condition
+//     const searchCondition = search
+//       ? {
+//           OR: [
+//             { name: { contains: search, mode: 'insensitive' } },
+//             { city: { contains: search, mode: 'insensitive' } },
+//             { address: { contains: search, mode: 'insensitive' } },
+//             { phone: { contains: search, mode: 'insensitive' } },
+//             { slug: { contains: search, mode: 'insensitive' } },
+//           ],
+//         }
+//       : {};
+
+//     const whereCondition = {
+//       deletedAt: null,
+//       ...searchCondition, // ✅ Add search condition
+//     };
+
+//     // ✅ Get total count with search filter
+//     const total = await prisma.clinic.count({ where: whereCondition });
+
+//     const clinics = await prisma.clinic.findMany({
+//       where: whereCondition,
+//       include: {
+//         admins: {
+//           where: { deletedAt: null },
+//           select: {
+//             id: true,
+//             name: true,
+//             email: true,
+//             phone: true,
+//           },
+//         },
+//         doctors: {
+//           where: { isActive: true, deletedAt: null },
+//           select: {
+//             id: true,
+//             name: true,
+//             speciality: true,
+//             avatar: true,
+//           },
+//         },
+//         gateways: {
+//           select: {
+//             id: true,
+//             name: true,
+//             isActive: true,
+//           },
+//         },
+//       },
+//       skip: skip,
+//       take: limit,
+//       orderBy: { createdAt: 'desc' },
+//     });
+
+//     return res.json({
+//       data: clinics,
+//       pagination: {
+//         total,
+//         page,
+//         limit,
+//         totalPages: Math.ceil(total / limit),
+//         hasNextPage: page < Math.ceil(total / limit),
+//         hasPrevPage: page > 1,
+//       },
+//       search: search || null, // ✅ Return search term
+//     });
+//   } catch (error) {
+//     console.error('getClinics error:', error);
+//     return res.status(500).json({ error: error.message });
+//   }
+// };
 export const getClinics = async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 10;
     const skip = (page - 1) * limit;
-    const search = req.query.search || ''; // ✅ Get search query
+    const search = req.query.search || '';
 
-    // ✅ Build search condition
     const searchCondition = search
       ? {
           OR: [
@@ -226,48 +304,42 @@ export const getClinics = async (req, res) => {
 
     const whereCondition = {
       deletedAt: null,
-      ...searchCondition, // ✅ Add search condition
+      ...searchCondition,
     };
 
-    // ✅ Get total count with search filter
-    const total = await prisma.clinic.count({ where: whereCondition });
-
-    const clinics = await prisma.clinic.findMany({
-      where: whereCondition,
-      include: {
-        admins: {
-          where: { deletedAt: null },
-          select: {
-            id: true,
-            name: true,
-            email: true,
-            phone: true,
+    // 🔥 ONE ROUNDTRIP: list + totals + active/inactive
+    const [total, activeCount, inactiveCount, clinics] = await prisma.$transaction([
+      prisma.clinic.count({ where: whereCondition }),
+      prisma.clinic.count({ where: { ...whereCondition, isActive: true } }),
+      prisma.clinic.count({ where: { ...whereCondition, isActive: false } }),
+      prisma.clinic.findMany({
+        where: whereCondition,
+        include: {
+          admins: {
+            where: { deletedAt: null },
+            select: { id: true, name: true, email: true, phone: true },
+          },
+          doctors: {
+            where: { isActive: true, deletedAt: null },
+            select: { id: true, name: true, speciality: true, avatar: true },
+          },
+          gateways: {
+            select: { id: true, name: true, isActive: true },
           },
         },
-        doctors: {
-          where: { isActive: true, deletedAt: null },
-          select: {
-            id: true,
-            name: true,
-            speciality: true,
-            avatar: true,
-          },
-        },
-        gateways: {
-          select: {
-            id: true,
-            name: true,
-            isActive: true,
-          },
-        },
-      },
-      skip: skip,
-      take: limit,
-      orderBy: { createdAt: 'desc' },
-    });
+        skip,
+        take: limit,
+        orderBy: { createdAt: 'desc' },
+      }),
+    ]);
 
     return res.json({
       data: clinics,
+      counts: {
+        total,
+        active: activeCount,
+        inactive: inactiveCount,
+      },
       pagination: {
         total,
         page,
@@ -276,13 +348,14 @@ export const getClinics = async (req, res) => {
         hasNextPage: page < Math.ceil(total / limit),
         hasPrevPage: page > 1,
       },
-      search: search || null, // ✅ Return search term
+      search: search || null,
     });
   } catch (error) {
     console.error('getClinics error:', error);
     return res.status(500).json({ error: error.message });
   }
 };
+  
 
 // -------------------------
 // GET CLINIC BY ID
@@ -932,39 +1005,38 @@ export const getGlobalBookingsStats = async (req, res) => {
 
 export const getPlatformRevenue = async (req, res) => {
   try {
-    // 1. Initial Registrations
-    const registrations = await prisma.registrationPayment.findMany({
-      where: { status: "SUCCESS" },
-      include: { clinic: { select: { name: true } } }
-    });
+    // --- 1. EXTRACT PAGINATION PARAMS ---
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
 
-    // 2. Plan Switches / Upgrades (Found in Subscriptions)
-    // We look for subscriptions that have a Payment ID but are NOT the initial registration
-    const planSwitches = await prisma.subscription.findMany({
-      where: {
-        status: "ACTIVE",
-        razorpayPaymentId: { not: null },
-      },
-      include: { 
-        clinic: { select: { name: true } },
-        plan: { select: { name: true } }
-      }
-    });
-
-    // 3. Patient Appointment Payments
-    const appointmentPayments = await prisma.payment.findMany({
-      where: { status: "PAID" },
-      include: { clinic: { select: { name: true } } }
-    });
-
-    // --- CALCULATE TOTALS ---
-    const regTotal = registrations.reduce((sum, p) => sum + Number(p.amount || 0), 0);
+    // --- 2. FETCH DATA ---
+    // Note: To paginate combined results accurately, we fetch all relevant IDs 
+    // or use a more unified approach. For simplicity here, we'll fetch the records.
     
-    // For upgrades, we use priceAtPurchase from the subscription model
+    const [registrations, planSwitches] = await Promise.all([
+      prisma.registrationPayment.findMany({
+        where: { status: "SUCCESS" },
+        include: { clinic: { select: { name: true } } }
+      }),
+      prisma.subscription.findMany({
+        where: {
+          status: "ACTIVE",
+          razorpayPaymentId: { not: null },
+        },
+        include: { 
+          clinic: { select: { name: true } },
+          plan: { select: { name: true } }
+        }
+      })
+    ]);
+
+    // --- 3. CALCULATE TOTALS (Before Pagination) ---
+    const regTotal = registrations.reduce((sum, p) => sum + Number(p.amount || 0), 0);
     const upgradeTotal = planSwitches.reduce((sum, s) => sum + Number(s.priceAtPurchase || 0), 0);
 
-    // --- FORMAT TRANSACTIONS ---
-    const formattedTransactions = [
+    // --- 4. FORMAT & SORT ALL TRANSACTIONS ---
+    const allTransactions = [
       ...registrations.map(r => ({
         id: r.id,
         type: 'REGISTRATION',
@@ -978,19 +1050,31 @@ export const getPlatformRevenue = async (req, res) => {
         type: 'UPGRADE/SWITCH',
         clinic: s.clinic?.name || 'Unknown Clinic',
         amount: Number(s.priceAtPurchase || 0).toFixed(2),
-        date: s.updatedAt, // Use updatedAt to show when the switch happened
+        date: s.updatedAt,
         ref: s.razorpayPaymentId
       }))
     ].sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    // --- 5. APPLY PAGINATION SLICE ---
+    const totalTransactions = allTransactions.length;
+    const paginatedTransactions = allTransactions.slice(skip, skip + limit);
+    const totalPages = Math.ceil(totalTransactions / limit);
 
     res.json({
       summary: {
         totalRevenue: (regTotal + upgradeTotal).toFixed(2),
         registrationRevenue: regTotal.toFixed(2),
         upgradeRevenue: upgradeTotal.toFixed(2),
-        totalTransactions: formattedTransactions.length
+        totalTransactions
       },
-      transactions: formattedTransactions
+      pagination: {
+        currentPage: page,
+        totalPages,
+        pageSize: limit,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1
+      },
+      transactions: paginatedTransactions
     });
 
   } catch (error) {

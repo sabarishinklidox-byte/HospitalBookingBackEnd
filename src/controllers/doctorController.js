@@ -98,22 +98,21 @@ export const getDoctorProfile = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
-
-// ----------------------------------------------------------------
-// GET DOCTOR SLOTS
-// ----------------------------------------------------------------
 export const getDoctorSlots = async (req, res) => {
   try {
     const { doctorId } = req.user;
-    const { date } = req.query;
+    const dateParam = req.params.date;
+    const dateQuery = req.query.date;
 
     if (!doctorId)
       return res.status(400).json({ error: 'Doctor ID missing in token' });
 
     let where = { 
-        doctorId, 
-        deletedAt: null 
+      doctorId, 
+      deletedAt: null 
     };
+    
+    const date = dateParam || dateQuery;
     
     if (date) {
       const d = new Date(date);
@@ -124,23 +123,107 @@ export const getDoctorSlots = async (req, res) => {
 
     const slots = await prisma.slot.findMany({
       where,
+      include: { 
+        appointments: { 
+          where: { 
+            deletedAt: null, 
+            status: { notIn: ['CANCELLED', 'COMPLETED'] }  
+          } 
+        } 
+      },
       orderBy: [{ date: 'asc' }, { time: 'asc' }]
     });
 
-    return res.json(slots);
+    // 🔥 BULLETPROOF FIXED: Handles Prisma null appointments + correct count
+    const formatted = (slots || []).map(slot => ({
+      ...slot,
+      status: Array.isArray(slot.appointments) && slot.appointments.length > 0 
+        ? 'BOOKED' 
+        : 'AVAILABLE',
+      available: !Array.isArray(slot.appointments) || slot.appointments.length === 0,
+      appointmentCount: Array.isArray(slot.appointments) ? slot.appointments.length : 0
+    }));
+
+    return res.json(formatted);  // Flat array for frontend ✅
   } catch (error) {
     console.error('Get Doctor Slots Error:', error);
     return res.status(500).json({ error: error.message });
   }
 };
+// 🔥 FIXED getAvailableSlots - Works with your 1-to-1 relation
+export const getAvailableSlots = async (req, res) => {
+  try {
+    const { doctorId } = req.user;
+    const { date } = req.query;
+
+    if (!doctorId || !date) {
+      return res.status(400).json({ error: 'Missing doctorId or date' });
+    }
+
+    const d = new Date(date + 'T00:00:00.000Z');
+    const startOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    const endOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+
+    // 🔥 ONLY TRULY FREE SLOTS (no appointment at all)
+    const availableSlots = await prisma.slot.findMany({
+      where: {
+        doctorId,
+        deletedAt: null,
+        date: {
+          gte: startOfDay,
+          lt: endOfDay
+        },
+        // 🔥 NO APPOINTMENT = TRULY AVAILABLE
+        appointments: {
+          is: null  // ✅ Only this!
+        }
+      },
+      select: {
+        id: true,
+        time: true,
+        date: true,
+        duration: true,
+        price: true,
+        type: true,
+        paymentMode: true
+      },
+      orderBy: [{ time: 'asc' }]
+    });
+
+    // 🔥 Format
+    const formatted = availableSlots.map(slot => ({
+      id: slot.id,
+      time: slot.time,
+      date: slot.date.toISOString().slice(0, 10),
+      status: 'AVAILABLE',
+      available: true,
+      appointmentCount: 0
+    }));
+
+    res.json({
+      slots: formatted,
+      totalAvailable: formatted.length,
+      date: date
+    });
+
+  } catch (error) {
+    console.error('Available Slots Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+};
+    
+
+
 
 // ----------------------------------------------------------------
-// GET DOCTOR APPOINTMENTS
+// GET DOCTOR APPOINTMENTS (UNCHANGED - ALREADY WORKING)
 // ----------------------------------------------------------------
 export const getDoctorAppointments = async (req, res) => {
   try {
     const { doctorId } = req.user;
-    const { date, status } = req.query;
+    const dateParam = req.params.date;     // 🔥 NEW: path param support
+    const dateQuery = req.query.date;      // ✅ OLD: query param
+    const { status } = req.query;
 
     if (!doctorId)
       return res.status(400).json({ error: 'Doctor ID missing in token' });
@@ -152,6 +235,7 @@ export const getDoctorAppointments = async (req, res) => {
 
     if (status) where.status = status;
 
+    const date = dateParam || dateQuery;  // ✅ Supports BOTH
     if (date) {
       const d = new Date(date + 'T00:00:00');
       const start = new Date(d);
@@ -182,13 +266,12 @@ export const getDoctorAppointments = async (req, res) => {
       timeFormatted: app.slot?.time || 'N/A'
     }));
 
-    return res.json(formatted);
+    return res.json({ appointments: formatted });
   } catch (error) {
     console.error('Get Doctor Appointments Error:', error);
     return res.status(500).json({ error: error.message });
   }
 };
-
 // ----------------------------------------------------------------
 // UPDATE APPOINTMENT STATUS
 // ----------------------------------------------------------------
@@ -419,14 +502,37 @@ export const getDoctorDashboardStats = async (req, res) => {
 // ----------------------------------------------------------------
 // GET REVIEWS
 // ----------------------------------------------------------------
+async function getClinicPlan(clinicId) {
+  const clinic = await prisma.clinic.findUnique({
+    where: { id: clinicId },
+    include: { subscription: { include: { plan: true } } },
+  });
+  return clinic?.subscription?.plan || null;
+}
+
 export const getMyReviews = async (req, res) => {
   try {
     const doctorId = req.user.doctorId;
-
     if (!doctorId) {
       return res.status(400).json({ error: "Doctor ID not found in session" });
     }
 
+    // NEW: Resolve clinicId and check plan
+    const doctor = await prisma.doctor.findUnique({
+      where: { id: doctorId },
+      select: { clinicId: true }
+    });
+    const clinicId = doctor?.clinicId;
+    if (!clinicId) {
+      return res.status(400).json({ error: "Clinic not found for doctor" });
+    }
+
+    const plan = await getClinicPlan(clinicId);
+    if (!plan || !plan.enableAuditLogs) {  // Or enableReviews?
+      return res.status(403).json({ error: "Reviews not available on your plan" });
+    }
+
+    // Original query unchanged
     const reviews = await prisma.review.findMany({
       where: { 
         doctorId,

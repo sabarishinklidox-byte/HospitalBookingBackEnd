@@ -273,7 +273,68 @@ export const updateSlot = async (req, res) => {
         error: 'Updated time overlaps an existing slot for this doctor.',
       });
     }
+const paymentHolds = await prisma.appointment.findFirst({
+  where: {
+    slotId: id,  // 🔥 THIS slot
+    status: 'PENDING_PAYMENT',
+    paymentExpiry: { gte: new Date() }  // Still active
+  },
+  include: {
+    user: { 
+      select: { name: true, phone: true } 
+    }
+  }
+});
 
+if (paymentHolds) {
+  console.log('⏳ PAYMENT HOLD DETECTED:', {
+    user: paymentHolds.user.name,
+    expires: paymentHolds.paymentExpiry
+  });
+  
+  return res.status(409).json({
+    success: false,
+    error: 'Payment in progress',
+    message: `User "${paymentHolds.user.name}" (${paymentHolds.user.phone?.slice(-4) || 'xxxx'}) is paying now. Hold expires: ${paymentHolds.paymentExpiry.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}. Edit after?`,
+    holdDetails: {
+      userName: paymentHolds.user.name,
+      phone: paymentHolds.user.phone,
+      expires: paymentHolds.paymentExpiry.toISOString()
+    },
+    canRetry: true,
+    slotTime: `${existing.date.toISOString().split('T')[0]} ${existing.time}`
+  });
+}
+const confirmedBooking = await prisma.appointment.findFirst({
+  where: {
+    slotId: id,  // THIS slot
+    status: { in: ['CONFIRMED', 'COMPLETED'] },  // Already booked/completed
+    deletedAt: null
+  },
+  include: {
+    user: { select: { name: true, phone: true } }
+  }
+});
+
+if (confirmedBooking) {
+  console.log('🔒 CONFIRMED BOOKING DETECTED:', {
+    user: confirmedBooking.user.name,
+    status: confirmedBooking.status
+  });
+  
+  return res.status(409).json({
+    success: false,
+    error: 'Slot booked',
+    message: `Slot is booked by "${confirmedBooking.user.name}" (${confirmedBooking.user.phone?.slice(-4) || 'xxxx'}). Status: ${confirmedBooking.status}. Cannot edit.`,
+    holdDetails: {
+      userName: confirmedBooking.user.name,
+      phone: confirmedBooking.user.phone,
+      status: confirmedBooking.status
+    },
+    canRetry: false,  // No retry - permanently booked
+    slotTime: `${existing.date.toISOString().split('T')[0]} ${existing.time}`
+  });
+}
     const updated = await prisma.slot.update({
       where: { id },
       data: {
@@ -618,174 +679,174 @@ export const getDoctorSlotsForReschedule = async (req, res, next) => {
 
 
 
-export const getDoctorSlotsWindow = async (req, res) => {
-  try {
-    const clinicId = req.user?.clinicId;
-    const { doctorId } = req.params;
-    const { from, days = 30, excludeAppointmentId } = req.query;
+  export const getDoctorSlotsWindow = async (req, res) => {
+    try {
+      const clinicId = req.user?.clinicId;
+      const { doctorId } = req.params;
+      const { from, days = 30, excludeAppointmentId } = req.query;
 
-    if (!clinicId) return res.status(401).json({ error: "Unauthorized" });
-    if (!doctorId) return res.status(400).json({ error: "Doctor ID is required" });
+      if (!clinicId) return res.status(401).json({ error: "Unauthorized" });
+      if (!doctorId) return res.status(400).json({ error: "Doctor ID is required" });
 
-    const daysNum = Number(days);
-    if (!Number.isFinite(daysNum) || daysNum <= 0 || daysNum > 365) {
-      return res.status(400).json({ error: "days must be 1-365" });
-    }
+      const daysNum = Number(days);
+      if (!Number.isFinite(daysNum) || daysNum <= 0 || daysNum > 365) {
+        return res.status(400).json({ error: "days must be 1-365" });
+      }
 
-    // 🔥 Base date: construct from YYYY-MM-DD at UTC midnight
-    const baseDateStr = from || new Date().toISOString().slice(0, 10);
-    const [y, m, d] = baseDateStr.split("-").map(Number);
-    if (!y || !m || !d) {
-      return res.status(400).json({ error: "Invalid from date" });
-    }
+      // 🔥 Base date: construct from YYYY-MM-DD at UTC midnight
+      const baseDateStr = from || new Date().toISOString().slice(0, 10);
+      const [y, m, d] = baseDateStr.split("-").map(Number);
+      if (!y || !m || !d) {
+        return res.status(400).json({ error: "Invalid from date" });
+      }
 
-    const start = new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
-    const endExclusive = new Date(start);
-    endExclusive.setDate(endExclusive.getDate() + daysNum);
+      const start = new Date(Date.UTC(y, m - 1, d, 0, 0, 0, 0));
+      const endExclusive = new Date(start);
+      endExclusive.setDate(endExclusive.getDate() + daysNum);
 
-    // "Today" and "Tomorrow" relative to window start
-    const todayStr = start.toISOString().slice(0, 10);
-    const tomorrowDate = new Date(start);
-    tomorrowDate.setDate(tomorrowDate.getDate() + 1);
-    const tomorrowStr = tomorrowDate.toISOString().slice(0, 10);
+      // "Today" and "Tomorrow" relative to window start
+      const todayStr = start.toISOString().slice(0, 10);
+      const tomorrowDate = new Date(start);
+      tomorrowDate.setDate(tomorrowDate.getDate() + 1);
+      const tomorrowStr = tomorrowDate.toISOString().slice(0, 10);
 
-    const slots = await prisma.slot.findMany({
-      where: {
-        clinicId,
-        doctorId,
-        deletedAt: null,
-        isBlocked: false,
-        kind: "APPOINTMENT",
-        date: { gte: start, lt: endExclusive },
-      },
-      orderBy: [{ date: "asc" }, { time: "asc" }],
-      include: {
-        appointments: {
-          where: {
-            deletedAt: null,
-            status: { in: ["PENDING", "CONFIRMED", "COMPLETED"] },
-            ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {}),
-          },
-          select: { id: true },
+      const slots = await prisma.slot.findMany({
+        where: {
+          clinicId,
+          doctorId,
+          deletedAt: null,
+          isBlocked: false,
+          kind: "APPOINTMENT",
+          date: { gte: start, lt: endExclusive },
         },
-      },
-    });
-
-    const isSlotPassedIst = (slotDateStr, slotTimeStr) => {
-      if (!slotDateStr || !slotTimeStr) return false;
-
-      const now = new Date();
-      const nowStr = now.toISOString().split("T")[0];
-
-      if (slotDateStr < nowStr) return true;
-      if (slotDateStr > nowStr) return false;
-
-      const [hours, minutes] = slotTimeStr.split(":").map(Number);
-      const currentHours = now.getHours();
-      const currentMinutes = now.getMinutes();
-
-      if (hours < currentHours) return true;
-      if (hours === currentHours && minutes <= currentMinutes) return true;
-      return false;
-    };
-
-    const byDate = {};
-
-    for (const s of slots) {
-      const slotDateStr = s.date.toISOString().split("T")[0];
-
-      if (isSlotPassedIst(slotDateStr, s.time)) continue;
-
-      if (!byDate[slotDateStr]) {
-        let label;
-        if (slotDateStr === todayStr) label = "Today";
-        else if (slotDateStr === tomorrowStr) label = "Tomorrow";
-        else {
-          label = s.date.toLocaleDateString("en-GB", {
-            weekday: "short",
-            day: "2-digit",
-            month: "short",
-          });
-        }
-        byDate[slotDateStr] = { date: slotDateStr, label, slots: [] };
-      }
-
-      const hour = parseInt(String(s.time).split(":")[0], 10);
-      const period = hour < 12 ? "Morning" : hour < 17 ? "Afternoon" : "Evening";
-
-      const [, mm] = String(s.time).split(":");
-      const hour12 = ((hour + 11) % 12) + 1;
-      const ampm = hour < 12 ? "AM" : "PM";
-      const timeLabel = `${String(hour12).padStart(2, "0")}:${mm} ${ampm}`;
-
-      let endTime = s.endTime || null;
-      if (!endTime && s.duration) {
-        const t = new Date(`2000-01-01T${String(s.time)}:00`);
-        t.setMinutes(t.getMinutes() + Number(s.duration));
-        const eh = String(t.getHours()).padStart(2, "0");
-        const em = String(t.getMinutes()).padStart(2, "0");
-        endTime = `${eh}:${em}`;
-      }
-
-      // 🔥 NEW: Slot Type & Price Display
-      const slotType = s.paymentMode === "FREE" 
-        ? "FREE" 
-        : s.paymentMode === "ONLINE" 
-        ? "Online Pay" 
-        : "Pay at Clinic";
-      
-      const priceDisplay = s.paymentMode === "FREE" 
-        ? "FREE" 
-        : `₹${Number(s.price || 0).toLocaleString()}`;
-
-      byDate[slotDateStr].slots.push({
-        slotId: s.id,
-        isBlocked: false,
-        isPassed: false,
-        period,
-        timeLabel,
-        startTime: s.time,
-        endTime,
-        isBooked: (s.appointments?.length || 0) > 0,
-        // 🔥 ADDED: Slot Type & Price
-        slotType,
-        price: Number(s.price || 0),
-        priceDisplay,
+        orderBy: [{ date: "asc" }, { time: "asc" }],
+        include: {
+          appointments: {
+            where: {
+              deletedAt: null,
+              status: { in: ["PENDING", "CONFIRMED", "COMPLETED"] },
+              ...(excludeAppointmentId ? { NOT: { id: excludeAppointmentId } } : {}),
+            },
+            select: { id: true },
+          },
+        },
       });
-    }
 
-    const daysArray = [];
-    for (let i = 0; i < daysNum; i++) {
-      const dDate = new Date(start);
-      dDate.setDate(dDate.getDate() + i);
-      const dateStr = dDate.toISOString().slice(0, 10);
+      const isSlotPassedIst = (slotDateStr, slotTimeStr) => {
+        if (!slotDateStr || !slotTimeStr) return false;
 
-      if (byDate[dateStr]) {
-        const entry = byDate[dateStr];
-        if (dateStr === todayStr) entry.label = "Today";
-        else if (dateStr === tomorrowStr) entry.label = "Tomorrow";
-        daysArray.push(entry);
-      } else {
-        let label;
-        if (dateStr === todayStr) label = "Today";
-        else if (dateStr === tomorrowStr) label = "Tomorrow";
-        else {
-          label = dDate.toLocaleDateString("en-GB", {
-            weekday: "short",
-            day: "2-digit",
-            month: "short",
-          });
+        const now = new Date();
+        const nowStr = now.toISOString().split("T")[0];
+
+        if (slotDateStr < nowStr) return true;
+        if (slotDateStr > nowStr) return false;
+
+        const [hours, minutes] = slotTimeStr.split(":").map(Number);
+        const currentHours = now.getHours();
+        const currentMinutes = now.getMinutes();
+
+        if (hours < currentHours) return true;
+        if (hours === currentHours && minutes <= currentMinutes) return true;
+        return false;
+      };
+
+      const byDate = {};
+
+      for (const s of slots) {
+        const slotDateStr = s.date.toISOString().split("T")[0];
+
+        if (isSlotPassedIst(slotDateStr, s.time)) continue;
+
+        if (!byDate[slotDateStr]) {
+          let label;
+          if (slotDateStr === todayStr) label = "Today";
+          else if (slotDateStr === tomorrowStr) label = "Tomorrow";
+          else {
+            label = s.date.toLocaleDateString("en-GB", {
+              weekday: "short",
+              day: "2-digit",
+              month: "short",
+            });
+          }
+          byDate[slotDateStr] = { date: slotDateStr, label, slots: [] };
         }
-        daysArray.push({ date: dateStr, label, slots: [] });
-      }
-    }
 
-    return res.json(daysArray);
-  } catch (err) {
-    console.error("getDoctorSlotsWindow error", err);
-    return res.status(500).json({ error: "Failed to load slots" });
-  }
-};
+        const hour = parseInt(String(s.time).split(":")[0], 10);
+        const period = hour < 12 ? "Morning" : hour < 17 ? "Afternoon" : "Evening";
+
+        const [, mm] = String(s.time).split(":");
+        const hour12 = ((hour + 11) % 12) + 1;
+        const ampm = hour < 12 ? "AM" : "PM";
+        const timeLabel = `${String(hour12).padStart(2, "0")}:${mm} ${ampm}`;
+
+        let endTime = s.endTime || null;
+        if (!endTime && s.duration) {
+          const t = new Date(`2000-01-01T${String(s.time)}:00`);
+          t.setMinutes(t.getMinutes() + Number(s.duration));
+          const eh = String(t.getHours()).padStart(2, "0");
+          const em = String(t.getMinutes()).padStart(2, "0");
+          endTime = `${eh}:${em}`;
+        }
+
+        // 🔥 NEW: Slot Type & Price Display
+        const slotType = s.paymentMode === "FREE" 
+          ? "FREE" 
+          : s.paymentMode === "ONLINE" 
+          ? "Online Pay" 
+          : "Pay at Clinic";
+        
+        const priceDisplay = s.paymentMode === "FREE" 
+          ? "FREE" 
+          : `₹${Number(s.price || 0).toLocaleString()}`;
+
+        byDate[slotDateStr].slots.push({
+          slotId: s.id,
+          isBlocked: false,
+          isPassed: false,
+          period,
+          timeLabel,
+          startTime: s.time,
+          endTime,
+          isBooked: (s.appointments?.length || 0) > 0,
+          // 🔥 ADDED: Slot Type & Price
+          slotType,
+          price: Number(s.price || 0),
+          priceDisplay,
+        });
+      }
+
+      const daysArray = [];
+      for (let i = 0; i < daysNum; i++) {
+        const dDate = new Date(start);
+        dDate.setDate(dDate.getDate() + i);
+        const dateStr = dDate.toISOString().slice(0, 10);
+
+        if (byDate[dateStr]) {
+          const entry = byDate[dateStr];
+          if (dateStr === todayStr) entry.label = "Today";
+          else if (dateStr === tomorrowStr) entry.label = "Tomorrow";
+          daysArray.push(entry);
+        } else {
+          let label;
+          if (dateStr === todayStr) label = "Today";
+          else if (dateStr === tomorrowStr) label = "Tomorrow";
+          else {
+            label = dDate.toLocaleDateString("en-GB", {
+              weekday: "short",
+              day: "2-digit",
+              month: "short",
+            });
+          }
+          daysArray.push({ date: dateStr, label, slots: [] });
+        }
+      }
+
+      return res.json(daysArray);
+    } catch (err) {
+      console.error("getDoctorSlotsWindow error", err);
+      return res.status(500).json({ error: "Failed to load slots" });
+    }
+  };
 
 
 

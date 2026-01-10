@@ -75,6 +75,10 @@ export const getAdminProfile = async (req, res) => {
         bankName: true,
         accountNumber: true,
         ifscCode: true,
+         googleCalendarId: true,
+        googleAccessToken: true,
+        googleRefreshToken: true,
+        googleTokenExpiry: true,
         deletedAt: true,
       },
     });

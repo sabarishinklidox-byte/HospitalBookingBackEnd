@@ -11,7 +11,7 @@ export const getClinics = async (req, res) => {
 
     const q = typeof qRaw === 'string' ? qRaw.trim() : '';
     const city = typeof cityRaw === 'string' ? cityRaw.trim() : '';
-
+console.log('🔍 getClinics params:', { q, city });
     const clinics = await prisma.clinic.findMany({
       where: {
         isActive: true,
@@ -315,22 +315,14 @@ export const getDoctors = async (req, res) => {
   }
 };
 function isSlotPassedIst(dateStr, timeStr) {
-  // Treat date+time as IST wall-clock and compare with current IST time
-  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-
-  // Current time in IST (as timestamp)
-  const nowUtc = Date.now();
-  const nowIst = nowUtc + IST_OFFSET_MS;
-
-  // Slot time in IST (as timestamp)
-  // 1) Build ISO without offset -> JS treats as local, so strip local offset:
-  const slotLocal = new Date(`${dateStr}T${timeStr}:00`).getTime();
-  // 2) Convert that local timestamp to IST-equivalent by *adding* or *subtracting*
-  //    your server offset. If your server is running in UTC, do NOT adjust it.
-  //    Assuming server is UTC:
-  const slotIst = slotLocal + IST_OFFSET_MS;
-
-  return slotIst < nowIst;
+  // Slot as explicit IST timestamp
+  const slotIst = new Date(`${dateStr}T${timeStr}:00+05:30`);
+  
+  // Current IST timestamp (Coimbatore/IST)
+  const nowIstStr = new Date().toLocaleString("en-US", { timeZone: 'Asia/Kolkata' });
+  const nowIst = new Date(nowIstStr);
+  
+  return slotIst.getTime() < nowIst.getTime();
 }
 
 export const getSlotsForUser = async (req, res, next) => {
@@ -364,7 +356,7 @@ export const getSlotsForUser = async (req, res, next) => {
           },
           select: { 
             id: true,
-            userId: true,      // 🔥 For isMyHold detection
+            userId: true,
             status: true,
             paymentStatus: true
           },
@@ -379,18 +371,15 @@ export const getSlotsForUser = async (req, res, next) => {
 
     return res.json({
       data: slots.map((s) => {
-        const isPassed = isSlotPassedIst(date, s.time);
+        const isPassed = isSlotPassedIst(date, s.time);  // ✅ FIXED
         const appointments = Array.isArray(s.appointments) ? s.appointments : [];
         
-        // 🔥 1. Check existing appointments
         const hasActiveAppointment = appointments.some(apt => 
           apt.status !== 'CANCELLED'
         );
         
-        // 🔥 2. Check blocked slots (payment holds)
         const isActiveHold = s.isBlocked && new Date(s.createdAt) >= tenMinutesAgo;
         
-        // 🔥 3. Is this MY hold?
         const isMyHold = isActiveHold && appointments.some(apt => 
           apt.userId === currentUserId && apt.status === 'PENDING_PAYMENT'
         );
@@ -404,11 +393,10 @@ export const getSlotsForUser = async (req, res, next) => {
           paymentMode: s.paymentMode,
           kind: s.kind,
           price: s.price,
-          // 🔥 PERFECT FLAGS:
           isBlocked: s.isBlocked,
           isBooked: isBooked,
           isMyHold: isMyHold,
-          isPassed: isPassed,
+          isPassed: isPassed,  // ✅ NOW CORRECT
         };
       }),
     });

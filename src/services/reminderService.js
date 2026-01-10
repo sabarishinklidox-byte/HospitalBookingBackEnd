@@ -35,7 +35,7 @@ const getHtmlTemplate = (userName, doctorName, dateStr, timeStr, type) => {
             </div>
         </div>
         <div style="background-color: #eee; padding: 15px; text-align: center; font-size: 12px; color: #999;">
-            <p>DocBook Clinic System &copy; ${new Date().getFullYear()}</p>
+            <p>DocBook inklidox Bookings System &copy; ${new Date().getFullYear()}</p>
         </div>
     </div>
     `;
@@ -50,14 +50,28 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-const sendEmail = async (to, subject, htmlContent) => {
+export const sendEmail = async (to, subject, htmlContent) => {
   try {
     console.log(`📨 Sending email to: ${to}`);
     await transporter.sendMail({
-      from: `"DocBook Clinic" <${process.env.EMAIL_USER}>`,
+      from: `"INKLIDOX BOOKINGS" <${process.env.EMAIL_USER}>`,
       to,
       subject,
       html: htmlContent, // <--- Using HTML now
+    });
+    console.log(`✅ Email sent successfully to: ${to}`);
+  } catch (err) {
+    console.error(`❌ Failed to send email to ${to}:`, err.message);
+  }
+};
+export const sendEmail1 = async ({ to, subject, html }) => {
+  try {
+    console.log(`📨 Sending email to: ${to}`);
+    await transporter.sendMail({
+      from: `"INKLIDOX BOOKINGS" <${process.env.EMAIL_USER}>`,
+      to,
+      subject,
+      html,
     });
     console.log(`✅ Email sent successfully to: ${to}`);
   } catch (err) {

@@ -39,7 +39,10 @@ import {
   exportAppointmentsExcel,
   exportAppointmentsPdf,
   rescheduleAppointmentByAdmin,
-  processCancellationRequest
+  processCancellationRequest,
+   googleCalendarSync,
+  // deleteGoogleCalendarEvent,
+  // googleCalendarResync
 } from '../controllers/adminAppointmentController.js';
 
 import { refreshClinicGoogleRating } from '../controllers/clinicController.js';
@@ -303,7 +306,29 @@ router.post(
   requireActiveSubscription, // 🔒 BLOCKED
   refreshClinicGoogleRating
 );
+router.post(
+  '/appointments/:id/google-calendar-sync', 
+  authMiddleware, 
+  requireAdmin, 
+  requireActiveSubscription,  // 🔒 Pro only
+  googleCalendarSync
+);
 
+// router.delete(
+//   '/appointments/:id/google-calendar-event', 
+//   authMiddleware, 
+//   requireAdmin, 
+//   requireActiveSubscription,  // 🔒 Pro only
+//   deleteGoogleCalendarEvent
+// );
+
+// router.patch(
+//   '/appointments/:id/google-calendar-resync', 
+//   authMiddleware, 
+//   requireAdmin, 
+//   requireActiveSubscription,  // 🔒 Pro only
+//   googleCalendarResync
+// );
 // ---------------- Notifications (OPEN) ----------------
 router.get('/notifications', authMiddleware, requireAdmin, getNotifications);
 router.get('/notifications/unread-count', authMiddleware, requireAdmin, getUnreadCount);

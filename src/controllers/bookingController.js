@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import { sendBookingEmails } from '../utils/email.js'
 import { logAudit } from '../utils/audit.js';
+import { google } from 'googleapis';
 // ----------------------------------------------------------------
 // Helper: load plan for a clinic
 // ----------------------------------------------------------------
@@ -481,6 +482,7 @@ export const createBooking = async (req, res) => {
       req,
     });
 
+
     // NON-BLOCKING EMAILS (unchanged)
     if (!isOnline && createNew) {
       getUserById(authUserId).then(user => {
@@ -493,6 +495,7 @@ export const createBooking = async (req, res) => {
         }).catch(err => console.error('Pending booking emails failed:', err));
       }).catch(() => {});
     }
+    
 
     console.log('✅ Booking decision:', {
       slotId,
@@ -545,6 +548,102 @@ export const createBooking = async (req, res) => {
       error: error.message || 'Booking system temporarily unavailable.',
     });
   }
+};
+export const autoSyncAppointmentToGCal = async (appointmentId) => {
+  try {
+    const appt = await prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      include: { 
+        clinic: true,
+        slot: { include: { doctor: true } },
+        user: true
+      }
+    });
+
+    if (!appt || appt.status !== "CONFIRMED") return;
+
+    // 1) Clinic subscribed? → BOTH calendars (priority: doctor first)
+    const plan = await getClinicPlan(appt.clinicId);
+    const doBoth = plan?.enableGoogleCalendarSync;
+
+    const doctor = appt.slot.doctor;
+    const clinic = appt.clinic;
+
+    // 2) Doctor calendar (if connected)
+    if (doctor?.googleRefreshToken) {
+      await syncToCalendar({
+        refreshToken: doctor.googleRefreshToken,
+        calendarId: doctor.googleCalendarId || "primary",
+        appt,
+        source: "doctor"
+      });
+    }
+
+    // 3) Clinic calendar (if connected AND clinic subscribed)
+    if (clinic?.googleRefreshToken && doBoth) {
+      await syncToCalendar({
+        refreshToken: clinic.googleRefreshToken,
+        calendarId: clinic.googleCalendarId || "primary",
+        appt,
+        source: "clinic"
+      });
+    }
+
+  } catch (error) {
+    console.error("🚨 GCal Sync Error:", error.response?.data || error.message);
+  }
+};
+
+// Helper function (reusable)
+const syncToCalendar = async ({ refreshToken, calendarId, appt, source }) => {
+  const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET
+  );
+  oauth2Client.setCredentials({ refresh_token: refreshToken });
+
+ const calendar = google.calendar({ version: "v3", auth: oauth2Client });
+
+const dateStr = new Date(appt.slot.date).toLocaleDateString('sv').split('-').reverse().join('-');
+console.log('🕒 SLOT DEBUG:', {
+  date: appt.slot.date, time: appt.slot.time, 
+  timeType: typeof appt.slot.time, slotId: appt.slotId
+});
+
+const slotDate = new Date(appt.slot.date);
+const [hours, minutes] = (appt.slot.time || '10:00').split(':').map(Number);
+
+if (isNaN(hours) || isNaN(minutes)) {
+  console.error('🕒 INVALID:', appt.slot);
+  return;
+}
+
+// ✅ UTC + Kolkata TZ = Perfect GCal
+const startDateTime = new Date(Date.UTC(
+  slotDate.getFullYear(), slotDate.getMonth(), slotDate.getDate(), 
+  hours, minutes, 0
+));
+const endDateTime = new Date(startDateTime.getTime() + 30 * 60 * 1000);
+
+  const eventBody = {
+    summary: `🏥 ${appt.user?.name || "Patient"} - ${appt.slot.doctor?.name || "Doctor"}`,
+    description: `Patient: ${appt.user?.name || "N/A"}\nPhone: ${appt.user?.phone || "N/A"}\nAppt ID: ${appt.id}`,
+    start: { dateTime: startDateTime.toISOString(), timeZone: "Asia/Kolkata" },
+    end: { dateTime: endDateTime.toISOString(), timeZone: "Asia/Kolkata" },
+    attendees: appt.user?.email ? [{ email: appt.user.email }] : [],
+  };
+
+  const response = await calendar.events.insert({
+    calendarId,
+    sendUpdates: "all",
+    requestBody: eventBody,
+  });
+    await prisma.appointment.update({
+    where: { id: appt.id },
+    data: { googleCalendarEventId: response.data.id }
+  });
+
+  console.log(`✅ GCal ${source}: ${response.data.htmlLink}`);
 };
 
 
@@ -805,7 +904,30 @@ console.log("-----------------------------------------------");
 
       return updatedAppt;
     });
-
+// if (result.status === "CONFIRMED") {
+//   const plan = await getClinicPlan(result.clinicId);
+//   if (plan?.enableGoogleCalendarSync) {
+//     // Non-blocking - don't delay payment response
+//     autoSyncAppointmentToGCal(result.id).catch(err => {
+//       console.error("❌ GCal sync failed:", err.message);
+//     });
+//   }
+// }
+if (result.status === "CONFIRMED") {
+  const plan = await getClinicPlan(result.clinicId);
+  if (plan?.enableGoogleCalendarSync) {
+    // Smart sync: Update if exists, create if new
+    if (result.googleCalendarEventId) {
+      autoSyncAppointmentToGCal(result.id).catch(err => {
+        console.error("❌ GCal update failed:", err.message);
+      });
+    } else {
+      autoSyncAppointmentToGCal(result.id).catch(err => {
+        console.error("❌ GCal create failed:", err.message);
+      });
+    }
+  }
+}
     // 5. Send Email
     sendBookingEmails({
       type: notes?.type === 'RESCHEDULE' ? "RESCHEDULE_CONFIRMED" : "CONFIRMED",

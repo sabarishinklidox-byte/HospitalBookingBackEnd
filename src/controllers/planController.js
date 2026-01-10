@@ -40,6 +40,7 @@ export const listPlans = async (req, res) => {
         enableExports: true,
         enableAuditLogs: true,
         enableGoogleReviews: true,
+        enableGoogleCalendarSync: true,  // ✅ NEW Premium feature
         isTrial: true,
         durationDays: true,
         trialDays: true,
@@ -61,9 +62,9 @@ export const listPlans = async (req, res) => {
       success: true,
       plans,
       planTiers: [
-        { name: 'Basic', allowOnlinePayments: false, maxDoctors: 1 },
-        { name: 'Pro', allowOnlinePayments: true, maxDoctors: 5 },
-        { name: 'Enterprise', allowOnlinePayments: true, maxDoctors: 50 }
+        { name: 'Basic', allowOnlinePayments: false, maxDoctors: 1, enableGoogleCalendarSync: false },
+        { name: 'Pro', allowOnlinePayments: true, maxDoctors: 5, enableGoogleCalendarSync: true },   // ✅ Pro gets Calendar
+        { name: 'Enterprise', allowOnlinePayments: true, maxDoctors: 50, enableGoogleCalendarSync: true }
       ]
     });
   } catch (err) {
@@ -94,6 +95,7 @@ export const createPlan = async (req, res) => {
       enableGoogleReviews = false,
       isActive = true,
       isTrial = false,
+       enableGoogleCalendarSync = false,
       durationDays,
       trialDays,
     } = req.body;
@@ -173,7 +175,7 @@ export const createPlan = async (req, res) => {
         isTrial,
         durationDays: durationDays ?? null,
         trialDays: trialDays ?? null,
-        
+           enableGoogleCalendarSync,
         // 🔥 Save the generated ID
         razorpayPlanId: razorpayPlanId || null, 
       },
@@ -233,6 +235,7 @@ export const updatePlan = async (req, res) => {
       durationDays,
       isTrial,
       trialDays,
+        enableGoogleCalendarSync,
     } = req.body;
 
     // Safe updates (always allowed)
@@ -247,6 +250,7 @@ export const updatePlan = async (req, res) => {
       enableAuditLogs: enableAuditLogs !== undefined ? enableAuditLogs : existing.enableAuditLogs,
       enableGoogleReviews: enableGoogleReviews !== undefined ? enableGoogleReviews : existing.enableGoogleReviews,
       isActive: isActive !== undefined ? isActive : existing.isActive,
+         enableGoogleCalendarSync: enableGoogleCalendarSync !== undefined ? enableGoogleCalendarSync : existing.enableGoogleCalendarSync,
     };
 
     // Pricing/limits - only if NO active subscriptions

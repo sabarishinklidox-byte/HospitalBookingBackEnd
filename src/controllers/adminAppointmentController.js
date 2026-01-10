@@ -27,11 +27,15 @@ import prisma from "../prisma.js";
 import { logAudit } from "../utils/audit.js";
 import ExcelJS from "exceljs";
 import PDFDocument from "pdfkit";
+import { createGoogleCalendarEvent } from '../utils/googleCalendar.js'; 
+// adminAppointmentController.js - LINE 1 (add)
+import { autoSyncAppointmentToGCal,deleteAppointmentFromGCal,  updateAppointmentOnGCal, } from '../utils/googleCalendar.js';  // 🔥 MISSING
+
+
 import { sendBookingEmails,sendAppointmentStatusEmail, 
   sendCancellationEmail 
     } from '../utils/email.js';
     import Razorpay from "razorpay";
-
 // ----------------------------------------------------------------
 // GET APPOINTMENTS (List)
 // ----------------------------------------------------------------
@@ -376,7 +380,19 @@ export const updateAppointmentStatus = async (req, res) => {
 
       return appt;
     });
-
+try {
+  if (status === "CONFIRMED") {
+    await autoSyncAppointmentToGCal(id);  // create/update ✅
+  } else if (status === "COMPLETED") {
+    await updateAppointmentOnGCal(id);    // ✅ COMPLETED + transparent ✅
+  } else if (status === "NO_SHOW") {
+    await deleteAppointmentFromGCal(id);  // remove ✅
+  } else if (status === "CANCELLED" || status === "REJECTED") {
+    await deleteAppointmentFromGCal(id);  // DELETE better than update [web:203]
+  }
+} catch (e) {
+  console.error("❌ GCal admin-status sync failed:", e.message);
+}
     // 🔥 SEND EMAIL FOR CONFIRMED/REJECTED/CANCELLED
     if (["CONFIRMED", "REJECTED", "CANCELLED"].includes(status)) {
       await sendAppointmentStatusEmail(existing, status, reason, req.user);
@@ -503,6 +519,42 @@ console.log('✅ Found existing slot:', newSlot.id, 'Price:', newSlot.price);
     if (anyApptOnSlot) {
       return res.status(409).json({ error: 'Slot already booked by another patient' });
     }
+// 🔥 NEW: Check active payment holds FIRST! (COPY FROM blockSlot)
+const paymentHolds = await prisma.appointment.findFirst({
+  where: {
+    slotId: newSlot.id,  // 🔥 CHECK NEW SLOT
+    status: 'PENDING_PAYMENT',
+    paymentExpiry: { gte: new Date() }  // Still active
+  },
+  include: {
+    user: { 
+      select: { 
+        name: true, 
+        phone: true 
+      } 
+    }
+  }
+});
+
+if (paymentHolds) {
+  console.log('⏳ PAYMENT HOLD DETECTED on new slot:', {
+    user: paymentHolds.user.name,
+    expires: paymentHolds.paymentExpiry
+  });
+  
+  return res.status(409).json({
+    success: false,
+    error: 'Payment in progress',
+    message: `User "${paymentHolds.user.name}" (${paymentHolds.user.phone?.slice(-4) || 'xxxx'}) is paying now. Hold expires: ${paymentHolds.paymentExpiry.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}. Try different slot?`,
+    holdDetails: {
+      userName: paymentHolds.user.name,
+      phone: paymentHolds.user.phone,
+      expires: paymentHolds.paymentExpiry.toISOString()
+    },
+    canRetry: true,
+    slotTime: `${newSlot.date.toISOString().split('T')[0]} ${newSlot.time}`
+  });
+}
 
    // 🔥 5. FINANCIAL LOGIC
 const oldPaidAmount = appt.paymentStatus === "PAID" ? Number(appt.amount || 0) : 0;
@@ -605,6 +657,10 @@ console.log(`💰 Financial Update: ${financialStatus} | Total: ${newPrice} | Di
       appointment: updated,
       financialAction: adminNote,
     });
+    if (updated.googleCalendarEventId) {
+  await deleteAppointmentFromGCal(updated.id).catch(console.error); // Clear old
+}
+await autoSyncAppointmentToGCal(updated.id).catch(console.error);   
   } catch (error) {
     console.error('❌ Admin Reschedule FAILED:', error);
     if (error.statusCode) {
@@ -931,9 +987,11 @@ export const cancelAppointment = async (req, res) => {
               processedAt: new Date(),
               processedById: userId,
               reason: finalReason,
+            
             },
           })
         : prisma.$queryRaw`SELECT 1`,
+          deleteAppointmentFromGCal(id) 
     ]);
 
     await sendCancellationEmail(
@@ -1503,5 +1561,63 @@ export const processCancellationRequest = async (req, res) => {
       error: "Server error during cancellation processing",
       details: error.message,
     });
+  }
+};
+
+export const googleCalendarSync = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const clinicId = req.clinic.id;
+    
+    // 1. Get appointment + clinic subscription
+    const appointment = await prisma.appointment.findUnique({
+      where: { id },
+      include: { clinic: { include: { subscription: true } } }
+    });
+    
+    if (!appointment || appointment.clinicId !== clinicId) {
+      return res.status(404).json({ error: 'Appointment not found' });
+    }
+    
+    // 2. Check Pro plan feature
+    const hasCalendarSync = appointment.clinic.subscription?.plan?.enableGoogleCalendarSync;
+    if (!hasCalendarSync) {
+      return res.status(403).json({ error: 'Google Calendar Sync requires Pro plan' });
+    }
+    
+    // 3. Clinic Google Calendar settings (from clinic table)
+    const clinic = await prisma.clinic.findUnique({
+      where: { id: clinicId },
+      select: { googleCalendarId: true, googleAccessToken: true }
+    });
+    
+    if (!clinic.googleCalendarId || !clinic.googleAccessToken) {
+      return res.status(400).json({ 
+        error: 'Connect Google Calendar first in Settings → Integrations' 
+      });
+    }
+    
+    // 4. Create Google Calendar Event
+    const event = await createGoogleCalendarEvent({
+      calendarId: clinic.googleCalendarId,
+      accessToken: clinic.googleAccessToken,
+      appointment
+    });
+    
+    // 5. Save event ID to appointment
+    await prisma.appointment.update({
+      where: { id },
+      data: { googleCalendarEventId: event.id }
+    });
+    
+    res.json({ 
+      success: true, 
+      eventId: event.id,
+      eventUrl: event.htmlLink 
+    });
+    
+  } catch (error) {
+    console.error('GCal Sync Error:', error);
+    res.status(500).json({ error: 'Failed to sync with Google Calendar' });
   }
 };

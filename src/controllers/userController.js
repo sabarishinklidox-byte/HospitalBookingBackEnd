@@ -6,75 +6,108 @@ import { logAudit } from '../utils/audit.js';
 import { sendBookingEmails } from '../utils/email.js'
 import Razorpay from 'razorpay';
 import Stripe from 'stripe';
+import { z } from 'zod';
+import { deleteAppointmentFromGCal } from '../utils/googleCalendar.js'; 
+import { updateAppointmentOnGCal} from "../utils/googleCalendar.js";  // 🔥 ADD
 
 
 // ----------------------------------------------------------------
 // 1. SIGNUP
 // ----------------------------------------------------------------
 
-export const userSignup = async (req, res) => {
+const signupSchema = z.object({
+  email: z
+    .string({ required_error: "Email is required" })
+    .email("Invalid email address")
+    .trim(),
+  password: z
+    .string({ required_error: "Password is required" })
+    .min(6, "Password must be at least 6 characters")
+    .max(128, "Password too long"),
+  name: z
+    .string({ required_error: "Name is required" })
+    .min(2, "Name must be at least 2 characters")
+    .max(100, "Name too long"),
+  phone: z  // ✅ FIXED: Always validates
+    .string()
+    .regex(/^\d{10}$/, "Phone: exactly 10 digits")  // Required 10 digits
+    .or(z.literal(''))  // OR empty (but shows error if invalid)
+    .refine(
+      (val) => val === '' || /^\d{10}$/.test(val), 
+      "Phone: exactly 10 digits (or leave empty)"
+    ),
+});
+
+
+// VALIDATION MIDDLEWARE
+const validateSignup = async (req, res, next) => {
   try {
-    const { email, password, name, phone } = req.body;
-
-    if (!email || !password || !name) {
-      return res
-        .status(400)
-        .json({ error: 'Email, password and name required' });
-    }
-
-    const existing = await prisma.user.findUnique({ where: { email } });
-    if (existing) {
-      if (existing.deletedAt) {
-        return res.status(403).json({
-          error:
-            'This account was deleted. Please contact support to reactivate.',
-        });
-      }
-      return res.status(400).json({ error: 'Email already exists' });
-    }
-
-    if (password.length < 6) {
-      return res
-        .status(400)
-        .json({ error: 'Password should be minimum 6 characters' });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 12);
-
-    const user = await prisma.user.create({
-      data: {
-        id: uuidv4(),
-        email,
-        password: hashedPassword,
-        name,
-        phone: phone || '',
-        role: 'USER',
-      },
-      select: { id: true, email: true, name: true, phone: true, role: true },
-    });
-
-    const token = jwt.sign(
-      { userId: user.id, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: '6h' }
-    );
-
-    await logAudit({
-      userId: user.id,
-      action: 'USER_SIGNUP',
-      entity: 'User',
-      entityId: user.id,
-      details: { email: user.email, name: user.name },
-      req,
-    });
-
-    return res.status(201).json({ token, user });
+    await signupSchema.parseAsync(req.body);
+    next();
   } catch (error) {
-    console.error('User Signup Error:', error);
-    return res.status(500).json({ error: error.message });
+    const fieldErrors = error.errors.map(err => 
+      `${err.path.join('.')}: ${err.message}`
+    );
+    return res.status(400).json({ 
+      error: "Validation failed", 
+      details: fieldErrors[0] || "Invalid input" 
+    });
   }
 };
 
+export const userSignup = [
+  validateSignup,  // ✅ ZOD FIRST
+  async (req, res) => {
+    try {
+      const { email, password, name, phone } = req.body;
+
+      // Duplicate check (your existing logic)
+      const existing = await prisma.user.findUnique({ where: { email } });
+      if (existing) {
+        if (existing.deletedAt) {
+          return res.status(403).json({
+            error: 'This account was deleted. Please contact support to reactivate.',
+          });
+        }
+        return res.status(400).json({ error: 'Email already exists' });
+      }
+
+      const hashedPassword = await bcrypt.hash(password, 12);
+
+      const user = await prisma.user.create({
+        data: {
+          id: uuidv4(),
+          email,
+          password: hashedPassword,
+          name,
+          phone: phone || '',
+          role: 'USER',
+        },
+        select: { id: true, email: true, name: true, phone: true, role: true },
+      });
+
+      const token = jwt.sign(
+        { userId: user.id, role: user.role },
+        process.env.JWT_SECRET,
+        { expiresIn: '6h' }
+      );
+
+      await logAudit({
+        userId: user.id,
+        action: 'USER_SIGNUP',
+        entity: 'User',
+        entityId: user.id,
+        details: { email: user.email, name: user.name },
+        req,
+      });
+
+      return res.status(201).json({ token, user });
+    } catch (error) {
+      console.error('User Signup Error:', error);
+      return res.status(500).json({ error: error.message });
+    }
+  }
+];
 // ----------------------------------------------------------------
 // 2. LOGIN (With Soft Delete Check)
 // ----------------------------------------------------------------
@@ -374,14 +407,15 @@ export const cancelUserAppointment = async (req, res) => {
             cancelledBy: "USER",            // ✅ CancellationActor enum
             logs: {
               create: {
-                oldDate: appointment.slot.date,
-                oldTime: appointment.slot.time,
-                newDate: null,               // Reschedules only
-                newTime: null,
-                reason: reason || "Cancelled by patient",
-                changedBy: userId,
-                metadata: { paymentMode: appointment.slot.paymentMode }
-              }
+            // 🔥 CANCEL LOG: NO newDate/newTime (reschedule-only)
+            oldDate: appointment.slot.date,
+            oldTime: appointment.slot.time,
+            reason: reason || "Cancelled by patient",
+            changedBy: userId,
+            metadata: { 
+              paymentMode: appointment.slot.paymentMode,
+              action: "CANCEL"  // 🔥 Optional: distinguish from reschedule
+            }}
             }
           },
         });
@@ -421,7 +455,7 @@ export const cancelUserAppointment = async (req, res) => {
         details: { reason, paymentMode: "OFFLINE" },
         req,
       });
-
+deleteAppointmentFromGCal(appointment.id).catch(console.error);
       return res.json(updated);
     }
 
@@ -482,6 +516,7 @@ export const cancelUserAppointment = async (req, res) => {
         details: { reason, paymentMode: "ONLINE" },
         req,
       });
+      deleteAppointmentFromGCal(appointment.id).catch(console.error);
 
       return res.json({
         message: "Cancellation request submitted. Clinic will review refund.",
@@ -732,11 +767,24 @@ export const rescheduleAppointment = async (req, res) => {
             doctor: true 
           }
         }),
-        tx.slot.findUnique({ where: { id: newSlotId }, include: { clinic: true } }),
-        tx.appointment.count({
-          where: { slotId: newSlotId, status: { notIn: ['CANCELLED'] }, deletedAt: null }
-        })
+        tx.slot.findUnique({ where: { id: newSlotId, deletedAt: null }, include: { clinic: true } }),
+     tx.appointment.count({
+  where: { 
+    slotId: newSlotId, 
+    status: { 
+      in: ['PENDING', 'CONFIRMED', 'PENDING_PAYMENT', 'COMPLETED'] 
+    }, 
+    deletedAt: null 
+  }
+})
       ]);
+      
+      console.log('📅 Reschedule Debug:', {
+        status: oldAppt?.status,
+        paymentStatus: oldAppt?.paymentStatus,
+        appointmentId,
+        newSlotId
+      });
 
       if (!oldAppt || !newSlot) {
         throw { statusCode: 404, message: "Appointment or slot not found" };
@@ -749,8 +797,11 @@ export const rescheduleAppointment = async (req, res) => {
       if (String(oldAppt.userId) !== String(userId)) {
         throw { statusCode: 403, message: "Not authorized" };
       }
-      if (["COMPLETED", "CANCELLED"].includes(oldAppt.status)) {
-        throw { statusCode: 400, message: "Cannot reschedule completed/cancelled" };
+      console.log('📅 Appointment status:', oldAppt.status, 'paymentStatus:', oldAppt.paymentStatus);
+      
+      // 🔥 FIXED STATUS CHECK
+      if (["COMPLETED", "CANCELLED"].includes(oldAppt.status) && oldAppt.status !== 'PENDING_PAYMENT') {
+        throw { statusCode: 400, message: "Cannot reschedule completed/cancelled appointments" };
       }
 
       // 🔥 SAFE MULTIPLE RESCHEDULE BLOCK
@@ -759,14 +810,13 @@ export const rescheduleAppointment = async (req, res) => {
         throw { statusCode: 400, message: "Cannot reschedule more than once per policy" };
       }
 
-      // FINANCIAL LOGIC (unchanged)
+      // FINANCIAL LOGIC
       const oldPrice = Number(oldAppt.amount || 0);
       const newPrice = Number(newSlot.price || 0);
       const oldPaidAmount = oldAppt.paymentStatus === "PAID" ? oldPrice : 0;
       const isOfflineToOnline = oldAppt.slot.paymentMode === 'OFFLINE' && newSlot.paymentMode === 'ONLINE';
       
       let needsPayment = false, financialStatus = 'NO_CHANGE', diffAmount = 0, adminNote = '';
-
       console.log(`💳 Old: ${oldAppt.slot.paymentMode}(${oldAppt.paymentStatus}) ₹${oldPrice} → New: ${newSlot.paymentMode} ₹${newPrice}`);
 
       if (newPrice > oldPaidAmount) {
@@ -783,102 +833,166 @@ export const rescheduleAppointment = async (req, res) => {
       }
 
       const oldSlotId = oldAppt.slotId;
-      
       if (oldSlotId && oldSlotId !== newSlotId) {
         await tx.slot.update({ where: { id: oldSlotId }, data: { status: 'PENDING', isBlocked: false } });
       }
 
-      // 🔥 SAFE UPDATE (works with/without schema)
-      const baseData = {
-        slot: { connect: { id: newSlotId } },
-        adminNote: `RESCHEDULED: ${adminNote}`,
-        status: needsPayment ? 'PENDING_PAYMENT' : 'CONFIRMED',
-        paymentStatus: needsPayment ? 'PENDING' : 'PAID',
-        financialStatus,
-        amount: newPrice,
-        diffAmount: diffAmount,
-        updatedAt: new Date()
-      };
+      // 🔥 BASE UPDATE DATA
+   const baseData = {
+  slotId: newSlotId,  // 🔥 DIRECT FK - No connect validation
+  adminNote: `RESCHEDULED: ${adminNote}`,
+  status: needsPayment ? 'PENDING_PAYMENT' : 'CONFIRMED',
+  paymentStatus: needsPayment ? 'PENDING' : 'PAID',
+  financialStatus,
+  amount: newPrice,
+  diffAmount: diffAmount,
+  updatedAt: new Date()
+};
 
+
+      // 🔥 SAFE TRACKING (schema compatible)
       const safeTracking = {
-        ...(typeof oldAppt.rescheduleCount !== 'undefined' && { rescheduleCount: { increment: 1 } }),
+        ...(typeof oldAppt.rescheduleCount !== 'undefined' && 
+          (!needsPayment ? { rescheduleCount: { increment: 1 } } : {})
+        ),
         ...(typeof oldAppt.type !== 'undefined' && { type: 'RESCHEDULE' }),
         ...(Array.isArray(oldAppt.history) && {
           history: {
             push: {
-              oldSlotId, oldDate: oldAppt.slot.date.toISOString(),
-              newDate: newSlot.date.toISOString(), oldTime: oldAppt.slot.time,
-              newTime: newSlot.time, timestamp: new Date().toISOString()
+              oldSlotId, 
+              oldDate: oldAppt.slot.date.toISOString(),
+              newDate: newSlot.date.toISOString(), 
+              oldTime: oldAppt.slot.time,
+              newTime: newSlot.time, 
+              timestamp: new Date().toISOString()
             }
           }
         })
       };
 
-  const updatedAppt = await tx.appointment.update({
-  where: { id: appointmentId },
-  data: { ...baseData, ...safeTracking },
-  include: { clinic: { include: { gateways: { where: { name: provider, isActive: true } } } }, slot: true }
+      // 🔥 RACE CONDITION FIX - Verify slot still exists
+await tx.slot.findUniqueOrThrow({ 
+  where: { id: newSlotId, deletedAt: null } 
 });
+      // 🔥 UPDATE APPOINTMENT
+      const updatedAppt = await tx.appointment.update({
+        where: { id: appointmentId },
+        data: { ...baseData, ...safeTracking },
+        include: { 
+          clinic: { include: { gateways: { where: { name: provider, isActive: true } } } }, 
+          slot: true 
+        }
+      });
 
-await tx.slot.update({
-  where: { id: newSlotId },
-  data: { status: needsPayment ? 'PENDING_PAYMENT' : 'CONFIRMED', isBlocked: needsPayment }
-});
+      // 🔥 LOCK NEW SLOT
+      await tx.slot.update({
+        where: { id: newSlotId },
+        data: { status: needsPayment ? 'PENDING_PAYMENT' : 'CONFIRMED', isBlocked: needsPayment }
+      });
 
-// 🔥 ADD THIS: Create reschedule history log
-await tx.appointmentLog.create({
-  data: {
-    appointmentId,
-    oldDate: oldAppt.slot.date,
-    oldTime: oldAppt.slot.time,
-    newDate: newSlot.date,
-    newTime: newSlot.time,
-    changedBy: userId,
-    reason: `Rescheduled: ${financialStatus}`,
-    metadata: { 
-      oldSlotId: oldAppt.slotId,
-      newSlotId,
-      oldPrice,
-      newPrice,
-      financialStatus 
-    }
-  }
-});
+      // 🔥 RESCHEDULE LOG
+      await tx.appointmentLog.create({
+        data: {
+          appointmentId,
+          oldDate: oldAppt.slot.date,
+          oldTime: oldAppt.slot.time,
+          newDate: newSlot.date,
+          newTime: newSlot.time,
+          changedBy: userId,
+          reason: `Rescheduled: ${financialStatus}`,
+          metadata: { 
+            oldSlotId: oldAppt.slotId,
+            newSlotId,
+            oldPrice,
+            newPrice,
+            financialStatus 
+          }
+        }
+      });
 
+      // 🔥 NOTIFICATION
+      await tx.notification.create({
+        data: {
+          clinicId: updatedAppt.clinicId,
+          type: 'RESCHEDULE',
+          entityId: appointmentId,
+          message: `Patient rescheduled to ${newSlot.time} on ${new Date(newSlot.date).toLocaleDateString('en-IN')}`
+        }
+      });
+
+      // 🔥 GCal UPDATE (if no payment needed)
 if (!needsPayment) {
+  // 🔥 SMART GCAL: Create if missing, update if exists
+  try {
+    if (updatedAppt.googleCalendarEventId) {
+      await updateAppointmentOnGCal(appointmentId);
+      console.log('📅 GCal UPDATED:', appointmentId);
+    } else {
+      await autoSyncAppointmentToGCal(appointmentId);
+      console.log('📅 GCal CREATED:', appointmentId);
+    }
+  } catch (gcalErr) {
+    console.error('❌ GCal Sync Failed:', gcalErr.message);
+  }
+  
   return {
     status: 'SUCCESS',
-    message: financialStatus === 'REFUND_AT_CLINIC' ? `Rescheduled! Get ₹${diffAmount} refund at clinic.` : 'Rescheduled successfully!',
+    message: financialStatus === 'REFUND_AT_CLINIC' 
+      ? `Rescheduled! Get ₹${diffAmount} refund at clinic.` 
+      : 'Rescheduled successfully!',
     data: { updatedAppt, financialStatus, refundAmount: financialStatus === 'REFUND_AT_CLINIC' ? diffAmount : 0 }
   };
 }
-  
-      // RAZORPAY (unchanged)
+
+
+      // 🔥 RAZORPAY PAYMENT (needsPayment = true)
       const gateways = updatedAppt.clinic.gateways || [];
       const gateway = gateways.find(g => g.name === provider && g.isActive);
 
       if (!gateway?.apiKey || !gateway?.secret) {
-        return { status: 'CLINIC_PAYMENT', message: `Pay ₹${diffAmount} at clinic`, data: { appointmentId, amount: diffAmount, clinic: updatedAppt.clinic } };
+        return { 
+          status: 'CLINIC_PAYMENT', 
+          message: `Pay ₹${diffAmount} at clinic`, 
+          data: { appointmentId, amount: diffAmount, clinic: updatedAppt.clinic } 
+        };
       }
 
       const razorpay = new Razorpay({ key_id: gateway.apiKey, key_secret: gateway.secret });
       const receipt = `resch_${appointmentId.slice(-10)}`;
       const razorpayOrder = await razorpay.orders.create({
-        amount: Math.round(diffAmount * 100), currency: 'INR', receipt,
-        notes: { type: financialStatus, appointmentId, slotId: newSlotId, oldAmount: oldPaidAmount, newAmount: newPrice, difference: diffAmount }
+        amount: Math.round(diffAmount * 100), 
+        currency: 'INR', 
+        receipt,
+        notes: { 
+          type: financialStatus, 
+          appointmentId, 
+          slotId: newSlotId, 
+          oldAmount: oldPaidAmount, 
+          newAmount: newPrice, 
+          difference: diffAmount 
+        }
       });
 
       return {
         status: 'PAYMENT_REQUIRED',
         message: `Pay ₹${diffAmount} difference`,
-        data: { appointmentId, key: gateway.apiKey, amount: razorpayOrder.amount, orderId: razorpayOrder.id, diffAmount, oldPaidAmount, newPrice, expiresIn: 600, paymentExpiry: new Date(Date.now() + 10 * 60 * 1000).toISOString() }
+        data: { 
+          appointmentId, 
+          key: gateway.apiKey, 
+          amount: razorpayOrder.amount, 
+          orderId: razorpayOrder.id, 
+          diffAmount, 
+          oldPaidAmount, 
+          newPrice, 
+          expiresIn: 600, 
+          paymentExpiry: new Date(Date.now() + 10 * 60 * 1000).toISOString() 
+        }
       };
     });
 
     res.json(result);
 
   } catch (error) {
-    // 🔥 FIXED: Variables in scope
     console.error('❌ RESCHEDULE ERROR:', { appointmentId, userId, newSlotId, error: error.message });
     
     if (error.code === 'P2002') return res.status(409).json({ error: 'Slot taken. Try again.' });
@@ -886,6 +1000,7 @@ if (!needsPayment) {
     return res.status(500).json({ error: 'Reschedule failed - please try again' });
   }
 };
+
 
 
 

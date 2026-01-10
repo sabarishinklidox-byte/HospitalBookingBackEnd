@@ -120,7 +120,15 @@ export const getPatientHistory = async (req, res) => {
 // controllers/adminPatientController.js
 
 
-
+const formatINR = (paise) => {
+  if (!paise || paise === 0) return "₹0";
+  const rupees = paise / 100;
+  return new Intl.NumberFormat('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+    minimumFractionDigits: 0,
+  }).format(rupees);
+};
 
 export const getPatientHistoryDetailed = async (req, res) => {
   try {
@@ -132,12 +140,12 @@ export const getPatientHistoryDetailed = async (req, res) => {
     const limit = Number(req.query.limit) || 10;
     const skip = (page - 1) * limit;
 
-    if (!clinicId) {
-      return res.status(400).json({ error: "Clinic ID missing from request" });
+    if (!clinicId || !userId) {
+      return res.status(400).json({ error: "Clinic ID or userId missing" });
     }
 
-    // Get total count + paginated records
-    const [totalCount, appointments] = await Promise.all([
+    // SAFE TRANSACTION - Only schema-proven relations
+    const [totalCount, appointments, user] = await prisma.$transaction([
       prisma.appointment.count({
         where: { clinicId, userId, deletedAt: null },
       }),
@@ -147,8 +155,16 @@ export const getPatientHistoryDetailed = async (req, res) => {
         skip,
         take: limit,
         include: {
-          doctor: { select: { id: true, name: true, speciality: true } },
-          clinic: { select: { id: true, name: true } },
+          doctor: {
+            select: {
+              id: true,
+              name: true,
+              speciality: true,
+            },
+          },
+          clinic: {
+            select: { id: true, name: true },
+          },
           slot: {
             select: {
               id: true,
@@ -158,7 +174,6 @@ export const getPatientHistoryDetailed = async (req, res) => {
               price: true,
             },
           },
-          logs: { orderBy: { createdAt: "asc" } },
           user: {
             select: {
               id: true,
@@ -168,14 +183,25 @@ export const getPatientHistoryDetailed = async (req, res) => {
               avatar: true,
             },
           },
-          payment: true,
-          cancellationRequest: true,
-          review: true,
+          payment: true,  // ✅ Schema match
+          // REMOVED: logs, cancellationRequest, review (missing schema)
+        },
+      }),
+      prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          phone: true,
+          avatar: true,
+          createdAt: true,
+          deletedAt: true,
         },
       }),
     ]);
 
-    if (!appointments.length) {
+    if (!appointments.length && !user) {
       return res.json({
         user: null,
         appointments: [],
@@ -188,7 +214,7 @@ export const getPatientHistoryDetailed = async (req, res) => {
       });
     }
 
-    const patient = appointments[0].user;
+    const patient = appointments[0]?.user || user;
 
     const formattedAppointments = appointments.map((a) => {
       const slot = a.slot || {};
@@ -200,122 +226,89 @@ export const getPatientHistoryDetailed = async (req, res) => {
 
       const timeline = [];
 
-      // 1. History: Booking
+      // 1. Booking event
       timeline.push({
         type: "BOOKED",
         amount: bookedAmount,
         at: a.createdAt.toISOString(),
         mode: slot.paymentMode || "SYSTEM",
-        note: `Booked slot for ₹${bookedAmount}`,
+        note: `Booked slot for ${formatINR(bookedAmount)}`,
       });
 
-      // 2. History: Reschedules / Admin Changes
-      for (const log of a.logs || []) {
-        const action = log.action || "";
-        const diff = Number(log.details?.diffAmount ?? 0);
+      // 2. Reschedule logs (if you add logs relation later)
+      // for (const log of a.logs || []) { ... }
 
-        if (
-          (action === "RESCHEDULE" || action === "RESCHEDULE_APPOINTMENT") &&
-          diff !== 0
-        ) {
-          currentAmount += diff;
-          timeline.push({
-            type: "AMOUNT_UPDATE",
-            amount: diff,
-            at: log.createdAt.toISOString(),
-            mode: "SYSTEM",
-            note:
-              diff > 0
-                ? `Amount increased by ₹${diff} (now ₹${currentAmount})`
-                : `Amount decreased by ₹${Math.abs(diff)} (now ₹${currentAmount})`,
-          });
-        }
-      }
+      // 3. ✅ FIXED PAYMENTS (single → array)
+    const paymentsArray = a.payment ? [a.payment] : [];
+for (const p of paymentsArray) {
+  const pAmount = Number(p.amount ?? 0);
 
-      // 3. History: Payments
-      if (a.payment) {
-        const p = a.payment;
-        const pAmount = Number(p.amount ?? 0);
-
-        if (p.status === "PAID") {
-          paidAmount += pAmount;
-          timeline.push({
-            type: slot.paymentMode === "ONLINE" ? "ONLINE_PAYMENT" : "CLINIC_PAYMENT",
-            amount: pAmount,
-            at: p.createdAt.toISOString(),
-            mode: slot.paymentMode || "UNKNOWN",
-            note: `Paid ₹${pAmount}`,
-          });
-        } else if (p.status === "REFUNDED") {
-          refundedAmount += pAmount;
-          timeline.push({
-            type: "REFUND",
-            amount: pAmount,
-            at: p.createdAt.toISOString(),
-            mode: slot.paymentMode || "UNKNOWN",
-            note: `Refunded ₹${pAmount}`,
-          });
-        }
-      }
-
-      // 4. Calculate Pending & Status
+  if (p.status === "PAID") {
+    paidAmount += pAmount;
+    timeline.push({
+      type: p.gateway === "razorpay" || p.gateway === "stripe" ? "ONLINE_PAYMENT" : "CLINIC_PAYMENT",
+      amount: pAmount,
+      at: p.createdAt.toISOString(),
+      mode: p.gateway === "razorpay" ? "Razorpay" : 
+            p.gateway === "stripe" ? "Stripe" : 
+            slot.paymentMode || "OFFLINE",  // 🔥 FIXED: Use slot.paymentMode as fallback
+      note: `Paid ${formatINR(pAmount)}`,
+    });
+  } else if (p.status === "REFUNDED") {
+    refundedAmount += pAmount;
+    timeline.push({
+      type: "REFUND",
+      amount: pAmount,
+      at: p.createdAt.toISOString(),
+      mode: slot.paymentMode || "OFFLINE",  // 🔥 FIXED: Proper fallback
+      note: `Refunded ${formatINR(pAmount)}`,
+    });
+  }
+}
+      // 4. Calculate final status
       let pendingAmount = Math.max(currentAmount - paidAmount + refundedAmount, 0);
-let paymentStatus = a.paymentStatus || "PENDING";
+      let paymentStatus = a.paymentStatus || "PENDING";
 
-if (currentAmount === 0) {
-  paymentStatus = "PAID";
-  pendingAmount = 0;
-} else if (paidAmount >= currentAmount && currentAmount > 0) {
-  paymentStatus = "PAID";
-  pendingAmount = 0;
-} else if (paidAmount > 0 && paidAmount < currentAmount) {
-  paymentStatus = "PARTIAL";
-} else {
-  paymentStatus = "PENDING";
-}
+      if (currentAmount === 0) {
+        paymentStatus = "PAID";
+        pendingAmount = 0;
+      } else if (paidAmount >= currentAmount && currentAmount > 0) {
+        paymentStatus = "PAID";
+        pendingAmount = 0;
+      } else if (paidAmount > 0 && paidAmount < currentAmount) {
+        paymentStatus = "PARTIAL";
+      } else {
+        paymentStatus = "PENDING";
+      }
 
-// AUTO‑TREAT COMPLETED OFFLINE AS PAID
-if (
-  a.status === "COMPLETED" &&
-  (!a.payment || a.payment.status !== "PAID") &&
-  (slot.paymentMode === "OFFLINE" || !slot.paymentMode)
-) {
-  paidAmount = currentAmount;     // assume full amount taken in clinic
-  pendingAmount = 0;
-  paymentStatus = "PAID";
-}
+      // Auto-treat COMPLETED OFFLINE as PAID
+      if (
+        a.status === "COMPLETED" &&
+        (!paymentsArray.length || paymentsArray.every((p) => p.status !== "PAID")) &&
+        (slot.paymentMode === "OFFLINE" || !slot.paymentMode)
+      ) {
+        paidAmount = currentAmount;
+        pendingAmount = 0;
+        paymentStatus = "PAID";
+      }
 
-// If appointment is cancelled and not paid, show CANCELLED
-if (a.status === "CANCELLED" && paidAmount === 0) {
-  paymentStatus = "CANCELLED";
-}
+      // Cancelled and not paid
+      if (a.status === "CANCELLED" && paidAmount === 0) {
+        paymentStatus = "CANCELLED";
+      }
+
       const lastPaymentEvent =
         timeline
           .filter((t) =>
             ["ONLINE_PAYMENT", "CLINIC_PAYMENT", "REFUND"].includes(t.type)
           )
           .slice(-1)[0] || null;
-           console.log('Patient history row >>>', {
-    id: a.id,
-    status: a.status,
-    slotPaymentMode: slot.paymentMode,
-    bookedAmount,
-    currentAmount,
-    paidAmount,
-    refundedAmount,
-    pendingAmount,
-    paymentStatus,
-    rawPayment: a.payment && {
-      amount: a.payment.amount,
-      status: a.payment.status,
-    },
-  });
 
       return {
         id: a.id,
         status: a.status,
 
-        // Financial Summary
+        // Financial summary
         bookedAmount,
         amount: currentAmount,
         paidAmount,
@@ -325,15 +318,8 @@ if (a.status === "CANCELLED" && paidAmount === 0) {
         paymentMode: slot.paymentMode || "UNKNOWN",
         paymentUpdatedAt: lastPaymentEvent ? lastPaymentEvent.at : null,
 
-        // Raw payment object
-        payment: a.payment
-          ? {
-              id: a.payment.id,
-              amount: Number(a.payment.amount ?? 0),
-              status: a.payment.status,
-              createdAt: a.payment.createdAt,
-            }
-          : null,
+        // ✅ FULL PAYMENT HISTORY (array for UI)
+        payments: paymentsArray,
 
         // Relations
         doctor: a.doctor
@@ -383,4 +369,3 @@ if (a.status === "CANCELLED" && paidAmount === 0) {
     return res.status(500).json({ error: error.message });
   }
 };
-

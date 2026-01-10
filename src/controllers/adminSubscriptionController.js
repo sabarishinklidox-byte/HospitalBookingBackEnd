@@ -188,8 +188,7 @@ const performPlanUpgrade = async ({ clinicId, planId, targetPlan, currentSub, us
 
   // ✅ PERFECT Audit (userId passed correctly)
 await logAudit({
-  // Use req.user.userId directly as a string, not a connect object
- userId: req.user.id,
+  userId: req.user.userId,
   clinicId: clinicId,
   action: 'UPDATE_SUBSCRIPTION_PLAN',
   entity: 'Subscription',
@@ -202,7 +201,7 @@ await logAudit({
     trialDays: targetPlan.trialDays,
     durationDays: targetPlan.durationDays
   },
-  req, // Pass req to extract ipAddress inside logAudit
+  req,
 });
 
   return subscription;

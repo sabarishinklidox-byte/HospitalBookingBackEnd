@@ -21,9 +21,7 @@ export const sendCancellationEmail = async (appointment, reason, patientRequeste
   const { user, slot } = appointment;
   const clinicName = slot.clinic.name;
   const doctorName = slot.doctor.name;
-  const slotTime = new Date(`${slot.date}T${slot.time}:00+05:30`).toLocaleString('en-IN', {
-    timeZone: 'Asia/Kolkata'
-  });
+ const slotTime = fmtDate(slot.date) + (slot.time ? ` (${slot.time})` : '');
   const adminName = adminUser.name || 'Clinic Admin';
 
   const subject = `⚠️ Appointment CANCELLED - ${doctorName}`;
@@ -61,13 +59,17 @@ export const sendCancellationEmail = async (appointment, reason, patientRequeste
 };
 
 // 🔥 2. STATUS UPDATE EMAIL (CONFIRMED/REJECTED/CANCELLED)
+const fmtDate = (dateValue) => {
+  if (!dateValue) return 'Date not available';
+  const d = dateValue instanceof Date ? dateValue : new Date(dateValue);
+  if (Number.isNaN(d.getTime())) return 'Date not available';
+  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+};
 export const sendAppointmentStatusEmail = async (appointment, status, reason, adminUser) => {
   const { user, slot } = appointment;
   const clinicName = slot.clinic.name;
   const doctorName = slot.doctor.name;
-  const slotTime = new Date(`${slot.date}T${slot.time}:00+05:30`).toLocaleString('en-IN', {
-    timeZone: 'Asia/Kolkata'
-  });
+const slotTime = fmtDate(slot.date) + (slot.time ? ` (${slot.time})` : '');
   const adminName = adminUser?.name || 'Clinic Admin';
   const appUrl = process.env.APP_URL || 'https://yourapp.com';
 
@@ -196,8 +198,12 @@ export const sendBookingEmails = async (appointmentData) => {
     const subjectPatient = isReschedule
       ? `📅 Appointment Rescheduled - Dr. ${doctor?.name}`
       : `📅 Appointment Confirmation - Dr. ${doctor?.name}`;
-
-    const fmtDate = (d) => (d ? new Date(d).toLocaleDateString('en-IN') : 'N/A');
+ const fmtDate = (dateValue) => {
+  if (!dateValue) return 'Date not available';
+  const d = dateValue instanceof Date ? dateValue : new Date(dateValue);
+  if (Number.isNaN(d.getTime())) return 'Date not available';
+  return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+};
 
     const badgeText = isReschedule ? 'RESCHEDULE REQUEST' : 'NEW APPOINTMENT REQUEST';
     const badgeBg = isReschedule ? '#FFF3E0' : '#E3F2FD';

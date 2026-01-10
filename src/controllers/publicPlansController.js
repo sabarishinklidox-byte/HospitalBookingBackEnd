@@ -37,6 +37,7 @@ export const listPublicPlans = async (req, res) => {
         trialDays: true,
         isActive: true,
         createdAt: true,
+          enableGoogleCalendarSync: true,
 
         // ✅ Prisma relation count (with filter) is valid
         _count: {
