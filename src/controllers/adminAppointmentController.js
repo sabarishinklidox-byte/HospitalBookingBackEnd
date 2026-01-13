@@ -1404,29 +1404,57 @@ export const processCancellationRequest = async (req, res) => {
     }
 
     // 2) REJECT
-    if (action === "REJECT") {
-      await prisma.cancellationRequest.update({
-        where: { id: requestId },
+  if (action === "REJECT") {
+  await prisma.$transaction(async (tx) => {
+    // 1. Update request status
+    await tx.cancellationRequest.update({
+      where: { id: requestId },
+      data: {
+        status: "REJECTED",
+        reason: adminNote || "Rejected by clinic",
+        processedAt: new Date(),
+        processedById: adminId,
+      },
+    });
+
+    // 2. Keep appointment CONFIRMED (already is)
+    await tx.appointment.update({
+      where: { id: appointment.id },
+      data: {
+        adminNote: `Cancellation rejected${adminNote ? `: ${adminNote}` : ''}`,
+      },
+    });
+
+    // 🔥 3. FIX: Make slot bookable again
+      await tx.slot.update({
+        where: { id: appointment.slotId },
         data: {
-          status: "REJECTED",
-          reason: adminNote || "Rejected by clinic",
-          processedAt: new Date(),
-          processedById: adminId,
+          status: "PENDING_PAYMENT",  // 10min hold, bookable
+          isBlocked: false,
+          blockedReason: null,
+          blockedBy: null,
+          blockedAt: null,
         },
       });
+    });
 
-      await logAudit({
-        userId: adminId,
-        clinicId: appointment.clinicId,
-        action: "REJECT_CANCELLATION_REQUEST",
-        entity: "Appointment",
-        entityId: appointment.id,
-        details: { requestId },
-        req,
-      });
+  await logAudit({
+    userId: adminId,
+    clinicId: appointment.clinicId,
+    action: "REJECT_CANCELLATION_REQUEST",
+    entity: "Appointment",
+    entityId: appointment.id,
+    details: { requestId },
+    req,
+  });
 
-      return res.json({ success: true, message: "Cancellation rejected", data: { requestId } });
-    }
+  return res.json({ 
+    success: true, 
+    message: "Cancellation rejected - appointment kept, slot available for booking",
+    data: { requestId, slotId: appointment.slotId }
+  });
+}
+
 
     // 3) APPROVE + refund policy
     const isRescheduled =

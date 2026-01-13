@@ -284,49 +284,340 @@ const getPaymentInstance = async (clinicId, provider = 'RAZORPAY') => {
 //   }
 // };
 // ✅ FULLY FIXED createBooking - Handles ALL FK + Race Conditions!
+// export const createBooking = async (req, res) => {
+//   try {
+//     const { slotId, paymentMethod = 'ONLINE', provider = 'RAZORPAY' } = req.body;
+//     const authUserId = req.user?.userId;
+
+//     console.log('🔑 Auth header:', req.headers.authorization);
+//     console.log('👤 req.user:', req.user);
+
+//     if (!authUserId) return res.status(401).json({ error: 'Unauthorized' });
+
+//     const HOLD_MS = 10 * 60 * 1000;
+//     const SAFETY_MS = 15 * 60 * 1000;
+//     const now = new Date();
+
+//     // 1. Fetch Slot + Clinic + Doctor
+//     const slotData = await prisma.slot.findUnique({
+//       where: { id: slotId },
+//       include: { clinic: true, doctor: true },
+//     });
+
+//     if (!slotData) return res.status(404).json({ error: 'Slot not found' });
+
+//     // 2. RECENT HOLD CHECK
+//     const recentHold = await prisma.appointment.findFirst({
+//       where: {
+//         slotId,
+//         deletedAt: null,
+//         status: 'PENDING_PAYMENT',
+//         createdAt: { gte: new Date(now.getTime() - SAFETY_MS) }
+//       },
+//     });
+
+//     if (recentHold) {
+//       if (recentHold.userId !== authUserId) {
+//         return res.status(409).json({
+//           error: 'Slot on hold by another user. Please wait 10-15 mins or choose another.',
+//           retry: true,
+//         });
+//       }
+//       return handleExistingHold(recentHold, slotData, provider, now, HOLD_MS, res, slotData.clinicId, req);
+//     }
+
+//     // 3. Plan validation
+//     const plan = await getClinicPlan(slotData.clinicId);
+//     if (!plan) {
+//       return res.status(400).json({ error: 'Clinic has no active subscription plan.' });
+//     }
+
+//     if (paymentMethod === 'ONLINE' && !plan.allowOnlinePayments) {
+//       return res.status(403).json({
+//         error: 'Online payments disabled. Use FREE or OFFLINE slots.',
+//         availableModes: ['FREE', 'OFFLINE'],
+//       });
+//     }
+
+//     // 🔥 4. ATOMIC TRANSACTION - FULLY FIXED CLEANUP!
+//     const result = await prisma.$transaction(async (tx) => {
+//       console.log('🧹 DEBUG: Checking stale appointments for slotId:', slotId);
+//       // 🔥 COMPLETE STALE CLEANUP (ALL CHILDREN FIRST!)
+//       const staleAppts = await tx.appointment.findMany({
+//         where: {
+//           slotId,
+//              OR: [
+//       { 
+//         status: 'PENDING', 
+//         createdAt: { lt: new Date(now.getTime() - SAFETY_MS) } 
+//       }, 
+//       { 
+//         status: 'PENDING_PAYMENT',
+//         createdAt: { lt: new Date(now.getTime() - SAFETY_MS) }
+//       }
+//     ]
+//   },
+      
+//         select: { id: true }
+//       });
+
+//       const staleIds = staleAppts.map(a => a.id);
+      
+//       if (staleIds.length > 0) {
+//         console.log(`🧹 Cleaning ${staleIds.length} stale appointments + children`);
+        
+//         // CRITICAL ORDER: Children → Parent (No FK Violations!)
+//         await tx.cancellationRequest.deleteMany({  // 🔥 ADDED
+//           where: { appointmentId: { in: staleIds } }
+//         });
+//         await tx.payment.deleteMany({
+//           where: { appointmentId: { in: staleIds } }
+//         });
+//         await tx.appointmentLog.deleteMany({  // 🔥 ADDED
+//           where: { appointmentId: { in: staleIds } }
+//         });
+        
+//         // NOW safe to delete appointments
+//         await tx.appointment.deleteMany({
+//           where: { id: { in: staleIds } }
+//         });
+        
+//         console.log(`✅ Cleaned ${staleIds.length} appts + payments/requests/logs`);
+//       }
+//       const freshSlot = await tx.slot.findUnique({
+//     where: { id: slotId },
+//     select: { isBlocked: true, status: true }
+//   });
+
+//   if (!freshSlot) throw new Error('SLOT_NOT_FOUND');
+  
+//   // Check if Admin blocked it while user was on the page
+//   if (freshSlot.isBlocked) {
+//     throw new Error('ADMIN_BLOCKED');
+//   }
+//   // ============================================================
+
+//       // SAFETY CHECKS (Inside transaction!)
+//       const confirmed = await tx.appointment.findFirst({
+//         where: { slotId, status: 'CONFIRMED', deletedAt: null }
+//       });
+//       if (confirmed) throw new Error('ALREADY_CONFIRMED');
+
+//       const otherHold = await tx.appointment.findFirst({
+//         where: {
+//           slotId,
+//           userId: { not: authUserId },
+//           status: 'PENDING_PAYMENT',
+//           deletedAt: null
+//         }
+//       });
+//       if (otherHold) throw new Error('SLOT_BLOCKED');
+
+//       // FREE/OFFLINE → INSTANT PENDING
+//       if (slotData.paymentMode === 'FREE' || paymentMethod === 'OFFLINE' || slotData.paymentMode === 'OFFLINE') {
+//         const appointment = await tx.appointment.create({
+//           data: {
+//             userId: authUserId,
+//             slotId,
+//             clinicId: slotData.clinicId,
+//             doctorId: slotData.doctorId,
+//             status: 'PENDING',
+//             paymentStatus: slotData.paymentMode === 'FREE' ? 'PAID' : 'PENDING',
+//             amount: slotData.paymentMode === 'FREE' ? 0 : Number(slotData.price),
+//             slug: `${slotData.paymentMode?.toLowerCase() || 'offline'}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+//             section: 'GENERAL',
+//           },
+//         });
+//         return { appointment, isOnline: false, createNew: true };
+//       }
+
+//       // ONLINE → RAZORPAY HOLD + ORDER
+//       const gateway = await getPaymentInstance(slotData.clinicId, provider);
+//       const orderData = await createPaymentOrder(gateway, slotData, provider);
+// const activeAppointment = await tx.appointment.findFirst({
+//   where: {
+//     slotId,
+//     status: { in: ['CONFIRMED', 'PENDING', 'PENDING_PAYMENT'] },
+//     deletedAt: null,
+//   },
+// });
+
+// if (activeAppointment) {
+//   throw new Error('SLOT_ALREADY_BOOKED');
+// }
+
+//       const appointment = await tx.appointment.create({
+//         data: {
+//           userId: authUserId,
+//           slotId,
+//           clinicId: slotData.clinicId,
+//           doctorId: slotData.doctorId,
+//           status: 'PENDING_PAYMENT',
+//           paymentStatus: 'PENDING',
+//           orderId: orderData.orderId || orderData.sessionId,
+//           amount: Number(slotData.price),
+//           slug: `hold_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+//           section: 'GENERAL',
+//           paymentExpiry: new Date(now.getTime() + HOLD_MS),
+//           createdAt: now,
+//         },
+//       });
+
+//       return { 
+//         appointment, 
+//         gatewayId: gateway.gatewayId,
+//         orderData,
+//         isOnline: true, 
+//         createNew: true 
+//       };
+//     });
+
+//     // 5. SUCCESS PROCESSING + AUDIT LOG (unchanged)
+//     const { appointment, gatewayId, orderData, isOnline, createNew } = result;
+    
+//     await logAudit({
+//       userId: authUserId,
+//       clinicId: slotData.clinicId,
+//       action: isOnline ? 'BOOKING_HOLD_CREATED_ONLINE' : 'BOOKING_CREATED_OFFLINE',
+//       entity: 'Appointment',
+//       entityId: appointment.id,
+//       details: {
+//         slotId,
+//         doctorId: slotData.doctorId,
+//         doctorName: slotData.doctor.name,
+//         paymentMode: slotData.paymentMode,
+//         paymentMethod,
+//         provider: isOnline ? provider : null,
+//         orderId: isOnline ? (orderData?.orderId || orderData?.sessionId) : null,
+//         amount: Number(slotData.price),
+//         status: appointment.status,
+//         isOnline,
+//         paymentExpiry: appointment.paymentExpiry || null,
+//       },
+//       req,
+//     });
+
+
+//     // NON-BLOCKING EMAILS (unchanged)
+//     if (!isOnline && createNew) {
+//       getUserById(authUserId).then(user => {
+//         sendBookingEmails({
+//           id: appointment.id,
+//           clinic: slotData.clinic,
+//           doctor: slotData.doctor,
+//           slot: slotData,
+//           user: user || { name: 'Patient', phone: 'N/A' }
+//         }).catch(err => console.error('Pending booking emails failed:', err));
+//       }).catch(() => {});
+//     }
+    
+
+//     console.log('✅ Booking decision:', {
+//       slotId,
+//       authUserId,
+//       path: isOnline ? 'NEW_ONLINE_HOLD' : 'OFFLINE_PENDING',
+//       appointmentId: appointment.id,
+//       status: appointment.status,
+//     });
+
+//     return res.json({
+//       success: true,
+//       appointmentId: appointment.id,
+//       gatewayId,
+//       isOnline,
+//       orderId: orderData?.orderId || orderData?.sessionId,
+//       amount: Number(slotData.price),
+//       ...orderData,
+//       expiresIn: isOnline ? HOLD_MS / 1000 : 0,
+//       message: isOnline 
+//         ? `Payment hold created! Complete within 10 mins - ₹${slotData.price}`
+//         : slotData.paymentMode === 'FREE' 
+//         ? 'Free booking created! Clinic will confirm soon.'
+//         : `Booking created! Pay ₹${slotData.price} at clinic on visit.`,
+//     });
+
+//   } catch (error) {
+//     console.error('🚨 CRITICAL BOOKING ERROR:', error);
+
+//     if (error.message === 'SLOT_BLOCKED') {
+//       return res.status(409).json({
+//         error: 'Slot on hold by another patient. Wait 10-15 mins or choose another.',
+//         retry: true,
+//       });
+//     }
+
+//     if (error.message === 'ALREADY_CONFIRMED') {
+//       return res.status(400).json({
+//         error: 'You already have a confirmed booking for this slot.',
+//       });
+//     }
+
+//     if (error.code === 'P2002') {
+//       return res.status(409).json({
+//         error: 'Slot taken instantly by another patient! Please refresh.',
+//         retry: true,
+//       });
+//     }
+
+//     return res.status(500).json({
+//       error: error.message || 'Booking system temporarily unavailable.',
+//     });
+//   }
+// };
 export const createBooking = async (req, res) => {
   try {
     const { slotId, paymentMethod = 'ONLINE', provider = 'RAZORPAY' } = req.body;
     const authUserId = req.user?.userId;
 
-    console.log('🔑 Auth header:', req.headers.authorization);
-    console.log('👤 req.user:', req.user);
-
-    if (!authUserId) return res.status(401).json({ error: 'Unauthorized' });
+    if (!authUserId) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
 
     const HOLD_MS = 10 * 60 * 1000;
     const SAFETY_MS = 15 * 60 * 1000;
     const now = new Date();
 
-    // 1. Fetch Slot + Clinic + Doctor
+    // 1️⃣ Fetch slot
     const slotData = await prisma.slot.findUnique({
       where: { id: slotId },
       include: { clinic: true, doctor: true },
     });
 
-    if (!slotData) return res.status(404).json({ error: 'Slot not found' });
+    if (!slotData) {
+      return res.status(404).json({ error: 'Slot not found' });
+    }
 
-    // 2. RECENT HOLD CHECK
+    // 2️⃣ Recent hold check (same user allowed)
     const recentHold = await prisma.appointment.findFirst({
       where: {
         slotId,
-        deletedAt: null,
         status: 'PENDING_PAYMENT',
-        createdAt: { gte: new Date(now.getTime() - SAFETY_MS) }
+        deletedAt: null,
+        createdAt: { gte: new Date(now.getTime() - SAFETY_MS) },
       },
     });
 
     if (recentHold) {
       if (recentHold.userId !== authUserId) {
         return res.status(409).json({
-          error: 'Slot on hold by another user. Please wait 10-15 mins or choose another.',
+          error: 'Slot on hold by another user. Please wait or choose another.',
           retry: true,
         });
       }
-      return handleExistingHold(recentHold, slotData, provider, now, HOLD_MS, res, slotData.clinicId, req);
+
+      return handleExistingHold(
+        recentHold,
+        slotData,
+        provider,
+        now,
+        HOLD_MS,
+        res,
+        slotData.clinicId,
+        req
+      );
     }
 
-    // 3. Plan validation
+    // 3️⃣ Plan validation
     const plan = await getClinicPlan(slotData.clinicId);
     if (!plan) {
       return res.status(400).json({ error: 'Clinic has no active subscription plan.' });
@@ -334,83 +625,53 @@ export const createBooking = async (req, res) => {
 
     if (paymentMethod === 'ONLINE' && !plan.allowOnlinePayments) {
       return res.status(403).json({
-        error: 'Online payments disabled. Use FREE or OFFLINE slots.',
+        error: 'Online payments disabled.',
         availableModes: ['FREE', 'OFFLINE'],
       });
     }
 
-    // 🔥 4. ATOMIC TRANSACTION - FULLY FIXED CLEANUP!
+    // 4️⃣ TRANSACTION
     const result = await prisma.$transaction(async (tx) => {
-      // 🔥 COMPLETE STALE CLEANUP (ALL CHILDREN FIRST!)
-      const staleAppts = await tx.appointment.findMany({
+
+      // 🧹 Delete ONLY expired online holds
+      await tx.appointment.deleteMany({
         where: {
           slotId,
-          OR: [
-            { status: 'CANCELLED' },
-            { status: 'PENDING' },
-            { 
-              status: 'PENDING_PAYMENT',
-              createdAt: { lt: new Date(now.getTime() - SAFETY_MS) }
-            }
-          ]
-        },
-        select: { id: true }
-      });
-
-      const staleIds = staleAppts.map(a => a.id);
-      
-      if (staleIds.length > 0) {
-        console.log(`🧹 Cleaning ${staleIds.length} stale appointments + children`);
-        
-        // CRITICAL ORDER: Children → Parent (No FK Violations!)
-        await tx.cancellationRequest.deleteMany({  // 🔥 ADDED
-          where: { appointmentId: { in: staleIds } }
-        });
-        await tx.payment.deleteMany({
-          where: { appointmentId: { in: staleIds } }
-        });
-        await tx.appointmentLog.deleteMany({  // 🔥 ADDED
-          where: { appointmentId: { in: staleIds } }
-        });
-        
-        // NOW safe to delete appointments
-        await tx.appointment.deleteMany({
-          where: { id: { in: staleIds } }
-        });
-        
-        console.log(`✅ Cleaned ${staleIds.length} appts + payments/requests/logs`);
-      }
-      const freshSlot = await tx.slot.findUnique({
-    where: { id: slotId },
-    select: { isBlocked: true, status: true }
-  });
-
-  if (!freshSlot) throw new Error('SLOT_NOT_FOUND');
-  
-  // Check if Admin blocked it while user was on the page
-  if (freshSlot.isBlocked) {
-    throw new Error('ADMIN_BLOCKED');
-  }
-  // ============================================================
-
-      // SAFETY CHECKS (Inside transaction!)
-      const confirmed = await tx.appointment.findFirst({
-        where: { slotId, status: 'CONFIRMED', deletedAt: null }
-      });
-      if (confirmed) throw new Error('ALREADY_CONFIRMED');
-
-      const otherHold = await tx.appointment.findFirst({
-        where: {
-          slotId,
-          userId: { not: authUserId },
           status: 'PENDING_PAYMENT',
-          deletedAt: null
-        }
+          createdAt: { lt: new Date(now.getTime() - SAFETY_MS) },
+        },
       });
-      if (otherHold) throw new Error('SLOT_BLOCKED');
 
-      // FREE/OFFLINE → INSTANT PENDING
-      if (slotData.paymentMode === 'FREE' || paymentMethod === 'OFFLINE' || slotData.paymentMode === 'OFFLINE') {
+      // 🔒 Slot state check
+      const freshSlot = await tx.slot.findUnique({
+        where: { id: slotId },
+        select: { isBlocked: true, status: true },
+      });
+
+      if (!freshSlot) throw new Error('SLOT_NOT_FOUND');
+      if (freshSlot.isBlocked || freshSlot.status !== 'PENDING_PAYMENT') {
+        throw new Error('SLOT_NOT_AVAILABLE');
+      }
+
+      // 🔥 SINGLE blocking rule
+      const activeAppointment = await tx.appointment.findFirst({
+        where: {
+          slotId,
+          status: { in: ['CONFIRMED', 'PENDING', 'PENDING_PAYMENT'] },
+          deletedAt: null,
+        },
+      });
+
+      if (activeAppointment) {
+        throw new Error('SLOT_ALREADY_BOOKED');
+      }
+
+      // 5️⃣ FREE / OFFLINE booking
+      if (
+        slotData.paymentMode === 'FREE' ||
+        paymentMethod === 'OFFLINE' ||
+        slotData.paymentMode === 'OFFLINE'
+      ) {
         const appointment = await tx.appointment.create({
           data: {
             userId: authUserId,
@@ -420,16 +681,33 @@ export const createBooking = async (req, res) => {
             status: 'PENDING',
             paymentStatus: slotData.paymentMode === 'FREE' ? 'PAID' : 'PENDING',
             amount: slotData.paymentMode === 'FREE' ? 0 : Number(slotData.price),
-            slug: `${slotData.paymentMode?.toLowerCase() || 'offline'}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            slug: `offline_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
             section: 'GENERAL',
           },
         });
-        return { appointment, isOnline: false, createNew: true };
+
+        return { appointment, isOnline: false };
       }
 
-      // ONLINE → RAZORPAY HOLD + ORDER
+      // 6️⃣ ONLINE — OLD RAZORPAY FLOW (WORKING STYLE)
       const gateway = await getPaymentInstance(slotData.clinicId, provider);
-      const orderData = await createPaymentOrder(gateway, slotData, provider);
+
+      if (!gateway?.instance || !gateway?.key_id) {
+        throw new Error('PAYMENT_CONFIG_MISSING');
+      }
+
+      const options = {
+        amount: Math.round(Number(slotData.price) * 100),
+        currency: 'INR',
+        receipt: `rcpt_${slotId.slice(-6)}_${Date.now()}`,
+        notes: {
+          slotId,
+          clinicId: slotData.clinicId,
+          doctorId: slotData.doctorId,
+        },
+      };
+
+      const order = await gateway.instance.orders.create(options);
 
       const appointment = await tx.appointment.create({
         data: {
@@ -439,113 +717,65 @@ export const createBooking = async (req, res) => {
           doctorId: slotData.doctorId,
           status: 'PENDING_PAYMENT',
           paymentStatus: 'PENDING',
-          orderId: orderData.orderId || orderData.sessionId,
+          orderId: order.id,
           amount: Number(slotData.price),
-          slug: `hold_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          slug: `hold_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
           section: 'GENERAL',
           paymentExpiry: new Date(now.getTime() + HOLD_MS),
-          createdAt: now,
         },
       });
 
-      return { 
-        appointment, 
-        gatewayId: gateway.gatewayId,
-        orderData,
-        isOnline: true, 
-        createNew: true 
+      return {
+        appointment,
+        isOnline: true,
+        orderId: order.id,
+        key: gateway.key_id, // 🔥 SAME AS OLD CODE
+        amount: order.amount,
       };
     });
 
-    // 5. SUCCESS PROCESSING + AUDIT LOG (unchanged)
-    const { appointment, gatewayId, orderData, isOnline, createNew } = result;
-    
+    // 7️⃣ Audit log
     await logAudit({
       userId: authUserId,
       clinicId: slotData.clinicId,
-      action: isOnline ? 'BOOKING_HOLD_CREATED_ONLINE' : 'BOOKING_CREATED_OFFLINE',
+      action: result.isOnline ? 'BOOKING_HOLD_CREATED_ONLINE' : 'BOOKING_CREATED_OFFLINE',
       entity: 'Appointment',
-      entityId: appointment.id,
-      details: {
-        slotId,
-        doctorId: slotData.doctorId,
-        doctorName: slotData.doctor.name,
-        paymentMode: slotData.paymentMode,
-        paymentMethod,
-        provider: isOnline ? provider : null,
-        orderId: isOnline ? (orderData?.orderId || orderData?.sessionId) : null,
-        amount: Number(slotData.price),
-        status: appointment.status,
-        isOnline,
-        paymentExpiry: appointment.paymentExpiry || null,
-      },
+      entityId: result.appointment.id,
       req,
     });
 
-
-    // NON-BLOCKING EMAILS (unchanged)
-    if (!isOnline && createNew) {
-      getUserById(authUserId).then(user => {
-        sendBookingEmails({
-          id: appointment.id,
-          clinic: slotData.clinic,
-          doctor: slotData.doctor,
-          slot: slotData,
-          user: user || { name: 'Patient', phone: 'N/A' }
-        }).catch(err => console.error('Pending booking emails failed:', err));
-      }).catch(() => {});
-    }
-    
-
-    console.log('✅ Booking decision:', {
-      slotId,
-      authUserId,
-      path: isOnline ? 'NEW_ONLINE_HOLD' : 'OFFLINE_PENDING',
-      appointmentId: appointment.id,
-      status: appointment.status,
-    });
-
+    // 8️⃣ Response
     return res.json({
       success: true,
-      appointmentId: appointment.id,
-      gatewayId,
-      isOnline,
-      orderId: orderData?.orderId || orderData?.sessionId,
+      appointmentId: result.appointment.id,
+      isOnline: result.isOnline,
+      orderId: result.orderId,
+      key: result.key,
       amount: Number(slotData.price),
-      ...orderData,
-      expiresIn: isOnline ? HOLD_MS / 1000 : 0,
-      message: isOnline 
-        ? `Payment hold created! Complete within 10 mins - ₹${slotData.price}`
-        : slotData.paymentMode === 'FREE' 
-        ? 'Free booking created! Clinic will confirm soon.'
-        : `Booking created! Pay ₹${slotData.price} at clinic on visit.`,
+      expiresIn: result.isOnline ? HOLD_MS / 1000 : 0,
+      message: result.isOnline
+        ? 'Payment hold created. Complete payment within 10 minutes.'
+        : 'Booking created successfully.',
     });
 
   } catch (error) {
-    console.error('🚨 CRITICAL BOOKING ERROR:', error);
+    console.error('🚨 BOOKING ERROR:', error);
 
-    if (error.message === 'SLOT_BLOCKED') {
+    if (error.message === 'SLOT_ALREADY_BOOKED') {
       return res.status(409).json({
-        error: 'Slot on hold by another patient. Wait 10-15 mins or choose another.',
+        error: 'Slot already booked. Please choose another.',
         retry: true,
       });
     }
 
-    if (error.message === 'ALREADY_CONFIRMED') {
-      return res.status(400).json({
-        error: 'You already have a confirmed booking for this slot.',
-      });
-    }
-
-    if (error.code === 'P2002') {
-      return res.status(409).json({
-        error: 'Slot taken instantly by another patient! Please refresh.',
-        retry: true,
+    if (error.message === 'PAYMENT_CONFIG_MISSING') {
+      return res.status(500).json({
+        error: 'Payment configuration missing. Please contact clinic.',
       });
     }
 
     return res.status(500).json({
-      error: error.message || 'Booking system temporarily unavailable.',
+      error: 'Booking system temporarily unavailable.',
     });
   }
 };
@@ -562,37 +792,47 @@ export const autoSyncAppointmentToGCal = async (appointmentId) => {
 
     if (!appt || appt.status !== "CONFIRMED") return;
 
-    // 1) Clinic subscribed? → BOTH calendars (priority: doctor first)
     const plan = await getClinicPlan(appt.clinicId);
     const doBoth = plan?.enableGoogleCalendarSync;
 
     const doctor = appt.slot.doctor;
     const clinic = appt.clinic;
 
-    // 2) Doctor calendar (if connected)
+    // 🧠 Doctor calendar
     if (doctor?.googleRefreshToken) {
-      await syncToCalendar({
+      const doctorEventId = await syncToCalendar({
         refreshToken: doctor.googleRefreshToken,
         calendarId: doctor.googleCalendarId || "primary",
         appt,
         source: "doctor"
       });
+
+      await prisma.appointment.update({
+        where: { id: appt.id },
+        data: { googleCalendarDoctorEventId: doctorEventId }
+      });
     }
 
-    // 3) Clinic calendar (if connected AND clinic subscribed)
+    // 🧠 Clinic calendar
     if (clinic?.googleRefreshToken && doBoth) {
-      await syncToCalendar({
+      const clinicEventId = await syncToCalendar({
         refreshToken: clinic.googleRefreshToken,
         calendarId: clinic.googleCalendarId || "primary",
         appt,
         source: "clinic"
       });
+
+      await prisma.appointment.update({
+        where: { id: appt.id },
+        data: { googleCalendarClinicEventId: clinicEventId }
+      });
     }
 
   } catch (error) {
-    console.error("🚨 GCal Sync Error:", error.response?.data || error.message);
+    console.error("🚨 GCal Sync Error:", error.message);
   }
 };
+
 
 // Helper function (reusable)
 const syncToCalendar = async ({ refreshToken, calendarId, appt, source }) => {
@@ -602,49 +842,37 @@ const syncToCalendar = async ({ refreshToken, calendarId, appt, source }) => {
   );
   oauth2Client.setCredentials({ refresh_token: refreshToken });
 
- const calendar = google.calendar({ version: "v3", auth: oauth2Client });
+  const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 
-const dateStr = new Date(appt.slot.date).toLocaleDateString('sv').split('-').reverse().join('-');
-console.log('🕒 SLOT DEBUG:', {
-  date: appt.slot.date, time: appt.slot.time, 
-  timeType: typeof appt.slot.time, slotId: appt.slotId
-});
+  const slotDate = new Date(appt.slot.date);
+  const [hours, minutes] = appt.slot.time.split(':').map(Number);
 
-const slotDate = new Date(appt.slot.date);
-const [hours, minutes] = (appt.slot.time || '10:00').split(':').map(Number);
+  const startDateTime = new Date(Date.UTC(
+    slotDate.getFullYear(),
+    slotDate.getMonth(),
+    slotDate.getDate(),
+    hours,
+    minutes
+  ));
 
-if (isNaN(hours) || isNaN(minutes)) {
-  console.error('🕒 INVALID:', appt.slot);
-  return;
-}
+  const endDateTime = new Date(startDateTime.getTime() + 30 * 60000);
 
-// ✅ UTC + Kolkata TZ = Perfect GCal
-const startDateTime = new Date(Date.UTC(
-  slotDate.getFullYear(), slotDate.getMonth(), slotDate.getDate(), 
-  hours, minutes, 0
-));
-const endDateTime = new Date(startDateTime.getTime() + 30 * 60 * 1000);
-
-  const eventBody = {
-    summary: `🏥 ${appt.user?.name || "Patient"} - ${appt.slot.doctor?.name || "Doctor"}`,
-    description: `Patient: ${appt.user?.name || "N/A"}\nPhone: ${appt.user?.phone || "N/A"}\nAppt ID: ${appt.id}`,
-    start: { dateTime: startDateTime.toISOString(), timeZone: "Asia/Kolkata" },
-    end: { dateTime: endDateTime.toISOString(), timeZone: "Asia/Kolkata" },
-    attendees: appt.user?.email ? [{ email: appt.user.email }] : [],
-  };
-
-  const response = await calendar.events.insert({
+  const event = await calendar.events.insert({
     calendarId,
     sendUpdates: "all",
-    requestBody: eventBody,
-  });
-    await prisma.appointment.update({
-    where: { id: appt.id },
-    data: { googleCalendarEventId: response.data.id }
+    requestBody: {
+      summary: `🏥 ${appt.user.name} - ${appt.slot.doctor.name}`,
+      description: `Appt ID: ${appt.id}`,
+      start: { dateTime: startDateTime.toISOString(), timeZone: "Asia/Kolkata" },
+      end: { dateTime: endDateTime.toISOString(), timeZone: "Asia/Kolkata" },
+    }
   });
 
-  console.log(`✅ GCal ${source}: ${response.data.htmlLink}`);
+  console.log(`✅ GCal ${source}:`, event.data.htmlLink);
+
+  return event.data.id; // 🔥 THIS IS THE KEY FIX
 };
+
 
 
 

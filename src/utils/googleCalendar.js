@@ -1,7 +1,11 @@
 import { google } from "googleapis";
 import prisma from "../prisma.js"; 
 
-export const createGoogleCalendarEvent = async ({ calendarId = "primary", refreshToken, appointment }) => {
+export const createGoogleCalendarEvent = async ({
+  calendarId = "primary",
+  refreshToken,
+  appointment,
+}) => {
   const oauth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET,
@@ -12,95 +16,116 @@ export const createGoogleCalendarEvent = async ({ calendarId = "primary", refres
 
   const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 
-  return calendar.events.insert({
+  const response = await calendar.events.insert({
     calendarId,
     sendUpdates: "all",
     requestBody: {
       summary: `Appointment: ${appointment.patientName}`,
       description: `Doctor: ${appointment.doctorName}\nPhone: ${appointment.patientPhone}`,
-      start: { dateTime: appointment.startTime, timeZone: "Asia/Kolkata" },
-      end: { dateTime: appointment.endTime, timeZone: "Asia/Kolkata" },
-      attendees: appointment.patientEmail ? [{ email: appointment.patientEmail }] : [],
+      start: {
+        dateTime: appointment.startTime,
+        timeZone: "Asia/Kolkata",
+      },
+      end: {
+        dateTime: appointment.endTime,
+        timeZone: "Asia/Kolkata",
+      },
+      attendees: appointment.patientEmail
+        ? [{ email: appointment.patientEmail }]
+        : [],
     },
   });
+
+  // 🔥 THIS IS THE IMPORTANT PART
+  return {
+    eventId: response.data.id,
+    htmlLink: response.data.htmlLink,
+  };
 };
 
-export const deleteAppointmentFromGCal = async (appointmentId) => {
-  try {
-    const appt = await prisma.appointment.findUnique({
-      where: { id: appointmentId },
-      select: { 
-        googleCalendarEventId: true, 
-        doctor: { 
-          select: { 
-            googleRefreshToken: true,
-            googleCalendarId: true
-          } 
-        },
-        clinic: { 
-          select: { 
-            googleRefreshToken: true,
-            googleCalendarId: true
-          } 
-        }
-      }
-    });
 
-    // 1. If there is no ID, we can't delete anything
-    if (!appt?.googleCalendarEventId) {
-      console.log("ℹ️ No GCal event ID found for this appointment.");
-      return;
-    }
+// export const deleteAppointmentFromGCal = async (appointmentId) => {
+//   try {
+//     const appt = await prisma.appointment.findUnique({
+//       where: { id: appointmentId },
+//       select: { 
+//         googleCalendarEventId: true, 
+//         doctor: { 
+//           select: { 
+//             googleRefreshToken: true,
+//             googleCalendarId: true
+//           } 
+//         },
+//         clinic: { 
+//           select: { 
+//             googleRefreshToken: true,
+//             googleCalendarId: true
+//           } 
+//         }
+//       }
+//     });
 
-    // 🔥 FIXED: Clinic-first loop (deletes from both if both connected)
-    const targets = [
-      { token: appt.clinic?.googleRefreshToken, calendarId: appt.clinic?.googleCalendarId || 'primary' },
-      { token: appt.doctor?.googleRefreshToken, calendarId: appt.doctor?.googleCalendarId || 'primary' }
-    ].filter(t => t.token);
+//     // 1. If there is no ID, we can't delete anything
+//     if (!appt?.googleCalendarEventId) {
+//       console.log("ℹ️ No GCal event ID found for this appointment.");
+//       return;
+//     }
 
-    if (targets.length === 0) {
-      console.log("ℹ️ No GCal tokens (clinic or doctor)");
-      return;
-    }
+//     // 🔥 FIXED: Clinic-first loop (deletes from both if both connected)
+//     const targets = [
+//       { token: appt.clinic?.googleRefreshToken, calendarId: appt.clinic?.googleCalendarId || 'primary' },
+//       { token: appt.doctor?.googleRefreshToken, calendarId: appt.doctor?.googleCalendarId || 'primary' }
+//     ].filter(t => t.token);
 
-    for (const target of targets) {
-      const oauth2Client = new google.auth.OAuth2(
-        process.env.GOOGLE_CLIENT_ID,
-        process.env.GOOGLE_CLIENT_SECRET
-      );
+//     if (targets.length === 0) {
+//       console.log("ℹ️ No GCal tokens (clinic or doctor)");
+//       return;
+//     }
+
+//     for (const target of targets) {
+//       const oauth2Client = new google.auth.OAuth2(
+//         process.env.GOOGLE_CLIENT_ID,
+//         process.env.GOOGLE_CLIENT_SECRET
+//       );
       
-      oauth2Client.setCredentials({ refresh_token: target.token });
-      const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+//       oauth2Client.setCredentials({ refresh_token: target.token });
+//       const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
 
-      await calendar.events.delete({
-        calendarId: target.calendarId,
-        eventId: appt.googleCalendarEventId
-      });
+//       await calendar.events.delete({
+//         calendarId: target.calendarId,
+//         eventId: appt.googleCalendarEventId
+//       });
 
-      console.log(`🗑️ GCal deleted from ${target.calendarId}: ${appt.googleCalendarEventId}`);
-    }
+//       console.log(`🗑️ GCal deleted from ${target.calendarId}: ${appt.googleCalendarEventId}`);
+//     }
 
-    // 4. Clean up the database
-    await prisma.appointment.update({
-      where: { id: appointmentId },
-      data: { googleCalendarEventId: null }
-    });
+//     // 4. Clean up the database
+//     await prisma.appointment.update({
+//       where: { id: appointmentId },
+//       data: { googleCalendarEventId: null }
+//     });
 
-    console.log(`✅ Appointment ${appointmentId} GCal cleanup complete`);
+//     console.log(`✅ Appointment ${appointmentId} GCal cleanup complete`);
 
-  } catch (error) {
-    // If the event was already deleted manually in Google, it will throw a 410 error.
-    // We should still clear it from our DB in that case.
-    if (error.code === 410 || error.code === 404) {
-      await prisma.appointment.update({
-        where: { id: appointmentId },
-        data: { googleCalendarEventId: null }
-      });
-      console.log(`ℹ️ GCal event ${appt?.googleCalendarEventId} already gone, DB cleared`);
-    }
-    console.error('❌ GCal Delete Error:', error.message);
-  }
-};
+//   } catch (error) {
+//   console.log('🆔 GCal Delete failed:', appointmentId, error.code || error.message);
+  
+//   if (!appt) {
+//     console.log("ℹ️ Appointment missing:", appointmentId);
+//     return;
+//   }
+  
+//   if (error.code === 410 || error.code === 404) {
+//     await prisma.appointment.update({
+//       where: { id: appointmentId },
+//       data: { googleCalendarEventId: null }
+//     });
+//     console.log(`✅ Cleared GCal ${appt.googleCalendarEventId}`);
+//   }
+  
+//   console.error('❌ GCal Error:', error.message);
+// }
+// };
 // export const updateAppointmentOnGCal = async (appointmentId) => {
 //   const appt = await prisma.appointment.findUnique({
 //     where: { id: appointmentId },
@@ -130,51 +155,178 @@ export const deleteAppointmentFromGCal = async (appointmentId) => {
 //     });
 //   }
 // };
+export const deleteAppointmentFromGCal = async (appointmentId) => {
+  try {
+    const appt = await prisma.appointment.findUnique({
+      where: { id: appointmentId },
+      include: {
+        doctor: true,
+        clinic: true,
+      },
+    });
+
+    if (!appt) return;
+
+    // 👨‍⚕️ Doctor calendar delete
+    if (
+      appt.googleCalendarDoctorEventId &&
+      appt.doctor?.googleRefreshToken
+    ) {
+      await deleteFromCalendar({
+        refreshToken: appt.doctor.googleRefreshToken,
+        calendarId: appt.doctor.googleCalendarId || "primary",
+        eventId: appt.googleCalendarDoctorEventId,
+        source: "doctor",
+      });
+    }
+
+    // 🏥 Clinic calendar delete
+    if (
+      appt.googleCalendarClinicEventId &&
+      appt.clinic?.googleRefreshToken
+    ) {
+      await deleteFromCalendar({
+        refreshToken: appt.clinic.googleRefreshToken,
+        calendarId: appt.clinic.googleCalendarId || "primary",
+        eventId: appt.googleCalendarClinicEventId,
+        source: "clinic",
+      });
+    }
+
+    // 🧹 Clean DB
+    await prisma.appointment.update({
+      where: { id: appointmentId },
+      data: {
+        googleCalendarDoctorEventId: null,
+        googleCalendarClinicEventId: null,
+      },
+    });
+
+    console.log(`✅ GCal cleanup complete: ${appointmentId}`);
+  } catch (err) {
+    console.error("❌ GCal delete failed:", err.message);
+  }
+};
+const deleteFromCalendar = async ({
+  refreshToken,
+  calendarId,
+  eventId,
+  source,
+}) => {
+  try {
+    const auth = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET
+    );
+
+    auth.setCredentials({ refresh_token: refreshToken });
+
+    const calendar = google.calendar({ version: "v3", auth });
+
+    await calendar.events.delete({ calendarId, eventId });
+
+    console.log(`🗑️ GCal deleted from ${source}:`, eventId);
+  } catch (e) {
+    console.error(`⚠️ ${source} delete failed:`, e.code || e.message);
+  }
+};
+
+
+
 export const updateAppointmentOnGCal = async (appointmentId) => {
   const appt = await prisma.appointment.findUnique({
     where: { id: appointmentId },
     include: {
       clinic: true,
-      slot: { include: { doctor: true } }, // ensure doctor token is available via slot.doctor
+      slot: { include: { doctor: true } },
       user: true,
     },
   });
 
-  if (!appt?.googleCalendarEventId || !appt?.slot) return;
+  if (!appt || !appt.slot) return;
 
-  // Build proper datetime (date + time) in IST
-  const dateStr = appt.slot.date instanceof Date
-    ? appt.slot.date.toISOString().split("T")[0]
-    : String(appt.slot.date).split("T")[0]; // fallback if string
+  const dateStr = appt.slot.date.toISOString().split("T")[0];
+  const [hours, minutes] = appt.slot.time.split(":").map(Number);
 
-const [hours, minutes] = appt.slot.time.split(':').map(Number);
-const startDateTime = new Date(`${dateStr}T${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:00+05:30`);
-const endDateTime = new Date(startDateTime.getTime() + 30 * 60 * 1000);
+  const startDateTime = new Date(
+    `${dateStr}T${hours.toString().padStart(2, "0")}:${minutes
+      .toString()
+      .padStart(2, "0")}:00+05:30`
+  );
+  const endDateTime = new Date(startDateTime.getTime() + 30 * 60000);
 
-  const targets = [
-    { token: appt.clinic?.googleRefreshToken, calendarId: appt.clinic?.googleCalendarId || "primary" },
-    { token: appt.slot?.doctor?.googleRefreshToken, calendarId: appt.slot?.doctor?.googleCalendarId || "primary" },
-  ].filter(t => t.token);
+  // 👨‍⚕️ Doctor calendar update
+  if (
+    appt.googleCalendarDoctorEventId &&
+    appt.slot.doctor?.googleRefreshToken
+  ) {
+    await patchCalendarEvent({
+      refreshToken: appt.slot.doctor.googleRefreshToken,
+      calendarId: appt.slot.doctor.googleCalendarId || "primary",
+      eventId: appt.googleCalendarDoctorEventId,
+      appt,
+      startDateTime,
+      endDateTime,
+      source: "doctor",
+    });
+  }
 
-  for (const t of targets) {
+  // 🏥 Clinic calendar update
+  if (
+    appt.googleCalendarClinicEventId &&
+    appt.clinic?.googleRefreshToken
+  ) {
+    await patchCalendarEvent({
+      refreshToken: appt.clinic.googleRefreshToken,
+      calendarId: appt.clinic.googleCalendarId || "primary",
+      eventId: appt.googleCalendarClinicEventId,
+      appt,
+      startDateTime,
+      endDateTime,
+      source: "clinic",
+    });
+  }
+};
+
+const patchCalendarEvent = async ({
+  refreshToken,
+  calendarId,
+  eventId,
+  appt,
+  startDateTime,
+  endDateTime,
+  source,
+}) => {
+  try {
     const oauth2Client = new google.auth.OAuth2(
       process.env.GOOGLE_CLIENT_ID,
       process.env.GOOGLE_CLIENT_SECRET
     );
-    oauth2Client.setCredentials({ refresh_token: t.token });
+
+    oauth2Client.setCredentials({ refresh_token: refreshToken });
 
     const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 
     await calendar.events.patch({
-      calendarId: t.calendarId,
-      eventId: appt.googleCalendarEventId,
+      calendarId,
+      eventId,
       requestBody: {
         summary: `${appt.status} - ${appt.user?.name || "Patient"}`,
         description: `Appt ID: ${appt.id}\nDoctor: ${appt.slot?.doctor?.name || ""}`,
-        start: { dateTime: startDateTime.toISOString(), timeZone: "Asia/Kolkata" },
-        end: { dateTime: endDateTime.toISOString(), timeZone: "Asia/Kolkata" },
+        start: {
+          dateTime: startDateTime.toISOString(),
+          timeZone: "Asia/Kolkata",
+        },
+        end: {
+          dateTime: endDateTime.toISOString(),
+          timeZone: "Asia/Kolkata",
+        },
       },
     });
+
+    console.log(`✅ GCal updated (${source}):`, eventId);
+  } catch (err) {
+    console.error(`⚠️ GCal update failed (${source}):`, err.code || err.message);
   }
 };
 
@@ -195,7 +347,7 @@ export const autoSyncAppointmentToGCal = async (appointmentId) => {
   try {
     const appt = await prisma.appointment.findUnique({
       where: { id: appointmentId },
-      include: { 
+      include: {
         clinic: true,
         slot: { include: { doctor: true } },
         user: true
@@ -204,67 +356,67 @@ export const autoSyncAppointmentToGCal = async (appointmentId) => {
 
     if (!appt || appt.status !== "CONFIRMED") return;
 
-    // 1) Clinic subscribed? → BOTH calendars (priority: doctor first)
     const plan = await getClinicPlan(appt.clinicId);
-    const doBoth = plan?.enableGoogleCalendarSync;
-
     const doctor = appt.slot.doctor;
     const clinic = appt.clinic;
 
-    // 2) Doctor calendar (if connected)
+    // 👨‍⚕️ Doctor calendar
     if (doctor?.googleRefreshToken) {
-      await syncToCalendar({
+      const doctorEventId = await syncToCalendar({
         refreshToken: doctor.googleRefreshToken,
         calendarId: doctor.googleCalendarId || "primary",
-        appt,
-        source: "doctor"
+        appt
+      });
+
+      await prisma.appointment.update({
+        where: { id: appt.id },
+        data: { googleCalendarDoctorEventId: doctorEventId }
       });
     }
 
-    // 3) Clinic calendar (if connected AND clinic subscribed)
-    if (clinic?.googleRefreshToken && doBoth) {
-      await syncToCalendar({
+    // 🏥 Clinic calendar (only if plan allows)
+    if (clinic?.googleRefreshToken && plan?.enableGoogleCalendarSync) {
+      const clinicEventId = await syncToCalendar({
         refreshToken: clinic.googleRefreshToken,
         calendarId: clinic.googleCalendarId || "primary",
-        appt,
-        source: "clinic"
+        appt
+      });
+
+      await prisma.appointment.update({
+        where: { id: appt.id },
+        data: { googleCalendarClinicEventId: clinicEventId }
       });
     }
 
-  } catch (error) {
-    console.error("🚨 GCal Sync Error:", error.response?.data || error.message);
+  } catch (err) {
+    console.error("🚨 GCal Sync Error:", err.message);
   }
 };
-const syncToCalendar = async ({ refreshToken, calendarId, appt, source }) => {
+
+const syncToCalendar = async ({ refreshToken, calendarId, appt }) => {
   const oauth2Client = new google.auth.OAuth2(
     process.env.GOOGLE_CLIENT_ID,
     process.env.GOOGLE_CLIENT_SECRET
   );
+
   oauth2Client.setCredentials({ refresh_token: refreshToken });
 
   const calendar = google.calendar({ version: "v3", auth: oauth2Client });
 
-  const startDateTime = new Date(`${appt.slot.date.toISOString().split("T")[0]}T${appt.slot.time}:00+05:30`);
-  const endDateTime = new Date(startDateTime.getTime() + 30 * 60 * 1000);
+  const date = appt.slot.date.toISOString().split("T")[0];
+  const start = new Date(`${date}T${appt.slot.time}:00+05:30`);
+  const end = new Date(start.getTime() + 30 * 60000);
 
-  const eventBody = {
-    summary: `🏥 ${appt.user?.name || "Patient"} - ${appt.slot.doctor?.name || "Doctor"}`,
-    description: `Patient: ${appt.user?.name || "N/A"}\nPhone: ${appt.user?.phone || "N/A"}\nAppt ID: ${appt.id}`,
-    start: { dateTime: startDateTime.toISOString(), timeZone: "Asia/Kolkata" },
-    end: { dateTime: endDateTime.toISOString(), timeZone: "Asia/Kolkata" },
-    attendees: appt.user?.email ? [{ email: appt.user.email }] : [],
-  };
-
-  const response = await calendar.events.insert({
+  const res = await calendar.events.insert({
     calendarId,
     sendUpdates: "all",
-    requestBody: eventBody,
+    requestBody: {
+      summary: `🏥 ${appt.user.name} - ${appt.slot.doctor.name}`,
+      description: `Appt ID: ${appt.id}`,
+      start: { dateTime: start.toISOString(), timeZone: "Asia/Kolkata" },
+      end: { dateTime: end.toISOString(), timeZone: "Asia/Kolkata" },
+    },
   });
-await prisma.appointment.update({
-  where: { id: appt.id },
-  data: { 
-    googleCalendarEventId: response.data.id  // For delete!
-  }
-});
-  console.log(`✅ GCal ${source}: ${response.data.htmlLink}`);
+
+  return res.data.id; // 🔥 CRITICAL
 };

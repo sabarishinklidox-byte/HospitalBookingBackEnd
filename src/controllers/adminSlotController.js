@@ -177,28 +177,34 @@ export const getSlots = async (req, res) => {
       date: { gte: start, lte: end },
     };
 
-    const [total, slots] = await prisma.$transaction([
-      prisma.slot.count({ where }),
-      prisma.slot.findMany({
-        where,
-        orderBy: [{ date: "asc" }, { time: "asc" }],
-        skip,
-        take: limitNum,
-        include: {
-          appointments: {
-            where: {
-              deletedAt: null,
-              status: { in: ["PENDING", "CONFIRMED", "COMPLETED"] },
-            },
-            select: { id: true },
-          },
-        },
-      }),
-    ]); 
+    // ✅ FIXED: Fetch slots FIRST
+    const slots = await prisma.slot.findMany({
+      where,
+      orderBy: [{ date: "asc" }, { time: "asc" }],
+      skip,
+      take: limitNum,
+    });
+
+    const total = await prisma.slot.count({ where });
+
+    // ✅ FIXED: No 'date' field - use slotId + status only
+    const slotIds = slots.map(s => s.id);
+    const appointments = await prisma.appointment.findMany({
+      where: {
+        deletedAt: null,
+        status: { in: ["CONFIRMED", "COMPLETED"] },
+        slotId: { in: slotIds }
+        // ✅ REMOVED: date filter (doesn't exist in schema)
+      },
+      select: { slotId: true }
+    });
+
+    // ✅ Map booked slot IDs
+    const bookedSlotIds = new Set(appointments.map(a => a.slotId));
 
     const data = slots.map((s) => ({
       ...s,
-      isBooked: !!s.appointments,
+      isBooked: bookedSlotIds.has(s.id),
     }));
 
     return res.json({
@@ -215,6 +221,8 @@ export const getSlots = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+  
+
 
 
 

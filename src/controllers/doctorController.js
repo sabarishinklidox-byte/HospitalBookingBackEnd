@@ -164,7 +164,6 @@ export const getAvailableSlots = async (req, res) => {
     const startOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate());
     const endOfDay = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
 
-    // 🔥 ONLY TRULY FREE SLOTS (no appointment at all)
     const availableSlots = await prisma.slot.findMany({
       where: {
         doctorId,
@@ -173,9 +172,8 @@ export const getAvailableSlots = async (req, res) => {
           gte: startOfDay,
           lt: endOfDay
         },
-        // 🔥 NO APPOINTMENT = TRULY AVAILABLE
         appointments: {
-          is: null  // ✅ Only this!
+          none: {}  // 🔥 FIXED: No appointments = available slot
         }
       },
       select: {
@@ -190,7 +188,6 @@ export const getAvailableSlots = async (req, res) => {
       orderBy: [{ time: 'asc' }]
     });
 
-    // 🔥 Format
     const formatted = availableSlots.map(slot => ({
       id: slot.id,
       time: slot.time,
@@ -211,6 +208,7 @@ export const getAvailableSlots = async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 };
+
     
 
 
@@ -221,57 +219,47 @@ export const getAvailableSlots = async (req, res) => {
 export const getDoctorAppointments = async (req, res) => {
   try {
     const { doctorId } = req.user;
-    const dateParam = req.params.date;     // 🔥 NEW: path param support
-    const dateQuery = req.query.date;      // ✅ OLD: query param
+    const dateParam = req.params.date;
+    const dateQuery = req.query.date;
     const { status } = req.query;
 
-    if (!doctorId)
-      return res.status(400).json({ error: 'Doctor ID missing in token' });
+    if (!doctorId) return res.status(400).json({ error: 'Doctor ID missing' });
 
     const where = {
-      slot: { doctorId },
+      slot: {
+        doctorId,
+        deletedAt: null  // 🔥 FIX: Only valid slots
+      },
       deletedAt: null
     };
 
     if (status) where.status = status;
-
-    const date = dateParam || dateQuery;  // ✅ Supports BOTH
+    
+    const date = dateParam || dateQuery;
     if (date) {
-      const d = new Date(date + 'T00:00:00');
-      const start = new Date(d);
-      const end = new Date(d);
-      end.setDate(end.getDate() + 1);
-      
+      const d = new Date(date + 'T00:00:00.000Z');
+      const start = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+      const end = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
       where.slot.date = { gte: start, lt: end };
     }
 
     const appointments = await prisma.appointment.findMany({
       where,
-      orderBy: [
-        { slot: { date: 'asc' } },
-        { slot: { time: 'asc' } }
-      ],
       include: {
         user: { select: { id: true, name: true, email: true, phone: true } },
         slot: true,
         payment: true
-      }
+      },
+      orderBy: [{ slot: { date: 'asc' } }, { slot: { time: 'asc' } }]
     });
 
-    const formatted = appointments.map(app => ({
-      ...app,
-      patientName: app.user?.name || 'Unknown',
-      patientPhone: app.user?.phone || '',
-      dateFormatted: app.slot?.date ? new Date(app.slot.date).toLocaleDateString() : 'N/A',
-      timeFormatted: app.slot?.time || 'N/A'
-    }));
-
-    return res.json({ appointments: formatted });
+    res.json({ appointments });
   } catch (error) {
-    console.error('Get Doctor Appointments Error:', error);
-    return res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message });
   }
 };
+
+
 // ----------------------------------------------------------------
 // UPDATE APPOINTMENT STATUS
 // ----------------------------------------------------------------

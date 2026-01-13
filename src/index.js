@@ -128,16 +128,39 @@ app.get('/api/clinic/google-calendar/callback', async (req, res) => {
       env: process.env.NODE_ENV || 'development'
     });
   });
-cron.schedule(
-  // '0 * * * *',    
-  '* * * * *',            // at minute 0 of every hour
-  () => {
-    console.log('Running hourly subscription check...');
-    runExpirationCheck();
-  },
-  { timezone: 'Asia/Kolkata' } // your production timezone
-);
+// cron.schedule(
+//   // '0 * * * *',    
+//   '0 * * * *',            // at minute 0 of every hour
+//   () => {
+//     console.log('Running hourly subscription check...');
+//     runExpirationCheck();
+//   },
+//   { timezone: 'Asia/Kolkata' } // your production timezone
+// );
   // ✅ 404 handler
+let isRunning = false;
+
+cron.schedule(
+  '*/30 * * * * *',
+  async () => {
+    if (isRunning) {
+      console.log('Previous job still running, skipping...');
+      return;
+    }
+
+    isRunning = true;
+    try {
+      console.log('Running subscription check...');
+      await runExpirationCheck();
+    } catch (err) {
+      console.error(err);
+    } finally {
+      isRunning = false;
+    }
+  },
+  { timezone: 'Asia/Kolkata' }
+);
+
   app.use('*', (req, res) => {
     res.status(404).json({ error: 'Route not found' });
   });

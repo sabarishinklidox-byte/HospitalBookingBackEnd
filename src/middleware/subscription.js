@@ -1,47 +1,56 @@
-// // src/middleware/subscription.js
-// import prisma from '../prisma.js'; 
-
-// export const requireActiveSubscription = async (req, res, next) => {
-//   const user = req.user;
-  
-//   // Find clinic subscription
-//   const clinic = await prisma.clinic.findUnique({
-//     where: { id: user.clinicId },
-//     include: { subscription: true }
-//   });
-
-//   if (!clinic?.subscription || clinic.subscription.status !== 'ACTIVE') {
-//     return res.status(403).json({ 
-//       error: 'Your subscription has expired. Please renew to continue.' 
-//     });
-//   }
-
-//   next();
-// };
-// src/middleware/subscription.js - FIXED ✅ NO Analytics for EXPIRED
 import prisma from '../prisma.js'; 
 
 export const requireActiveSubscription = async (req, res, next) => {
+   console.log('🔒 MIDDLEWARE FIRED:', req.user);
   const user = req.user;
   
   const clinic = await prisma.clinic.findUnique({
     where: { id: user.clinicId },
     include: { subscription: true }
   });
-
+  if (!user?.clinicId) {
+    console.log('❌ NO USER/CLINICID:', req.user);
+    return res.status(403).json({ error: 'No clinic access' });
+  }
   const sub = clinic?.subscription;
-
-  // ✅ FIXED: TRIAL + ACTIVE ONLY (NO EXPIRED analytics)
   if (!sub || !['ACTIVE', 'TRIAL'].includes(sub.status)) {
     return res.status(403).json({ 
-      error: 'Your subscription has expired. Please renew to continue.',
+      error: 'Subscription expired. Upgrade required.',
       currentStatus: sub?.status || 'NO_SUBSCRIPTION'
     });
+  }
+
+  const now = new Date();
+  
+  // 🔥 BLOCK 1: Check MAIN PLAN expiry (durationDays)
+  const planEndsAt = new Date(sub.startDate);
+  planEndsAt.setDate(planEndsAt.getDate() + sub.durationDays);
+  
+  if (now > planEndsAt) {
+    console.log('🚫 Plan expired:', { planEndsAt: planEndsAt.toISOString() });
+    return res.status(403).json({ 
+      error: 'Plan expired. Please upgrade to continue.',
+      expiredAt: planEndsAt.toISOString()
+    });
+  }
+
+  // 🔥 BLOCK 2: Check TRIAL expiry (if trialDays exist)
+  if (sub.trialDays > 0) {
+    const trialEndsAt = new Date(sub.startDate);
+    trialEndsAt.setDate(trialEndsAt.getDate() + sub.trialDays);
+    
+    if (now > trialEndsAt) {
+      console.log('🚫 Trial expired:', { trialEndsAt: trialEndsAt.toISOString() });
+      return res.status(403).json({ 
+        error: 'Trial expired. Payment required to continue.',
+        upgradeRequired: true
+      });
+    }
   }
 
   req.subscription = sub;
   next();
 };
 
-// ✅ Analytics = Same as requireActiveSubscription (blocks EXPIRED)
+
 export const requireActiveSubscriptionForAnalytics = requireActiveSubscription;

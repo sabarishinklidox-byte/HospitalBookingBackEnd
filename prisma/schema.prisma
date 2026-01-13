@@ -209,7 +209,7 @@ model Slot {
   deletedAt    DateTime?
   paymentMode  SlotPaymentMode   @default(ONLINE)
   kind         String            @default("APPOINTMENT")
-  appointments Appointment?
+ appointments Appointment[] 
   clinic       Clinic            @relation(fields: [clinicId], references: [id])
   doctor       Doctor            @relation(fields: [doctorId], references: [id])
 
@@ -224,7 +224,9 @@ model Appointment {
   doctorId            String
     rescheduleCount Int      @default(0)
   clinicId            String
-  slotId              String               @unique
+ slotId                 String     
+
+
   section             BookingSection
   status              AppointmentStatus    @default(PENDING_PAYMENT)
   paymentId           String?
@@ -234,7 +236,15 @@ model Appointment {
   diffAmount             Decimal?            // store positive difference
   // relations
   prescription        String?
-    googleCalendarEventId String?  @map("google_calendar_event_id")
+  googleCalendarClinicEventId String?
+googleCalendarClinicUrl     String?
+
+// Doctor calendar
+googleCalendarDoctorEventId String?
+googleCalendarDoctorUrl     String?
+
+// Optional shared ICS
+
   adminNote String?  @db.Text
   createdAt           DateTime             @default(now())
   updatedAt           DateTime             @updatedAt
@@ -254,7 +264,8 @@ model Appointment {
   payment             Payment?
   review              Review?
  googleCalendarUrl   String?  // "https://calendar.google.com/..."
-  googleCalendarIcs   String?  // ICS content for download
+  googleCalendarIcs   String? 
+  @@index([slotId]) // ICS content for download
   @@map("appointments")
 }
 
